@@ -1,0 +1,807 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  SUPERVISOR
+  AGENT
+  SALES_AGENT
+  EMERGENCY_TEAM
+}
+
+enum AgentStatus {
+  AVAILABLE
+  BUSY
+  BREAK
+  WRAP_UP
+  OFFLINE
+}
+
+enum ChannelType {
+  WHATSAPP
+  VOICE
+  EMAIL
+  SMS
+  CHAT
+  INSTAGRAM
+  MESSENGER
+}
+
+enum Priority {
+  LOW
+  NORMAL
+  HIGH
+  EMERGENCY
+}
+
+enum ConversationStatus {
+  OPEN
+  PENDING
+  RESOLVED
+  CLOSED
+}
+
+enum CallStatus {
+  RINGING
+  IN_PROGRESS
+  ENDED
+  MISSED
+  REJECTED
+}
+
+enum LeadStatus {
+  NEW
+  IN_PROGRESS
+  POSITIVE
+  NEGATIVE
+  FOLLOWUP_REQUIRED
+  CONVERTED
+  CLOSED
+}
+
+enum LeadPriority {
+  LOW
+  NORMAL
+  HIGH
+}
+
+enum MeetingType {
+  CALLBACK
+  APPOINTMENT
+  CONSULTATION
+  HOME_VISIT
+  DEMO_MEETING
+}
+
+enum AppointmentStatus {
+  REQUESTED
+  PENDING_CONFIRMATION
+  CONFIRMED
+  CHECKED_IN
+  IN_CONSULTATION
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+  RESCHEDULED
+}
+
+enum BookingSource {
+  VOICE_AGENT
+  HUMAN_AGENT
+  AI_AGENT
+  WHATSAPP
+  INSTAGRAM
+  WEBSITE
+  WALK_IN
+  PHONE
+  REFERRAL
+  CRM
+  OTHER
+}
+
+model User {
+  id            String    @id @default(uuid()) @db.Uuid
+  authUserId    String?   @unique // Supabase Auth UUID
+  email         String    @unique
+  passwordHash  String
+  role          UserRole  @default(AGENT)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  agentProfile  Agent?
+  callsMade     CallSession[] @relation("CallsMade")
+  callsReceived CallSession[] @relation("CallsReceived")
+  supervisorLogs SupervisorLog[]
+  uploadedLeads Lead[] @relation("UploadedLeads")
+  leadUploads   LeadUploadHistory[] @relation("LeadUploads")
+}
+
+model Agent {
+  id              String      @id @default(uuid()) @db.Uuid
+  userId          String      @unique @db.Uuid
+  user            User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Personal & Work Info
+  name            String
+  phone           String?
+  address         String?
+  city            String?
+  state           String?
+  country         String?
+  zipCode         String?
+  gender          String?
+  dob             DateTime?
+  employeeId      String?      @unique
+  department      String?
+  avatarUrl       String?
+  
+  // Operational Status
+  status          AgentStatus @default(OFFLINE)
+  socketId        String?
+  lastActive      DateTime?
+  joinedAt        DateTime    @default(now())
+  isDeleted       Boolean     @default(false)
+  activeCalls     Int         @default(0)
+  lastAssignedAt  DateTime?
+  extension       String?     @unique
+  skills          String[]    @default([])
+
+  // Relationships
+  assignedCalls   CallLog[]
+  assignedTickets Ticket[]
+  conversations   Conversation[]
+  sessions        WebsocketSession[]
+  calendar        Calendar?
+  crmTasks        CrmTask[]
+  appointmentsAsDoctor Appointment[] @relation("DoctorAppointments")
+  appointmentsAsAgent  Appointment[] @relation("AgentAppointments")
+
+  // CRM Expansion Relations
+  departments     Department[]
+  queueAssignments QueueAssignment[]
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  // Lead Management Relations
+  assignedLeads       Lead[] @relation("AssignedLeads")
+  agentFollowups      LeadFollowup[] @relation("AgentFollowups")
+  agentConversionLogs LeadConversionLog[] @relation("AgentConversionLogs")
+}
+
+model Customer {
+  id               String    @id @default(uuid()) @db.Uuid
+  name             String
+  phone            String    @unique
+  email            String?
+  emergencyContact String?
+  
+  // Omnichannel Identity fields
+  platform            String?
+  platformUserId      String?
+  instagramUsername   String?
+  instagramProfilePic String?
+  profileEnriched     Boolean   @default(false)
+  enrichmentFailed    Boolean   @default(false)
+  lastProfileSync     DateTime?
+
+  notes            CustomerNote[]
+  servicePlans     ServicePlan[]
+  conversations    Conversation[]
+  tickets          Ticket[]
+  calls            CallLog[]
+  callSessions     CallSession[]
+  billings         Billing[]
+  quotations       Quotation[]
+  orders           Order[]
+  subscriptions    Subscription[]
+  appointments     Appointment[]
+  crmTasks         CrmTask[]
+  platformIdentities PlatformIdentity[]
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+}
+
+model PlatformIdentity {
+  id             String   @id @default(uuid()) @db.Uuid
+  customerId     String   @db.Uuid
+  customer       Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  platform       String
+  platformUserId String
+  username       String?
+  profilePicture String?
+  metadata       Json?
+  
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model Conversation {
+  id          String             @id @default(uuid()) @db.Uuid
+  customerId  String             @db.Uuid
+  customer    Customer           @relation(fields: [customerId], references: [id])
+  agentId     String?            @db.Uuid
+  agent       Agent?             @relation(fields: [agentId], references: [id])
+  channel     ChannelType
+  priority    Priority           @default(NORMAL)
+  status      ConversationStatus @default(OPEN)
+  unreadCount Int                @default(0)
+  
+  messages    Message[]
+  aiSummary   AiSummary?
+  emailLogs   EmailLog[]
+  whatsappLogs WhatsappLog[]
+  callSessions CallSession[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Message {
+  id             String       @id @default(uuid()) @db.Uuid
+  conversationId String       @db.Uuid
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderType     String       // 'AGENT', 'CUSTOMER', 'SYSTEM', 'AI'
+  content        String
+  status         String       // 'SENT', 'DELIVERED', 'READ'
+  isAiSuggested  Boolean      @default(false)
+  
+  createdAt      DateTime     @default(now())
+}
+
+model CallLog {
+  id            String    @id @default(uuid()) @db.Uuid
+  customerId    String    @db.Uuid
+  customer      Customer  @relation(fields: [customerId], references: [id])
+  agentId       String?   @db.Uuid
+  agent         Agent?    @relation(fields: [agentId], references: [id])
+  vobizCallSid  String?
+  status        String
+  duration      Int       @default(0)
+  recordingUrl  String?
+  direction     String    @default("INBOUND") // 'INBOUND' or 'OUTBOUND'
+  
+  createdAt     DateTime  @default(now())
+}
+
+model Ticket {
+  id          String   @id @default(uuid()) @db.Uuid
+  customerId  String   @db.Uuid
+  customer    Customer @relation(fields: [customerId], references: [id])
+  agentId     String?  @db.Uuid
+  agent       Agent?   @relation(fields: [agentId], references: [id])
+  category    String
+  priority    Priority
+  status      String
+  resolution  String?
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model CustomerNote {
+  id          String   @id @default(uuid()) @db.Uuid
+  customerId  String   @db.Uuid
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  content     String
+  createdBy   String?  @db.Uuid // Agent ID
+  
+  createdAt   DateTime @default(now())
+}
+
+model ServicePlan {
+  id          String   @id @default(uuid()) @db.Uuid
+  customerId  String   @db.Uuid
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  planType    String
+  status      String   @default("ACTIVE")
+  startDate   DateTime
+  endDate     DateTime?
+  
+  createdAt   DateTime @default(now())
+}
+
+model AiSummary {
+  id             String       @id @default(uuid()) @db.Uuid
+  conversationId String       @unique @db.Uuid
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  summaryText    String
+  sentimentScore String
+  riskLevel      String
+  
+  createdAt      DateTime @default(now())
+}
+
+model QueueItem {
+  id          String   @id @default(uuid()) @db.Uuid
+  customerId  String   @db.Uuid
+  priority    Priority
+  department  String
+  status      String   // 'WAITING', 'ASSIGNED', 'ESCALATED'
+  
+  createdAt   DateTime @default(now())
+}
+
+model EmergencyAlert {
+  id          String   @id @default(uuid()) @db.Uuid
+  type        String
+  description String
+  status      String   @default("ACTIVE")
+  
+  createdAt   DateTime @default(now())
+  resolvedAt  DateTime?
+}
+
+model WebsocketSession {
+  id        String   @id @default(uuid()) @db.Uuid
+  agentId   String   @db.Uuid
+  agent     Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  socketId  String
+  
+  createdAt DateTime @default(now())
+}
+
+model EmailLog {
+  id              String   @id @default(uuid()) @db.Uuid
+  conversationId  String   @db.Uuid
+  customerEmail   String
+  subject         String
+  body            String
+  status          String   @default("SENT")
+  messageId       String?
+  sentAt          DateTime @default(now())
+  
+  conversation    Conversation @relation(fields: [conversationId], references: [id])
+}
+
+model WhatsappLog {
+  id              String   @id @default(uuid()) @db.Uuid
+  conversationId  String   @db.Uuid
+  phone           String
+  message         String
+  direction       String   @default("OUTBOUND")
+  status          String   @default("SENT")
+  twilioSid       String?
+  createdAt       DateTime @default(now())
+
+  conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+}
+
+// ==========================================
+// CRM EXPANSION MODELS
+// ==========================================
+
+model Billing {
+  id          String   @id @default(uuid()) @db.Uuid
+  customerId  String   @db.Uuid
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  amount      Float
+  currency    String   @default("USD")
+  status      String   // 'PAID', 'UNPAID', 'OVERDUE'
+  dueDate     DateTime
+  
+  invoices    Invoice[]
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Invoice {
+  id          String   @id @default(uuid()) @db.Uuid
+  billingId   String   @db.Uuid
+  billing     Billing  @relation(fields: [billingId], references: [id], onDelete: Cascade)
+  invoiceNo   String   @unique
+  issueDate   DateTime
+  pdfUrl      String?
+  
+  createdAt   DateTime @default(now())
+}
+
+model Quotation {
+  id          String   @id @default(uuid()) @db.Uuid
+  customerId  String   @db.Uuid
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  amount      Float
+  status      String   // 'DRAFT', 'SENT', 'ACCEPTED', 'REJECTED'
+  validUntil  DateTime
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Order {
+  id          String   @id @default(uuid()) @db.Uuid
+  customerId  String   @db.Uuid
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  totalAmount Float
+  status      String   // 'PENDING', 'COMPLETED', 'CANCELLED'
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Subscription {
+  id          String   @id @default(uuid()) @db.Uuid
+  customerId  String   @db.Uuid
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  planName    String
+  status      String   // 'ACTIVE', 'CANCELLED', 'SUSPENDED'
+  nextBilling DateTime
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ==========================================
+// SCHEDULING MODELS
+// ==========================================
+
+model Calendar {
+  id          String   @id @default(uuid()) @db.Uuid
+  agentId     String   @unique @db.Uuid
+  agent       Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  
+  events      Appointment[]
+}
+
+model Appointment {
+  id                 String             @id @default(uuid()) @db.Uuid
+  bookingId          String             @unique @default(uuid())
+  calendarId         String?            @db.Uuid
+  calendar           Calendar?          @relation(fields: [calendarId], references: [id], onDelete: Cascade)
+  
+  customerId         String?            @db.Uuid
+  customer           Customer?          @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  leadId             String?            @db.Uuid
+  lead               Lead?              @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  
+  doctorId           String?            @db.Uuid
+  doctor             Agent?             @relation("DoctorAppointments", fields: [doctorId], references: [id])
+  
+  assignedAgentId    String?            @db.Uuid
+  assignedAgent      Agent?             @relation("AgentAppointments", fields: [assignedAgentId], references: [id])
+
+  title              String
+  treatment          String?
+  date               DateTime           @db.Date
+  startTime          DateTime
+  endTime            DateTime
+  duration           Int                @default(30) // in minutes
+  timezone           String             @default("UTC")
+  
+  status             AppointmentStatus  @default(REQUESTED)
+  bookingSource      BookingSource      @default(CRM)
+  appointmentType    String?
+  notes              String?
+  
+  cancellationReason String?
+  rescheduleReason   String?
+  confirmationStatus String?
+  reminderStatus     String?
+  
+  createdBy          String?            @db.Uuid
+  updatedBy          String?            @db.Uuid
+  
+  callSessionId      String?            @db.Uuid
+  callSession        CallSession?       @relation(fields: [callSessionId], references: [id])
+  
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  @@index([doctorId, startTime])
+  @@index([customerId])
+  @@index([startTime])
+  @@index([status])
+}
+
+model CrmTask {
+  id          String   @id @default(uuid()) @db.Uuid
+  agentId     String   @db.Uuid
+  agent       Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  customerId  String?  @db.Uuid
+  customer    Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  title       String
+  description String?
+  dueDate     DateTime?
+  status      String   // 'TODO', 'IN_PROGRESS', 'DONE'
+  priority    Priority @default(NORMAL)
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ==========================================
+// AUTOMATION ENGINE MODELS
+// ==========================================
+
+model WorkflowAutomation {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  description String?
+  isActive    Boolean  @default(true)
+  triggerType String   // 'MISSED_CALL', 'NEGATIVE_SENTIMENT', 'TICKET_CLOSED'
+  actionType  String   // 'SEND_WHATSAPP', 'CREATE_TICKET', 'ESCALATE'
+  actionConfig Json?   // Stores template, payload, etc.
+  
+  triggers    AutomationTrigger[]
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model AutomationTrigger {
+  id             String             @id @default(uuid()) @db.Uuid
+  workflowId     String             @db.Uuid
+  workflow       WorkflowAutomation @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  targetId       String?            // The ID of the item that triggered this (e.g., callSid, ticketId)
+  status         String             // 'PENDING', 'SUCCESS', 'FAILED'
+  executionLog   String?
+  
+  executedAt     DateTime?
+  createdAt      DateTime @default(now())
+}
+
+model CallSession {
+  id             String        @id @default(uuid()) @db.Uuid
+  conversationId String?       @db.Uuid
+  callerUserId   String?       @db.Uuid
+  calleeUserId   String?       @db.Uuid
+  customerId     String?       @db.Uuid
+  status         CallStatus    @default(RINGING)
+  startedAt      DateTime?
+  endedAt        DateTime?
+  duration       Int?          @default(0)
+  recordingUrl   String?
+  reason         String?
+  livekitRoom    String?
+  livekitSipParticipantIdentity String?
+  livekitEgressId String?
+  transferHistory Json?
+  holdDuration   Int?          @default(0)
+  aiProcessingStatus String    @default("PENDING") // PENDING, RECORDING_PENDING, TRANSCRIBING, ANALYZING, COMPLETED, FAILED
+  recordingStatus       String?  @default("NOT_AVAILABLE") // PENDING, RECORDING, PROCESSING, READY, FAILED, NOT_AVAILABLE
+  recordingStoragePath  String?
+  recordingMimeType     String?
+  recordingFileSize     Int?
+  recordingDuration     Int?
+  recordingStartedAt    DateTime?
+  recordingCompletedAt  DateTime?
+  createdAt      DateTime      @default(now())
+
+  caller         User?         @relation("CallsMade", fields: [callerUserId], references: [id])
+  callee         User?         @relation("CallsReceived", fields: [calleeUserId], references: [id])
+  customer       Customer?     @relation(fields: [customerId], references: [id])
+  conversation   Conversation? @relation(fields: [conversationId], references: [id])
+  mediasoupTransports MediasoupTransport[]
+
+  participants   CallParticipant[]
+  recordings     CallRecording[]
+  analytics      CallAnalytics?
+  appointments   Appointment[]
+
+  @@index([status])
+  @@index([startedAt])
+  @@index([callerUserId])
+  @@index([customerId])
+}
+
+model CallParticipant {
+  id             String      @id @default(uuid()) @db.Uuid
+  callSessionId  String      @db.Uuid
+  callSession    CallSession @relation(fields: [callSessionId], references: [id], onDelete: Cascade)
+  agentId        String?     @db.Uuid
+  customerId     String?     @db.Uuid
+  role           String      // 'AGENT', 'CUSTOMER', 'AI'
+  joinedAt       DateTime    @default(now())
+  leftAt         DateTime?
+  duration       Int?
+}
+
+model CallRecording {
+  id             String      @id @default(uuid()) @db.Uuid
+  callSessionId  String      @db.Uuid
+  callSession    CallSession @relation(fields: [callSessionId], references: [id], onDelete: Cascade)
+  recordingUrl   String
+  duration       Int
+  size           Int?
+  createdAt      DateTime    @default(now())
+}
+
+model CallAnalytics {
+  id             String      @id @default(uuid()) @db.Uuid
+  callSessionId  String      @unique @db.Uuid
+  callSession    CallSession @relation(fields: [callSessionId], references: [id], onDelete: Cascade)
+  sentimentScore Float?
+  silenceRatio   Float?
+  talkRatio      Float?
+  summary        String?
+  createdAt      DateTime    @default(now())
+}
+
+// ==========================================
+// ENTERPRISE CONTACT CENTER MODELS
+// ==========================================
+
+model Department {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @unique
+  description String?
+  
+  queues      Queue[]
+  agents      Agent[]
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Queue {
+  id           String   @id @default(uuid()) @db.Uuid
+  departmentId String   @db.Uuid
+  department   Department @relation(fields: [departmentId], references: [id])
+  name         String
+  routingType  String   // 'FIFO', 'ROUND_ROBIN', 'SKILL_BASED'
+  
+  assignments  QueueAssignment[]
+  
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model QueueAssignment {
+  id          String   @id @default(uuid()) @db.Uuid
+  queueId     String   @db.Uuid
+  queue       Queue    @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  agentId     String   @db.Uuid
+  agent       Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  skillLevel  Int      @default(1) // 1-5
+  skills      String[] // Array of skill tags
+  
+  createdAt   DateTime @default(now())
+}
+
+model SupervisorLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  supervisorId String   @db.Uuid
+  supervisor   User     @relation(fields: [supervisorId], references: [id])
+  action       String
+  targetId     String?
+  details      Json
+  
+  createdAt    DateTime @default(now())
+}
+
+model SlaLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  queueId      String   @db.Uuid
+  breachType   String   // 'WAIT_TIME', 'HANDLE_TIME'
+  threshold    Int
+  actualValue  Int
+  
+  createdAt    DateTime @default(now())
+}
+
+model MediasoupTransport {
+  id           String   @id @default(uuid()) @db.Uuid
+  sessionId    String   @db.Uuid
+  callSession  CallSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  transportId  String   @unique
+  type         String   // 'webrtc' | 'plain'
+  direction    String   // 'send' | 'recv'
+  
+  createdAt    DateTime @default(now())
+}
+
+// ==========================================
+// LEAD MANAGEMENT SYSTEM
+// ==========================================
+
+model Lead {
+  id                String      @id @default(uuid()) @db.Uuid
+  customerName      String
+  phoneNumber       String      @unique
+  email             String?
+  serviceInterest   String?     // 'Elderly Care', 'Home Service', etc.
+  city              String?
+  notes             String?
+  source            String?     // e.g. 'Excel Upload', 'Website'
+  status            LeadStatus  @default(NEW)
+  priority          LeadPriority @default(NORMAL)
+  conversionScore   Int?        // 0-100 from Gemini
+  sentiment         String?     // 'POSITIVE', 'NEGATIVE', 'NEUTRAL'
+  
+  uploadedById      String?     @db.Uuid
+  uploadedBy        User?       @relation("UploadedLeads", fields: [uploadedById], references: [id])
+  
+  assignedAgentId   String?     @db.Uuid
+  assignedAgent     Agent?      @relation("AssignedLeads", fields: [assignedAgentId], references: [id])
+  
+  uploadHistoryId   String?     @db.Uuid
+  uploadHistory     LeadUploadHistory? @relation(fields: [uploadHistoryId], references: [id])
+
+  lockedAt          DateTime?   // For Redis/DB lock when claiming
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  followups         LeadFollowup[]
+  conversionLogs    LeadConversionLog[]
+  notifications     LeadNotification[]
+  appointments      Appointment[]
+
+  @@index([status])
+  @@index([assignedAgentId])
+  @@index([createdAt])
+}
+
+model LeadFollowup {
+  id                  String      @id @default(uuid()) @db.Uuid
+  leadId              String      @db.Uuid
+  lead                Lead        @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  assignedAgentId     String      @db.Uuid
+  assignedAgent       Agent       @relation("AgentFollowups", fields: [assignedAgentId], references: [id], onDelete: Cascade)
+  
+  followupDate        DateTime
+  meetingType         MeetingType @default(CALLBACK)
+  purpose             String?
+  notes               String?
+  customerConfirmation Boolean    @default(false)
+  status              String      @default("PENDING") // PENDING, COMPLETED, CANCELLED
+  
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+}
+
+model LeadConversionLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  leadId      String   @db.Uuid
+  lead        Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  agentId     String?  @db.Uuid
+  agent       Agent?   @relation("AgentConversionLogs", fields: [agentId], references: [id])
+  
+  oldStatus   LeadStatus?
+  newStatus   LeadStatus
+  notes       String?
+  
+  createdAt   DateTime @default(now())
+}
+
+model LeadUploadHistory {
+  id              String   @id @default(uuid()) @db.Uuid
+  fileName        String
+  uploadedById    String   @db.Uuid
+  uploadedBy      User     @relation("LeadUploads", fields: [uploadedById], references: [id])
+  
+  totalRows       Int      @default(0)
+  successfulRows  Int      @default(0)
+  failedRows      Int      @default(0)
+  status          String   @default("COMPLETED") // PENDING, PROCESSING, COMPLETED, FAILED
+  errorLog        Json?
+  
+  leads           Lead[]
+  
+  createdAt       DateTime @default(now())
+}
+
+model LeadNotification {
+  id          String   @id @default(uuid()) @db.Uuid
+  leadId      String   @db.Uuid
+  lead        Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  
+  type        String   // REMINDER, ASSIGNMENT, STATUS_CHANGE
+  channel     String   // WHATSAPP, SMS, EMAIL, IN_APP
+  content     String
+  status      String   @default("PENDING") // PENDING, SENT, FAILED
+  scheduledFor DateTime?
+  
+  createdAt   DateTime @default(now())
+  sentAt      DateTime?
+}
