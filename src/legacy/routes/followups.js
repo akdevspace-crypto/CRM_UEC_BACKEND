@@ -22,8 +22,18 @@ const reminderQueue = new Queue('reminderQueue', { connection: redisConnection }
 router.get('/', async (req, res) => {
   try {
     const { agentId, status } = req.query;
+    const reqRole = req.user?.role;
+    const reqAgentId = req.user?.agentId || req.user?.userId;
+    const isElevated = reqRole && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(reqRole);
+
     const whereClause = {};
-    if (agentId) whereClause.assignedAgentId = agentId;
+    if (!isElevated) {
+      // Agents only see their assigned followups
+      if (reqAgentId) whereClause.assignedAgentId = reqAgentId;
+    } else if (agentId) {
+      whereClause.assignedAgentId = agentId;
+    }
+
     if (status) whereClause.status = status;
 
     const followups = await prisma.leadFollowup.findMany({
@@ -46,11 +56,13 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const { leadId, agentId, followupDate, meetingType, purpose, notes } = req.body;
+    const isElevated = req.user?.role && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(req.user.role);
+    const assignedAgentId = (isElevated && agentId) ? agentId : (req.user?.agentId || req.user?.userId);
 
     const followup = await prisma.leadFollowup.create({
       data: {
         leadId,
-        assignedAgentId: agentId,
+        assignedAgentId,
         followupDate: new Date(followupDate),
         meetingType,
         purpose,

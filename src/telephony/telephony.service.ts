@@ -451,9 +451,29 @@ export class TelephonyService {
     return { queuedCalls, missedCalls, activeCalls };
   }
 
-  async getCallHistory() {
+  async getCallHistory(user?: any) {
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+    const whereClause: any = { status: { in: ['ENDED', 'MISSED', 'REJECTED'] } };
+
+    if (!isElevated && user) {
+      whereClause.OR = [
+        { callerUserId: user.userId },
+        { calleeUserId: user.userId },
+        {
+          participants: {
+            some: {
+              OR: [
+                { agentId: user.agentId },
+                { agentId: user.id },
+              ]
+            }
+          }
+        }
+      ];
+    }
+
     const records = await this.prisma.callSession.findMany({
-      where: { status: { in: ['ENDED', 'MISSED', 'REJECTED'] } },
+      where: whereClause,
       orderBy: { startedAt: 'desc' },
       take: 50,
       include: {

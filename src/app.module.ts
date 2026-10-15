@@ -9,6 +9,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { RedisModule } from './redis/redis.module';
 import { ApiGatewayModule } from './api-gateway/api-gateway.module';
 import { AuthGuard } from './api-gateway/auth.guard';
+import { RolesGuard } from './api-gateway/roles.guard';
 import { AgentModule } from './agent/agent.module';
 import { QueueOrchestrationModule } from './queue-orchestration/queue-orchestration.module';
 import { TelephonyModule } from './telephony/telephony.module';
@@ -73,6 +74,10 @@ const getRedisConnectionOptions = () => {
     {
       provide: APP_GUARD,
       useClass: AuthGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: RolesGuard,
     },
     {
       provide: APP_GUARD,

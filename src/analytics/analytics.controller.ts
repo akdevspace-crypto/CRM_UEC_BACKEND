@@ -1,4 +1,4 @@
-import { Controller, Get, Logger } from '@nestjs/common';
+import { Controller, Get, Logger, Req } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Controller('api/v1/analytics')
@@ -8,9 +8,33 @@ export class AnalyticsController {
   constructor(private readonly prisma: PrismaService) {}
 
   @Get('summaries')
-  async getAiSummaries() {
+  async getAiSummaries(@Req() req: any) {
     this.logger.log('Fetching AI Summaries...');
+    const user = req?.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+
+    const whereClause: any = {};
+    if (!isElevated && user) {
+      whereClause.callSession = {
+        OR: [
+          { callerUserId: user.userId },
+          { calleeUserId: user.userId },
+          {
+            participants: {
+              some: {
+                OR: [
+                  { agentId: user.agentId },
+                  { agentId: user.id },
+                ]
+              }
+            }
+          }
+        ]
+      };
+    }
+
     const analytics = await this.prisma.callAnalytics.findMany({
+      where: whereClause,
       orderBy: { createdAt: 'desc' },
       take: 50,
       include: {

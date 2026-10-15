@@ -1,6 +1,7 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const bcrypt = require('bcryptjs');
+const { requireRole } = require('../middleware/auth');
 
 const router = express.Router();
 const prisma = require('../prisma');
@@ -216,8 +217,8 @@ router.get('/dashboard-metrics', async (req, res) => {
   }
 });
 
-// CREATE agent
-router.post('/create', async (req, res) => {
+// CREATE agent (Restricted to SUPER_ADMIN, ADMIN, HR)
+router.post('/create', requireRole(['SUPER_ADMIN', 'ADMIN', 'HR']), async (req, res) => {
   const {
     fullName, email, password, phone, address, city, state, country, zipCode,
     gender, dob, employeeId, department, role, status, joinedAt
@@ -234,7 +235,6 @@ router.post('/create', async (req, res) => {
     }
 
     // 1. Create user in Supabase Auth (Admin API)
-    // Note: If you don't actually use Supabase Auth, you can comment this out and rely on Prisma only.
     let authUserId = null;
     try {
       const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
@@ -245,7 +245,6 @@ router.post('/create', async (req, res) => {
       });
       if (authError) {
         console.warn('Supabase Auth error:', authError.message);
-        // Fallback: If Supabase admin isn't fully configured, we continue to create Prisma record
       } else if (authUser?.user) {
         authUserId = authUser.user.id;
       }
@@ -299,12 +298,29 @@ router.post('/create', async (req, res) => {
   }
 });
 
-// UPDATE agent
+// UPDATE agent (Restricted to SUPER_ADMIN, ADMIN, HR, or self-update for personal details)
 router.put('/:id', async (req, res) => {
   const { id } = req.params;
   const updateData = req.body;
+  const currentUser = req.user;
   
   try {
+    const agentRecord = await prisma.agent.findUnique({ where: { id } });
+    if (!agentRecord) return res.status(404).json({ error: 'Agent not found' });
+
+    const isElevated = currentUser && ['SUPER_ADMIN', 'ADMIN', 'HR'].includes(currentUser.role);
+    const isSelf = currentUser && (currentUser.agentId === id || currentUser.userId === agentRecord.userId);
+
+    if (!isElevated && !isSelf) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to update this agent' });
+    }
+
+    // Non-elevated users cannot change their role or email
+    if (!isElevated) {
+      delete updateData.role;
+      delete updateData.email;
+    }
+
     // Extract user specific fields
     const userUpdate = {};
     if (updateData.email) userUpdate.email = updateData.email;
@@ -313,7 +329,6 @@ router.put('/:id', async (req, res) => {
         const existingSuperAdmin = await prisma.user.findFirst({
           where: { role: 'SUPER_ADMIN' }
         });
-        const agentRecord = await prisma.agent.findUnique({ where: { id } });
         if (existingSuperAdmin && existingSuperAdmin.id !== agentRecord.userId) {
           return res.status(400).json({ error: 'Only one Super Admin slot is allowed in the system.' });
         }
@@ -333,7 +348,6 @@ router.put('/:id', async (req, res) => {
 
     const updatedAgent = await prisma.$transaction(async (tx) => {
       if (Object.keys(userUpdate).length > 0) {
-        const agentRecord = await tx.agent.findUnique({ where: { id } });
         await tx.user.update({
           where: { id: agentRecord.userId },
           data: userUpdate
@@ -356,8 +370,8 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-// DELETE agent (Soft Delete)
-router.delete('/:id', async (req, res) => {
+// DELETE agent (Soft Delete - Restricted to SUPER_ADMIN, ADMIN)
+router.delete('/:id', requireRole(['SUPER_ADMIN', 'ADMIN']), async (req, res) => {
   const { id } = req.params;
   try {
     const deletedAgent = await prisma.agent.update({

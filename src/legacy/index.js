@@ -50,15 +50,15 @@ const metaWebhookRouter = require('./routes/metaWebhook');
 app.use('/', metaWebhookRouter);
 
 // Agents Routes
-const { requireAuth } = require('./middleware/auth');
+const { requireAuth, requireRole } = require('./middleware/auth');
 const agentsRouter = require('./routes/agents');
 app.use('/api/v1/agents', requireAuth, agentsRouter);
 
 // Lead Management Routes
 const leadsRouter = require('./routes/leads');
 const followupsRouter = require('./routes/followups');
-app.use('/api/v1/leads', leadsRouter);
-app.use('/api/v1/followups', followupsRouter);
+app.use('/api/v1/leads', requireAuth, leadsRouter);
+app.use('/api/v1/followups', requireAuth, followupsRouter);
 
 // ==========================================
 // FREESWITCH IVR WEBHOOK
@@ -212,7 +212,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
 */
 
 // Dynamic CRM APIs
-app.get('/api/v1/conversations', async (req, res) => {
+app.get('/api/v1/conversations', requireAuth, async (req, res) => {
   try {
     const conversations = await prisma.conversation.findMany({
       include: {
@@ -225,10 +225,10 @@ app.get('/api/v1/conversations', async (req, res) => {
     // Transform to match frontend expectations
     const formatted = conversations.map(c => ({
       id: c.id,
-      customerId: c.customer.id,
-      customerName: c.channel === 'INSTAGRAM' && c.customer.instagramUsername ? c.customer.instagramUsername : c.customer.name,
-      customerAvatar: c.customer.instagramProfilePic || null,
-      customerEmail: c.customer.email || 'unknown@example.com',
+      customerId: c.customer?.id,
+      customerName: c.channel === 'INSTAGRAM' && c.customer?.instagramUsername ? c.customer.instagramUsername : (c.customer?.name || 'Unknown'),
+      customerAvatar: c.customer?.instagramProfilePic || null,
+      customerEmail: c.customer?.email || 'unknown@example.com',
       channel: c.channel.toLowerCase(),
       lastMessage: c.messages[0]?.content || 'No messages',
       unreadCount: c.unreadCount,
@@ -245,8 +245,13 @@ app.get('/api/v1/conversations', async (req, res) => {
 });
 
 // Fetch Customer Full Profile (Omnichannel Fix Phase 1)
-app.get('/api/v1/customers/:id', async (req, res) => {
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+app.get('/api/v1/customers/:id', requireAuth, async (req, res) => {
   try {
+    if (!UUID_REGEX.test(req.params.id)) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
     const customer = await prisma.customer.findUnique({
       where: { id: req.params.id },
       include: {
@@ -276,7 +281,7 @@ app.get('/api/v1/customers/:id', async (req, res) => {
 });
 
 // Fetch Customer by Phone
-app.get('/api/v1/customers', async (req, res) => {
+app.get('/api/v1/customers', requireAuth, async (req, res) => {
   try {
     const { phone } = req.query;
     if (!phone) {
@@ -341,7 +346,7 @@ app.get('/api/v1/agents', async (req, res) => {
 });
 
 // Send new message
-app.post('/api/v1/messages/send', async (req, res) => {
+app.post('/api/v1/messages/send', requireAuth, async (req, res) => {
   const { conversationId, content, senderType } = req.body;
   try {
     const newMessage = await prisma.message.create({
@@ -367,7 +372,7 @@ app.post('/api/v1/messages/send', async (req, res) => {
 const { sendEmailReply } = require('./mailer');
 
 // Send actual Email and log it
-app.post('/api/messages/send-email', async (req, res) => {
+app.post('/api/messages/send-email', requireAuth, async (req, res) => {
   const { conversationId, customerEmail, subject, message, agentId } = req.body;
   try {
     // 1. Verify conversation
@@ -606,7 +611,7 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER || 'whatsapp:+14155238886';
 
 // OUTGOING WHATSAPP
-app.post('/api/messages/send-whatsapp', async (req, res) => {
+app.post('/api/messages/send-whatsapp', requireAuth, async (req, res) => {
   const { conversationId, message } = req.body;
   try {
     const conversation = await prisma.conversation.findUnique({
@@ -664,8 +669,8 @@ app.post('/api/messages/send-whatsapp', async (req, res) => {
   }
 });
 
-// TEST ROUTE
-app.get('/test-send', async (req, res) => {
+// TEST ROUTE (Restricted to Super Admin)
+app.get('/test-send', requireAuth, requireRole(['SUPER_ADMIN']), async (req, res) => {
   try {
     // For test, you can dynamically read from query string or use hardcoded if none provided
     // example: /test-send?to=+91xxxxxx
@@ -685,9 +690,9 @@ app.get('/test-send', async (req, res) => {
 });
 
 // OUTGOING INSTAGRAM
-const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || 'IGAASXVchcdJdBZAGFnRU5iQzRRbGN2VWJUSmN1UHZANSk9CV1JSYklpQi1Va2NaME44T1JxU1FJVlBaNk1sWGpRZAjhJbWM0NHNfZAFpzUF9janYwVXdmcTg1UFhKWWszYllSakhIcW5VbGE4T1VYRkZAVcE83UjhPYkFqUTJzdFhrUQZDZD';
+const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || process.env.META_ACCESS_TOKEN || '';
 
-app.post('/api/messages/send-instagram', async (req, res) => {
+app.post('/api/messages/send-instagram', requireAuth, async (req, res) => {
   const { conversationId, message } = req.body;
   try {
     const conversation = await prisma.conversation.findUnique({
@@ -752,8 +757,26 @@ app.post('/api/messages/send-instagram', async (req, res) => {
 });
 
 // Fetch messages for a specific conversation
-app.get('/api/v1/conversations/:id/messages', async (req, res) => {
+app.get('/api/v1/conversations/:id/messages', requireAuth, async (req, res) => {
   try {
+    if (!UUID_REGEX.test(req.params.id)) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    const conversation = await prisma.conversation.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    const user = req.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+    if (!isElevated && user && conversation.agentId && conversation.agentId !== user.agentId && conversation.agentId !== user.userId) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to access this conversation' });
+    }
+
     const messages = await prisma.message.findMany({
       where: { conversationId: req.params.id },
       orderBy: { createdAt: 'asc' }
@@ -776,8 +799,12 @@ app.get('/api/v1/conversations/:id/messages', async (req, res) => {
 });
 
 // Mark conversation as read
-app.put('/api/v1/conversations/:id/read', async (req, res) => {
+app.put('/api/v1/conversations/:id/read', requireAuth, async (req, res) => {
   try {
+    if (!UUID_REGEX.test(req.params.id)) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
     const updatedConv = await prisma.conversation.update({
       where: { id: req.params.id },
       data: { unreadCount: 0 }
@@ -794,18 +821,18 @@ app.put('/api/v1/conversations/:id/read', async (req, res) => {
 });
 
 // Fetch AI Call Records (Call Logs with AI Summaries)
-app.get('/api/v1/call-records', async (req, res) => {
+app.get('/api/v1/call-records', requireAuth, async (req, res) => {
   try {
-    const role = req.headers['x-user-role'];
-    const agentId = req.headers['x-agent-id'];
+    const role = req.user?.role;
+    const agentId = req.user?.agentId || req.user?.userId;
 
     const whereClause = {};
 
-    if (role !== 'SUPER_ADMIN') {
-      // Admins and Agents can only see OUTBOUND calls
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(role);
+    if (!isElevated) {
+      // Admins and Managers see all; regular agents only see OUTBOUND calls assigned to them
       whereClause.direction = 'OUTBOUND';
-      if (role !== 'ADMIN' && agentId) {
-        // Regular agents can only see THEIR outbound calls
+      if (agentId) {
         whereClause.agentId = agentId;
       }
     }
@@ -857,9 +884,9 @@ app.get('/api/v1/call-records', async (req, res) => {
 });
 
 // End Call Endpoint
-app.post('/api/v1/calls/:sid/end', async (req, res) => {
+app.post('/api/v1/calls/:sid/end', requireAuth, async (req, res) => {
   const { sid } = req.params;
-  const { duration, transcript, recordingUrl, conversationId } = req.body;
+  const { duration, transcript, recordingUrl, conversationId, customerId, agentId } = req.body;
 
   try {
     // 1. Update the Call Log
@@ -885,7 +912,7 @@ app.post('/api/v1/calls/:sid/end', async (req, res) => {
       aiResult = await generateCallSummary(transcript);
       console.log(`[AI Analysis] Call ${sid} Sentiment: ${aiResult.sentiment}`);
 
-      // Update CallLog with AI data (if your schema supports it, otherwise store in a note/log)
+      // Update CallLog with AI data
       await prisma.callLog.updateMany({
         where: { vobizCallSid: sid },
         data: {
@@ -898,7 +925,7 @@ app.post('/api/v1/calls/:sid/end', async (req, res) => {
     const { evaluateTriggers } = require('./workflows/workflowEngine');
     await evaluateTriggers('CALL_COMPLETED', {
       callSid: sid,
-      customerId: callRecord?.customerId,
+      customerId: callRecord?.customerId || customerId,
       transcript,
       recordingUrl,
       aiAnalysis: aiResult
@@ -908,11 +935,12 @@ app.post('/api/v1/calls/:sid/end', async (req, res) => {
     if (aiResult?.sentiment === 'NEGATIVE' || aiResult?.escalationRisk === 'HIGH') {
       await evaluateTriggers('NEGATIVE_SENTIMENT', {
         callSid: sid,
-        customerId: callRecord?.customerId,
+        customerId: callRecord?.customerId || customerId,
         reason: aiResult.summary
       });
     }
 
+    io.emit('callEnded', { sid, duration, summary: aiResult });
     res.json({ success: true, aiSummary: aiResult });
   } catch (err) {
     console.error('Error ending call:', err);
@@ -924,14 +952,15 @@ app.post('/api/v1/calls/:sid/end', async (req, res) => {
 // CALL LOGIC & AI SUMMARY
 // ==========================================
 
-app.get('/api/v1/calls/records', async (req, res) => {
+app.get('/api/v1/calls/records', requireAuth, async (req, res) => {
   try {
-    const role = req.headers['x-user-role'];
-    const agentId = req.headers['x-agent-id'];
+    const role = req.user?.role;
+    const agentId = req.user?.agentId || req.user?.userId;
 
     const whereClause = {};
 
-    if (role !== 'SUPER_ADMIN' && role !== 'ADMIN') {
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(role);
+    if (!isElevated) {
       // Regular agent: ONLY outbound calls attended by them
       whereClause.direction = 'OUTBOUND';
       if (agentId) {
@@ -952,8 +981,6 @@ app.get('/api/v1/calls/records', async (req, res) => {
 
     // We fetch AiSummary from conversation notes manually if we need to
     const formatted = callLogs.map(log => {
-      // Basic heuristic for direction: if it's from the dashboard it's likely outbound, 
-      // but without a strict 'direction' field in CallLog, we can infer from status/department
       const aiNote = log.customer?.notes?.find(n => n.content.includes(`[Call: ${log.vobizCallSid}]`));
       let aiSummary = null;
       if (aiNote) {
@@ -972,7 +999,6 @@ app.get('/api/v1/calls/records', async (req, res) => {
         duration: log.duration,
         recordingUrl: log.recordingUrl,
         date: log.createdAt,
-        // Mock classification since direction isn't natively in CallLog yet
         direction: (log.agentId) ? 'Outbound' : 'Inbound',
         aiSummary
       };
@@ -985,99 +1011,33 @@ app.get('/api/v1/calls/records', async (req, res) => {
   }
 });
 
-app.post('/api/v1/calls/:sid/end', async (req, res) => {
-  const { sid } = req.params;
-  const { duration, customerId, agentId, transcript } = req.body;
-
-  try {
-    // Basic AI Summary Simulation based on transcript or duration
-    let summaryText = "Call completed successfully.";
-    let sentimentScore = "NEUTRAL";
-    let riskLevel = "LOW";
-
-    if (transcript && transcript.toLowerCase().includes("angry")) {
-      sentimentScore = "NEGATIVE";
-      riskLevel = "HIGH";
-      summaryText = "Customer was upset regarding unresolved issues.";
-    } else if (duration > 300) {
-      summaryText = "Long call discussing multiple questions. Required detailed explanation.";
-    }
-
-    // Attempt to find existing conversation or create one
-    let conversation = await prisma.conversation.findFirst({
-      where: { customerId: customerId, status: 'OPEN' }
-    });
-
-    if (!conversation && customerId) {
-      conversation = await prisma.conversation.create({
-        data: {
-          customerId,
-          channel: 'VOICE',
-          priority: 'NORMAL',
-          status: 'RESOLVED'
-        }
-      });
-    }
-
-    let aiSummary = null;
-    if (conversation) {
-      aiSummary = await prisma.aiSummary.create({
-        data: {
-          conversationId: conversation.id,
-          summaryText,
-          actionItems: ["Review account details", "Send follow-up email"],
-          sentimentScore,
-          riskLevel
-        }
-      });
-
-      // Update customer profile note
-      await prisma.customerNote.create({
-        data: {
-          customerId: customerId,
-          content: `Call Summary: ${summaryText}`,
-          agentId: agentId || null
-        }
-      });
-    }
-
-    // Check if we should auto-escalate to ticket
-    if (riskLevel === "HIGH" && customerId) {
-      const ticket = await prisma.ticket.create({
-        data: {
-          customerId: customerId,
-          category: 'Escalation',
-          priority: 'HIGH',
-          status: 'OPEN',
-          resolution: 'Auto-generated from HIGH risk call.',
-          agentId: agentId || null
-        }
-      });
-      io.emit('ticketCreated', ticket);
-    }
-
-    io.emit('callEnded', { sid, duration, summary: aiSummary });
-    res.json({ success: true, aiSummary });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to process call end' });
-  }
-});
-
 // ==========================================
 // TICKETING API
 // ==========================================
 
-app.get('/api/v1/tickets', async (req, res) => {
+app.get('/api/v1/tickets', requireAuth, async (req, res) => {
   try {
+    const role = req.user?.role;
+    const agentId = req.user?.agentId || req.user?.userId;
+
+    const whereClause = {};
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(role);
+    if (!isElevated && agentId) {
+      whereClause.OR = [
+        { agentId: agentId },
+        { agentId: null }
+      ];
+    }
+
     const tickets = await prisma.ticket.findMany({
+      where: whereClause,
       include: { customer: true, agent: true },
       orderBy: { updatedAt: 'desc' }
     });
 
     res.json(tickets.map(t => ({
       id: t.id,
-      customer: t.customer.name,
+      customer: t.customer?.name || 'Unknown',
       subject: t.category,
       status: t.status,
       priority: t.priority,
@@ -1089,7 +1049,7 @@ app.get('/api/v1/tickets', async (req, res) => {
   }
 });
 
-app.post('/api/v1/tickets', async (req, res) => {
+app.post('/api/v1/tickets', requireAuth, async (req, res) => {
   const { customerPhone, customerName, subject, description, priority, category, agentId } = req.body;
   try {
     let customer = await prisma.customer.findUnique({ where: { phone: customerPhone } });
@@ -1097,7 +1057,8 @@ app.post('/api/v1/tickets', async (req, res) => {
       customer = await prisma.customer.create({ data: { name: customerName, phone: customerPhone } });
     }
 
-    let assignedAgentId = agentId || null;
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(req.user?.role);
+    let assignedAgentId = (isElevated && agentId) ? agentId : (req.user?.agentId || null);
     const ticketCategory = category || subject;
 
     // Intelligent Routing by Department
@@ -1127,7 +1088,7 @@ app.post('/api/v1/tickets', async (req, res) => {
         category: ticketCategory,
         priority: priority || 'NORMAL',
         status: 'OPEN',
-        resolution: description, // Storing description in resolution for now
+        resolution: description,
         agentId: assignedAgentId
       },
       include: {
@@ -1149,7 +1110,7 @@ app.post('/api/v1/tickets', async (req, res) => {
 // ==========================================
 // TELEPHONY: CALL TRANSFER (SIP)
 // ==========================================
-app.post('/api/v1/calls/:sid/transfer', async (req, res) => {
+app.post('/api/v1/calls/:sid/transfer', requireAuth, async (req, res) => {
   const { sid } = req.params;
   const { targetAgentId, targetQueue } = req.body;
 
@@ -1185,18 +1146,16 @@ app.post('/api/v1/calls/:sid/transfer', async (req, res) => {
 // ==========================================
 // FEEDBACK API
 // ==========================================
-app.post('/api/v1/feedback', async (req, res) => {
-  const { callSid, csatScore, tags, notes, agentId } = req.body;
+app.post('/api/v1/feedback', requireAuth, async (req, res) => {
+  const { callSid, csatScore, tags, notes } = req.body;
+  const agentId = req.user?.agentId || req.user?.userId;
   try {
-    // In a real DB schema we would link this to the agent or callLog
-    // Assuming we have a basic log or we just console.log for now
-    console.log(`Feedback received for call ${callSid} by Agent ${agentId}: CSAT ${csatScore}, Tags: ${tags.join(',')}`);
+    console.log(`Feedback received for call ${callSid} by Agent ${agentId}: CSAT ${csatScore}, Tags: ${Array.isArray(tags) ? tags.join(',') : ''}`);
 
     // Create customer note representing the feedback for this session
     await prisma.customerNote.create({
       data: {
-        content: `Post-Call Feedback: CSAT=${csatScore}/5. Notes: ${notes}. Tags: ${tags.join(', ')}`,
-        // Default to a placeholder customerId if unknown (must match existing schema requirement)
+        content: `Post-Call Feedback: CSAT=${csatScore}/5. Notes: ${notes}. Tags: ${Array.isArray(tags) ? tags.join(', ') : ''}`,
         customerId: "00000000-0000-0000-0000-000000000000",
         agentId: agentId || null
       }

@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const xlsx = require('xlsx');
 const Redis = require('ioredis');
+const { requireRole } = require('../middleware/auth');
 
 const prisma = require('../prisma');
 const router = express.Router();
@@ -19,10 +20,10 @@ redisConnection.on('error', (err) => {
   console.error('[Redis Leads] Error:', err.message);
 });
 
-// POST /api/v1/leads/upload (Super Admin / Admin)
-router.post('/upload', upload.single('file'), async (req, res) => {
+// POST /api/v1/leads/upload (Super Admin / Admin / Supervisor / Senior Manager)
+router.post('/upload', requireRole(['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER']), upload.single('file'), async (req, res) => {
   try {
-    const { uploadedById } = req.body;
+    const uploadedById = req.user?.userId || req.user?.id || req.body.uploadedById;
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
     // Parse file based on extension
@@ -125,12 +126,13 @@ router.get('/', async (req, res) => {
     });
 
     // Mask phone numbers if agent is requesting and lead is not assigned to them
-    const reqAgentId = req.headers['x-agent-id'];
-    const reqRole = req.headers['x-user-role']; // Passed from frontend or middleware
+    const reqAgentId = req.user?.agentId || req.user?.userId;
+    const reqRole = req.user?.role;
+    const isElevated = reqRole && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(reqRole);
     
     const formatted = leads.map(l => {
       let phone = l.phoneNumber;
-      if (reqRole !== 'SUPER_ADMIN' && reqRole !== 'ADMIN') {
+      if (!isElevated) {
         if (l.assignedAgentId !== reqAgentId) {
           // Mask phone: XXXXXX4521
           phone = phone.length > 4 ? 'X'.repeat(phone.length - 4) + phone.slice(-4) : 'XXXX';
@@ -201,7 +203,8 @@ router.post('/', async (req, res) => {
 // POST /api/v1/leads/:id/claim
 router.post('/:id/claim', async (req, res) => {
   const leadId = req.params.id;
-  const { agentId } = req.body;
+  const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER'].includes(req.user?.role);
+  const agentId = (isElevated && req.body.agentId) ? req.body.agentId : (req.user?.agentId || req.user?.userId);
   const lockKey = `lead_lock:${leadId}`;
 
   try {
@@ -256,7 +259,9 @@ router.post('/:id/claim', async (req, res) => {
 // PUT /api/v1/leads/:id/status
 router.put('/:id/status', async (req, res) => {
   const leadId = req.params.id;
-  const { status, notes, agentId } = req.body;
+  const { status, notes } = req.body;
+  const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER'].includes(req.user?.role);
+  const agentId = (isElevated && req.body.agentId) ? req.body.agentId : (req.user?.agentId || req.user?.userId);
   
   try {
     const oldLead = await prisma.lead.findUnique({ where: { id: leadId } });
@@ -289,7 +294,9 @@ router.put('/:id/status', async (req, res) => {
 // POST /api/v1/leads/:id/convert
 router.post('/:id/convert', async (req, res) => {
   const leadId = req.params.id;
-  const { notes, agentId, appointmentDate, appointmentPurpose, sentiment: manualSentiment } = req.body;
+  const { notes, appointmentDate, appointmentPurpose, sentiment: manualSentiment } = req.body;
+  const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER'].includes(req.user?.role);
+  const agentId = (isElevated && req.body.agentId) ? req.body.agentId : (req.user?.agentId || req.user?.userId);
   
   try {
     const oldLead = await prisma.lead.findUnique({ where: { id: leadId } });

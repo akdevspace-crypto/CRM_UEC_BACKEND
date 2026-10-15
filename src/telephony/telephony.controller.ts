@@ -29,8 +29,8 @@ export class TelephonyController {
   }
 
   @Get('history')
-  async getCallHistory() {
-    return await this.telephonyService.getCallHistory();
+  async getCallHistory(@Req() req: Request) {
+    return await this.telephonyService.getCallHistory((req as any).user);
   }
 
   @Get('my-ringing-call')

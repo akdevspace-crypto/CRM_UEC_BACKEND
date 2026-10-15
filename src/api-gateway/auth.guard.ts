@@ -4,6 +4,8 @@ import {
   ExecutionContext,
   UnauthorizedException,
   SetMetadata,
+  Inject,
+  Optional,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
@@ -16,6 +18,7 @@ export class AuthGuard implements CanActivate {
   constructor(
     private readonly jwtService: JwtService,
     private readonly reflector: Reflector,
+    @Optional() @Inject('REDIS_CLIENT') private readonly redisClient?: any,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -46,6 +49,17 @@ export class AuthGuard implements CanActivate {
 
     if (!token) {
       throw new UnauthorizedException('JWT Token missing');
+    }
+
+    if (this.redisClient) {
+      try {
+        const isRevoked = await this.redisClient.get(`revoked_token:${token}`);
+        if (isRevoked) {
+          throw new UnauthorizedException('Token has been revoked');
+        }
+      } catch (err) {
+        if (err instanceof UnauthorizedException) throw err;
+      }
     }
 
     try {

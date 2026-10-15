@@ -1,10 +1,18 @@
 const jwt = require('jsonwebtoken');
+const Redis = require('ioredis');
+
+let redis = null;
+try {
+  const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+  redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
+  redis.on('error', () => {});
+} catch (e) {}
 
 /**
  * Express Authentication Middleware for Legacy Routes
  * Enforces valid Bearer JWT tokens signed with the application JWT_SECRET.
  */
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const authHeader = req.headers['authorization'] || req.headers['Authorization'];
   if (!authHeader) {
     return res.status(401).json({ error: 'Unauthorized: Authentication token required' });
@@ -22,6 +30,14 @@ function requireAuth(req, res, next) {
   const secret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
   try {
     const payload = jwt.verify(token, secret);
+    if (redis) {
+      try {
+        const isRevoked = await redis.get(`revoked_token:${token}`);
+        if (isRevoked) {
+          return res.status(401).json({ error: 'Unauthorized: Token has been revoked' });
+        }
+      } catch (e) {}
+    }
     req.user = payload;
     next();
   } catch (err) {

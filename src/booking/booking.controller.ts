@@ -6,11 +6,16 @@ import {
   Patch,
   Param,
   Query,
+  Req,
   BadRequestException,
+  NotFoundException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { BookingService } from './booking.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
 import { AppointmentStatus } from '@prisma/client';
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 @Controller('appointments')
 export class BookingController {
@@ -75,7 +80,15 @@ export class BookingController {
   }
 
   @Get('patient/:customerId')
-  async getPatientAppointments(@Param('customerId') customerId: string) {
+  async getPatientAppointments(@Param('customerId') customerId: string, @Req() req: any) {
+    if (!UUID_REGEX.test(customerId)) {
+      throw new NotFoundException('Patient record not found');
+    }
+    const user = req?.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER', 'HR'].includes(user.role);
+    if (!isElevated && user && !['AGENT', 'SALES_AGENT'].includes(user.role)) {
+      throw new ForbiddenException('Forbidden: Insufficient permissions to view patient records');
+    }
     return this.bookingService.getUpcomingAppointments(customerId);
   }
 
@@ -86,6 +99,9 @@ export class BookingController {
     @Body('duration') duration: number,
     @Body('reason') reason?: string,
   ) {
+    if (!UUID_REGEX.test(id)) {
+      throw new NotFoundException('Appointment not found');
+    }
     return this.bookingService.rescheduleAppointment(
       id,
       newStartTime,
@@ -99,6 +115,9 @@ export class BookingController {
     @Param('id') id: string,
     @Body('reason') reason?: string,
   ) {
+    if (!UUID_REGEX.test(id)) {
+      throw new NotFoundException('Appointment not found');
+    }
     return this.bookingService.cancelAppointment(id, reason);
   }
 

@@ -1,5 +1,7 @@
-import { Controller, Get, Param, Logger, Put } from '@nestjs/common';
+import { Controller, Get, Param, Logger, Put, Req, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 @Controller('api/v1/conversations')
 export class OmnichannelController {
@@ -8,9 +10,22 @@ export class OmnichannelController {
   constructor(private readonly prisma: PrismaService) {}
 
   @Get()
-  async getConversations() {
+  async getConversations(@Req() req: any) {
     this.logger.log('Fetching omnichannel conversations');
+    const user = req?.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+
+    const whereClause: any = {};
+    if (!isElevated && user) {
+      whereClause.OR = [
+        { agentId: user.agentId },
+        { agentId: user.id },
+        { agentId: null }, // Unassigned pool
+      ];
+    }
+
     const conversations = await this.prisma.conversation.findMany({
+      where: whereClause,
       include: {
         customer: true,
       },
@@ -32,7 +47,25 @@ export class OmnichannelController {
   }
 
   @Get(':id/messages')
-  async getMessages(@Param('id') id: string) {
+  async getMessages(@Param('id') id: string, @Req() req: any) {
+    if (!UUID_REGEX.test(id)) {
+      throw new NotFoundException('Conversation not found');
+    }
+
+    const conversation = await this.prisma.conversation.findUnique({
+      where: { id },
+    });
+
+    if (!conversation) {
+      throw new NotFoundException('Conversation not found');
+    }
+
+    const user = req?.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+    if (!isElevated && user && conversation.agentId && conversation.agentId !== user.agentId && conversation.agentId !== user.id) {
+      throw new ForbiddenException('Forbidden: Not authorized to access this conversation');
+    }
+
     this.logger.log(`Fetching messages for conversation ${id}`);
     const messages = await this.prisma.message.findMany({
       where: { conversationId: id },
