@@ -35,7 +35,11 @@ export class TelephonyController {
 
   @Get('my-ringing-call')
   async getMyRingingCall(@Req() req: Request) {
-    const agentId = req.query.agentId as string;
+    const user = (req as any).user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR'].includes(user.role);
+    const agentId = isElevated
+      ? ((req.query.agentId as string) || user?.agentId || user?.userId)
+      : (user?.agentId || user?.userId || (req.query.agentId as string));
     if (!agentId) return { call: null };
 
     const result = await this.telephonyService.getMyRingingCall(agentId);

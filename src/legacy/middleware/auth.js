@@ -29,7 +29,15 @@ async function requireAuth(req, res, next) {
 
   const secret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
   try {
-    const payload = jwt.verify(token, secret);
+    const verifyOptions = {};
+    if (process.env.JWT_ISSUER) verifyOptions.issuer = process.env.JWT_ISSUER;
+    if (process.env.JWT_AUDIENCE) verifyOptions.audience = process.env.JWT_AUDIENCE;
+
+    const payload = jwt.verify(token, secret, verifyOptions);
+    if (!payload || (!payload.sub && !payload.userId && !payload.id)) {
+      return res.status(401).json({ error: 'Unauthorized: Token missing valid subject claim' });
+    }
+
     if (redis) {
       try {
         const isRevoked = await redis.get(`revoked_token:${token}`);

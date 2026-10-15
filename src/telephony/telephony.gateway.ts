@@ -73,16 +73,26 @@ export class TelephonyGateway
     this.logger.log(`Agent ${name || agentId} logging in via WebSocket...`);
 
     const rawToken = data?.token || client.handshake.auth?.token || client.handshake.headers?.authorization?.replace(/^Bearer\s+/i, '');
+    if (!rawToken) {
+      this.logger.warn(`[SECURITY] WebSocket authentication rejected for socket ${client.id}: Token missing`);
+      client.emit('auth_error', { message: 'Authentication token required for agent login' });
+      return;
+    }
+
     let authenticatedUser: any = null;
-    if (rawToken) {
-      try {
-        const secret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
-        authenticatedUser = jwt.verify(rawToken, secret);
-      } catch (err: any) {
-        this.logger.warn(`[SECURITY] WebSocket authentication rejected for socket ${client.id}: ${err.message}`);
-        client.emit('auth_error', { message: 'Invalid or expired authentication token' });
-        return;
-      }
+    try {
+      const secret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
+      authenticatedUser = jwt.verify(rawToken, secret);
+    } catch (err: any) {
+      this.logger.warn(`[SECURITY] WebSocket authentication rejected for socket ${client.id}: ${err.message}`);
+      client.emit('auth_error', { message: 'Invalid or expired authentication token' });
+      return;
+    }
+
+    if (!authenticatedUser || (!authenticatedUser.userId && !authenticatedUser.sub && !authenticatedUser.id)) {
+      this.logger.warn(`[SECURITY] WebSocket authentication rejected for socket ${client.id}: Missing user claims`);
+      client.emit('auth_error', { message: 'Invalid token claims' });
+      return;
     }
 
     if (agentId) {
@@ -99,17 +109,15 @@ export class TelephonyGateway
 
         if (agent) {
           // Verify user is authorized to bind this agent socket
-          if (authenticatedUser) {
-            const isOwner = authenticatedUser.userId === agent.userId ||
-                            authenticatedUser.agentId === agent.id ||
-                            authenticatedUser.sub === agent.userId ||
-                            authenticatedUser.id === agent.userId;
-            const isAdmin = ['ADMIN', 'SUPER_ADMIN'].includes(authenticatedUser.role);
-            if (!isOwner && !isAdmin) {
-              this.logger.warn(`[SECURITY] WebSocket spoofing attempt blocked: user ${authenticatedUser.userId || authenticatedUser.sub} attempted to bind agent ${agent.id}`);
-              client.emit('auth_error', { message: 'Unauthorized: cannot impersonate other agents' });
-              return;
-            }
+          const isOwner = authenticatedUser.userId === agent.userId ||
+                          authenticatedUser.agentId === agent.id ||
+                          authenticatedUser.sub === agent.userId ||
+                          authenticatedUser.id === agent.userId;
+          const isAdmin = ['ADMIN', 'SUPER_ADMIN'].includes(authenticatedUser.role);
+          if (!isOwner && !isAdmin) {
+            this.logger.warn(`[SECURITY] WebSocket spoofing attempt blocked: user ${authenticatedUser.userId || authenticatedUser.sub} attempted to bind agent ${agent.id}`);
+            client.emit('auth_error', { message: 'Unauthorized: cannot impersonate other agents' });
+            return;
           }
 
           await this.prisma.agent.update({

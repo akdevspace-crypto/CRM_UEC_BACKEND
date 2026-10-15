@@ -64,10 +64,18 @@ export class AuthGuard implements CanActivate {
 
     try {
       const secret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
-      const payload = await this.jwtService.verifyAsync(token, { secret });
+      const verifyOptions: any = { secret };
+      if (process.env.JWT_ISSUER) verifyOptions.issuer = process.env.JWT_ISSUER;
+      if (process.env.JWT_AUDIENCE) verifyOptions.audience = process.env.JWT_AUDIENCE;
+
+      const payload = await this.jwtService.verifyAsync(token, verifyOptions);
+      if (!payload || (!payload.sub && !payload.userId && !payload.id)) {
+        throw new UnauthorizedException('Token missing valid subject/userId claim');
+      }
       request.user = payload;
       return true;
     } catch (err) {
+      if (err instanceof UnauthorizedException) throw err;
       throw new UnauthorizedException('Invalid or expired token');
     }
   }

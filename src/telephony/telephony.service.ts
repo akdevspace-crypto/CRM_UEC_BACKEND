@@ -504,6 +504,10 @@ export class TelephonyService {
 
   async getMyRingingCall(agentId: string) {
     if (!agentId) return null;
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!UUID_REGEX.test(agentId)) {
+      return null;
+    }
 
     // Find a ringing call session assigned to this agent
     const callSession = await this.prisma.callSession.findFirst({

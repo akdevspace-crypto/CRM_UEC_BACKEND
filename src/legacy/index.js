@@ -214,7 +214,20 @@ app.post('/api/v1/auth/login', async (req, res) => {
 // Dynamic CRM APIs
 app.get('/api/v1/conversations', requireAuth, async (req, res) => {
   try {
+    const user = req.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+    const whereClause = {};
+    if (!isElevated && user) {
+      whereClause.OR = [
+        { agentId: user.agentId },
+        { agentId: user.userId },
+        { agentId: user.id },
+        { agentId: null }
+      ];
+    }
+
     const conversations = await prisma.conversation.findMany({
+      where: whereClause,
       include: {
         customer: true,
         messages: { orderBy: { createdAt: 'desc' }, take: 1 }
@@ -318,8 +331,8 @@ app.get('/api/v1/customers', requireAuth, async (req, res) => {
   }
 });
 
-// Fetch Directory of Agents
-app.get('/api/v1/agents', async (req, res) => {
+// Fetch Directory of Agents (Protected fallback)
+app.get('/api/v1/agents', requireAuth, async (req, res) => {
   try {
     const allUsers = await prisma.user.findMany({
       include: { agentProfile: true }

@@ -5,6 +5,8 @@ redis.on('error', (err) => {
   console.error('[Redis Signaling] Error:', err.message);
 });
 
+const jwt = require('jsonwebtoken');
+
 // Helper to interact with Redis for agents
 const redisKey = (id) => `agent:${id}`;
 
@@ -14,6 +16,17 @@ function setupSignaling(io) {
 
     // Agent authenticates and sets status
     socket.on('agent_login', async (data) => {
+      const rawToken = data?.token || socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace(/^Bearer\s+/i, '');
+      if (!rawToken) {
+        return; // Handled / rejected by gateway with auth_error
+      }
+      try {
+        const secret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
+        jwt.verify(rawToken, secret);
+      } catch (err) {
+        return;
+      }
+
       const { agentId, name, skills } = data;
       const agentData = { agentId, name, skills, status: 'AVAILABLE', socketId: socket.id };
       await redis.set(redisKey(socket.id), JSON.stringify(agentData));

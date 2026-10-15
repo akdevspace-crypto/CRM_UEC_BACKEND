@@ -29,8 +29,18 @@ async function bootstrap() {
     app.use(express.json());
 
     // CORS
+    const allowedOrigins = process.env.ALLOWED_ORIGINS
+      ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim())
+      : ['http://localhost:3000', 'http://127.0.0.1:3000'];
+
     app.enableCors({
-      origin: true,
+      origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+        if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+          callback(null, true);
+        } else {
+          callback(new Error('CORS origin denied'), false);
+        }
+      },
       credentials: true,
     });
 
@@ -38,6 +48,7 @@ async function bootstrap() {
 
     // Get underlying Express instance
     const expressInstance = app.getHttpAdapter().getInstance();
+    expressInstance.set('trust proxy', 1);
 
     // Mount legacy routes
     if (legacyModule?.app) {
