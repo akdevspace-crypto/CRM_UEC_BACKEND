@@ -1050,10 +1050,12 @@ app.get('/api/v1/tickets', requireAuth, async (req, res) => {
       ];
     }
 
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
     const tickets = await prisma.ticket.findMany({
       where: whereClause,
       include: { customer: true, agent: true },
-      orderBy: { updatedAt: 'desc' }
+      orderBy: { updatedAt: 'desc' },
+      take: limit,
     });
 
     res.json(tickets.map(t => ({
@@ -1172,6 +1174,7 @@ const handleCalendarRequest = async (req, res) => {
         doctor: true,
       },
       orderBy: { startTime: 'asc' },
+      take: Math.min(parseInt(req.query.limit, 10) || 100, 200),
     });
 
     res.json(appointments);
@@ -1187,19 +1190,122 @@ app.get('/api/v1/appointments/calendar', requireAuth, handleCalendarRequest);
 // ==========================================
 // DASHBOARD ANALYTICS API (DEF-06)
 // ==========================================
-const analyticsCache = new Map();
+let legacyInFlightRawMetrics = null;
+let legacyCachedRawMetrics = null;
 const ANALYTICS_CACHE_TTL = 15000; // 15 seconds
+
+const getLegacyRawMetrics = async () => {
+  const now = Date.now();
+  if (legacyCachedRawMetrics && (now - legacyCachedRawMetrics.timestamp < ANALYTICS_CACHE_TTL)) {
+    return legacyCachedRawMetrics.data;
+  }
+  if (legacyInFlightRawMetrics) {
+    return legacyInFlightRawMetrics;
+  }
+
+  legacyInFlightRawMetrics = (async () => {
+    try {
+      const [countsResult, servicesResult] = await Promise.all([
+        prisma.$queryRaw`
+          SELECT
+            (SELECT COUNT(*)::int FROM "Customer") as total_customers,
+            (SELECT COUNT(*)::int FROM "Lead") as total_leads,
+            (SELECT COUNT(*)::int FROM "Lead" WHERE status IN ('NEW', 'IN_PROGRESS')) as active_leads,
+            (SELECT COUNT(*)::int FROM "Lead" WHERE status IN ('CONVERTED', 'POSITIVE')) as converted_leads,
+            (SELECT COUNT(*)::int FROM "Lead" WHERE sentiment = 'POSITIVE') as positive_leads,
+            (SELECT COUNT(*)::int FROM "CallSession") as total_calls,
+            (SELECT COUNT(*)::int FROM "CallSession" WHERE status = 'IN_PROGRESS') as active_calls,
+            (SELECT COUNT(*)::int FROM "Agent") as total_agents,
+            (SELECT COUNT(*)::int FROM "Agent" WHERE status = 'AVAILABLE') as available_agents,
+            (SELECT COUNT(*)::int FROM "QueueItem" WHERE status = 'WAITING') as waiting_queue,
+            (SELECT COALESCE(AVG(duration), 0)::float FROM "CallSession") as avg_duration;
+        `.catch(err => {
+          console.warn('[Legacy Analytics] queryRaw fallback:', err.message);
+          return null;
+        }),
+        prisma.lead.groupBy({
+          by: ['serviceInterest'],
+          _count: { id: true }
+        }).catch(() => [])
+      ]);
+
+      let raw;
+      if (countsResult && countsResult.length > 0) {
+        const c = countsResult[0];
+        raw = {
+          totalCustomers: Number(c.total_customers) || 0,
+          totalLeads: Number(c.total_leads) || 0,
+          activeLeads: Number(c.active_leads) || 0,
+          convertedLeads: Number(c.converted_leads) || 0,
+          positiveLeads: Number(c.positive_leads) || 0,
+          totalCalls: Number(c.total_calls) || 0,
+          activeCalls: Number(c.active_calls) || 0,
+          totalAgents: Number(c.total_agents) || 0,
+          availableAgents: Number(c.available_agents) || 0,
+          waitingQueue: Number(c.waiting_queue) || 0,
+          avgDurationSec: Math.round(Number(c.avg_duration) || 0),
+          servicesCount: servicesResult || []
+        };
+      } else {
+        const [
+          totalCustomers,
+          totalLeads,
+          activeLeads,
+          convertedLeads,
+          positiveLeads,
+          totalCalls,
+          activeCalls,
+          totalAgents,
+          availableAgents,
+          waitingQueue,
+          callDurationAgg
+        ] = await Promise.all([
+          prisma.customer.count().catch(() => 0),
+          prisma.lead.count().catch(() => 0),
+          prisma.lead.count({ where: { status: { in: ['NEW', 'IN_PROGRESS'] } } }).catch(() => 0),
+          prisma.lead.count({ where: { status: { in: ['CONVERTED', 'POSITIVE'] } } }).catch(() => 0),
+          prisma.lead.count({ where: { sentiment: 'POSITIVE' } }).catch(() => 0),
+          prisma.callSession.count().catch(() => 0),
+          prisma.callSession.count({ where: { status: 'IN_PROGRESS' } }).catch(() => 0),
+          prisma.agent.count().catch(() => 0),
+          prisma.agent.count({ where: { status: 'AVAILABLE' } }).catch(() => 0),
+          prisma.queueItem.count({ where: { status: 'WAITING' } }).catch(() => 0),
+          prisma.callSession.aggregate({ _avg: { duration: true } }).catch(() => ({ _avg: { duration: 0 } }))
+        ]);
+        raw = {
+          totalCustomers,
+          totalLeads,
+          activeLeads,
+          convertedLeads,
+          positiveLeads,
+          totalCalls,
+          activeCalls,
+          totalAgents,
+          availableAgents,
+          waitingQueue,
+          avgDurationSec: Math.round(callDurationAgg?._avg?.duration || 0),
+          servicesCount: servicesResult || []
+        };
+      }
+
+      legacyCachedRawMetrics = {
+        timestamp: Date.now(),
+        data: raw
+      };
+      return raw;
+    } finally {
+      legacyInFlightRawMetrics = null;
+    }
+  })();
+
+  return legacyInFlightRawMetrics;
+};
 
 const handleDashboardAnalytics = async (req, res) => {
   try {
     const { type = 'overall' } = req.query;
-    const cacheKey = `analytics_${type}`;
-    const cached = analyticsCache.get(cacheKey);
-    if (cached && (Date.now() - cached.timestamp < ANALYTICS_CACHE_TTL)) {
-      return res.json(cached.data);
-    }
-
-    const [
+    const raw = await getLegacyRawMetrics();
+    const {
       totalCustomers,
       totalLeads,
       activeLeads,
@@ -1211,24 +1317,10 @@ const handleDashboardAnalytics = async (req, res) => {
       availableAgents,
       waitingQueue,
       servicesCount,
-      callDurationAgg
-    ] = await Promise.all([
-      prisma.customer.count().catch(() => 0),
-      prisma.lead.count().catch(() => 0),
-      prisma.lead.count({ where: { status: { in: ['NEW', 'IN_PROGRESS'] } } }).catch(() => 0),
-      prisma.lead.count({ where: { status: { in: ['CONVERTED', 'POSITIVE'] } } }).catch(() => 0),
-      prisma.lead.count({ where: { sentiment: 'POSITIVE' } }).catch(() => 0),
-      prisma.callSession.count().catch(() => 0),
-      prisma.callSession.count({ where: { status: 'IN_PROGRESS' } }).catch(() => 0),
-      prisma.agent.count().catch(() => 0),
-      prisma.agent.count({ where: { status: 'AVAILABLE' } }).catch(() => 0),
-      prisma.queueItem.count({ where: { status: 'WAITING' } }).catch(() => 0),
-      prisma.lead.groupBy({ by: ['serviceInterest'], _count: { id: true } }).catch(() => []),
-      prisma.callSession.aggregate({ _avg: { duration: true } }).catch(() => ({ _avg: { duration: 0 } }))
-    ]);
+      avgDurationSec
+    } = raw;
 
     const conversionRate = totalLeads > 0 ? ((convertedLeads / totalLeads) * 100).toFixed(1) : '0';
-    const avgDurationSec = Math.round(callDurationAgg?._avg?.duration || 0);
     const avgDurationFormatted = `${Math.floor(avgDurationSec / 60)}m ${avgDurationSec % 60}s`;
 
     let kpis = [];
@@ -1316,7 +1408,6 @@ const handleDashboardAnalytics = async (req, res) => {
       }
     };
 
-    analyticsCache.set(cacheKey, { timestamp: Date.now(), data: responseData });
     res.json(responseData);
   } catch (err) {
     console.error('[Dashboard Analytics] Error:', err);

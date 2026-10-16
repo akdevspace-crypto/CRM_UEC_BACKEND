@@ -158,13 +158,15 @@ router.get('/', async (req, res) => {
       ];
     }
 
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
     const leads = await prisma.lead.findMany({
       where: whereClause,
       include: {
         assignedAgent: true,
         followups: { orderBy: { followupDate: 'asc' }, take: 1 }
       },
-      orderBy: { createdAt: 'desc' }
+      orderBy: { createdAt: 'desc' },
+      take: limit,
     });
 
     // Mask phone numbers if agent is requesting and lead is not assigned to them

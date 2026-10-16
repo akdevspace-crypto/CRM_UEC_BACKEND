@@ -70,12 +70,129 @@ export class AnalyticsController {
     }));
   }
 
+  private static inFlightRawMetrics: Promise<any> | null = null;
+  private static cachedRawMetrics: { timestamp: number; data: any } | null = null;
+  private static readonly CACHE_TTL_MS = 15000; // 15 seconds
+
+  private async getRawMetrics(): Promise<any> {
+    const now = Date.now();
+    if (
+      AnalyticsController.cachedRawMetrics &&
+      now - AnalyticsController.cachedRawMetrics.timestamp < AnalyticsController.CACHE_TTL_MS
+    ) {
+      return AnalyticsController.cachedRawMetrics.data;
+    }
+
+    if (AnalyticsController.inFlightRawMetrics) {
+      return AnalyticsController.inFlightRawMetrics;
+    }
+
+    AnalyticsController.inFlightRawMetrics = (async () => {
+      try {
+        const [countsResult, servicesResult] = await Promise.all([
+          this.prisma.$queryRaw<any[]>`
+            SELECT
+              (SELECT COUNT(*)::int FROM "Customer") as total_customers,
+              (SELECT COUNT(*)::int FROM "Lead") as total_leads,
+              (SELECT COUNT(*)::int FROM "Lead" WHERE status IN ('NEW', 'IN_PROGRESS')) as active_leads,
+              (SELECT COUNT(*)::int FROM "Lead" WHERE status IN ('CONVERTED', 'POSITIVE')) as converted_leads,
+              (SELECT COUNT(*)::int FROM "Lead" WHERE sentiment = 'POSITIVE') as positive_leads,
+              (SELECT COUNT(*)::int FROM "CallSession") as total_calls,
+              (SELECT COUNT(*)::int FROM "CallSession" WHERE status = 'IN_PROGRESS') as active_calls,
+              (SELECT COUNT(*)::int FROM "Agent") as total_agents,
+              (SELECT COUNT(*)::int FROM "Agent" WHERE status = 'AVAILABLE') as available_agents,
+              (SELECT COUNT(*)::int FROM "QueueItem" WHERE status = 'WAITING') as waiting_queue,
+              (SELECT COALESCE(AVG(duration), 0)::float FROM "CallSession") as avg_duration;
+          `.catch((err) => {
+            this.logger.warn(`Single queryRaw failed, falling back to count queries: ${err.message}`);
+            return null;
+          }),
+          this.prisma.lead.groupBy({
+            by: ['serviceInterest'],
+            _count: { id: true },
+          }).catch(() => []),
+        ]);
+
+        let raw: any;
+        if (countsResult && countsResult.length > 0) {
+          const c = countsResult[0];
+          raw = {
+            totalCustomers: Number(c.total_customers) || 0,
+            totalLeads: Number(c.total_leads) || 0,
+            activeLeads: Number(c.active_leads) || 0,
+            convertedLeads: Number(c.converted_leads) || 0,
+            positiveLeads: Number(c.positive_leads) || 0,
+            totalCalls: Number(c.total_calls) || 0,
+            activeCalls: Number(c.active_calls) || 0,
+            totalAgents: Number(c.total_agents) || 0,
+            availableAgents: Number(c.available_agents) || 0,
+            waitingQueue: Number(c.waiting_queue) || 0,
+            avgDurationSec: Math.round(Number(c.avg_duration) || 0),
+            servicesCount: servicesResult || [],
+          };
+        } else {
+          // Graceful fallback if queryRaw is unavailable
+          const [
+            totalCustomers,
+            totalLeads,
+            activeLeads,
+            convertedLeads,
+            positiveLeads,
+            totalCalls,
+            activeCalls,
+            totalAgents,
+            availableAgents,
+            waitingQueue,
+            callDurationAgg,
+          ] = await Promise.all([
+            this.prisma.customer.count().catch(() => 0),
+            this.prisma.lead.count().catch(() => 0),
+            this.prisma.lead.count({ where: { status: { in: ['NEW', 'IN_PROGRESS'] } } }).catch(() => 0),
+            this.prisma.lead.count({ where: { status: { in: ['CONVERTED', 'POSITIVE'] } } }).catch(() => 0),
+            this.prisma.lead.count({ where: { sentiment: 'POSITIVE' } }).catch(() => 0),
+            this.prisma.callSession.count().catch(() => 0),
+            this.prisma.callSession.count({ where: { status: 'IN_PROGRESS' } }).catch(() => 0),
+            this.prisma.agent.count().catch(() => 0),
+            this.prisma.agent.count({ where: { status: 'AVAILABLE' } }).catch(() => 0),
+            this.prisma.queueItem.count({ where: { status: 'WAITING' } }).catch(() => 0),
+            this.prisma.callSession.aggregate({ _avg: { duration: true } }).catch(() => ({ _avg: { duration: 0 } })),
+          ]);
+          raw = {
+            totalCustomers,
+            totalLeads,
+            activeLeads,
+            convertedLeads,
+            positiveLeads,
+            totalCalls,
+            activeCalls,
+            totalAgents,
+            availableAgents,
+            waitingQueue,
+            avgDurationSec: Math.round(callDurationAgg?._avg?.duration || 0),
+            servicesCount: servicesResult || [],
+          };
+        }
+
+        AnalyticsController.cachedRawMetrics = {
+          timestamp: Date.now(),
+          data: raw,
+        };
+        return raw;
+      } finally {
+        AnalyticsController.inFlightRawMetrics = null;
+      }
+    })();
+
+    return AnalyticsController.inFlightRawMetrics;
+  }
+
   @Get(['analytics', 'dashboard/analytics'])
   async getDashboardMetrics(@Req() req: any) {
     this.logger.log('Fetching live dashboard metrics...');
     const type = req.query?.type || 'overall';
+    const raw = await this.getRawMetrics();
 
-    const [
+    const {
       totalCustomers,
       totalLeads,
       activeLeads,
@@ -87,24 +204,10 @@ export class AnalyticsController {
       availableAgents,
       waitingQueue,
       servicesCount,
-      callDurationAgg
-    ] = await Promise.all([
-      this.prisma.customer.count().catch(() => 0),
-      this.prisma.lead.count().catch(() => 0),
-      this.prisma.lead.count({ where: { status: { in: ['NEW', 'IN_PROGRESS'] } } }).catch(() => 0),
-      this.prisma.lead.count({ where: { status: { in: ['CONVERTED', 'POSITIVE'] } } }).catch(() => 0),
-      this.prisma.lead.count({ where: { sentiment: 'POSITIVE' } }).catch(() => 0),
-      this.prisma.callSession.count().catch(() => 0),
-      this.prisma.callSession.count({ where: { status: 'IN_PROGRESS' } }).catch(() => 0),
-      this.prisma.agent.count().catch(() => 0),
-      this.prisma.agent.count({ where: { status: 'AVAILABLE' } }).catch(() => 0),
-      this.prisma.queueItem.count({ where: { status: 'WAITING' } }).catch(() => 0),
-      this.prisma.lead.groupBy({ by: ['serviceInterest'], _count: { id: true } }).catch(() => []),
-      this.prisma.callSession.aggregate({ _avg: { duration: true } }).catch(() => ({ _avg: { duration: 0 } }))
-    ]);
+      avgDurationSec,
+    } = raw;
 
     const conversionRate = totalLeads > 0 ? ((convertedLeads / totalLeads) * 100).toFixed(1) : '0';
-    const avgDurationSec = Math.round(callDurationAgg?._avg?.duration || 0);
     const avgDurationFormatted = `${Math.floor(avgDurationSec / 60)}m ${avgDurationSec % 60}s`;
 
     let kpis = [];
