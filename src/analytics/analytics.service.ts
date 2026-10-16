@@ -34,7 +34,7 @@ export class AnalyticsService {
       return;
     }
 
-    const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+    const modelName = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
     this.logger.log(`[AI-AUDIT] event=MODEL_CONFIG provider=@google/genai model=${modelName} apiKeyConfigured=true authenticationMode=Developer_API_Key`);
 
     try {
