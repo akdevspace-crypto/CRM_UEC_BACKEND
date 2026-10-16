@@ -23,6 +23,10 @@ export class AnalyticsService {
 
     if (session.recordingStatus !== 'READY' || !session.recordingStoragePath) {
       this.logger.error(`[AI-AUDIT] event=PIPELINE_FAILED callId=${sessionId} error="Recording not ready or path missing"`);
+      await this.prisma.callSession.update({
+        where: { id: sessionId },
+        data: { aiProcessingStatus: 'FAILED' }
+      }).catch(() => {});
       return;
     }
 
@@ -31,6 +35,10 @@ export class AnalyticsService {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       this.logger.error(`[AI-AUDIT] event=PIPELINE_FAILED callId=${sessionId} error="GEMINI_API_KEY is not set"`);
+      await this.prisma.callSession.update({
+        where: { id: sessionId },
+        data: { aiProcessingStatus: 'FAILED' }
+      }).catch(() => {});
       return;
     }
 
@@ -38,6 +46,11 @@ export class AnalyticsService {
     this.logger.log(`[AI-AUDIT] event=MODEL_CONFIG provider=@google/genai model=${modelName} apiKeyConfigured=true authenticationMode=Developer_API_Key`);
 
     try {
+      await this.prisma.callSession.update({
+        where: { id: sessionId },
+        data: { aiProcessingStatus: 'ANALYZING' }
+      }).catch(() => {});
+
       const supabaseUrl = process.env.SUPABASE_URL || 'https://aws-1-ap-southeast-1.pooler.supabase.com';
       const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || 'dummy_key';
       const supabase = createClient(supabaseUrl, supabaseKey);
@@ -115,11 +128,20 @@ export class AnalyticsService {
         }
       });
 
+      await this.prisma.callSession.update({
+        where: { id: sessionId },
+        data: { aiProcessingStatus: 'COMPLETED' }
+      }).catch(() => {});
+
       this.logger.log(`[AI-AUDIT] event=DATABASE_PERSISTED callId=${sessionId}`);
       this.logger.log(`[AI-AUDIT] event=PIPELINE_COMPLETE callId=${sessionId}`);
 
       return result;
     } catch (err) {
+      await this.prisma.callSession.update({
+        where: { id: sessionId },
+        data: { aiProcessingStatus: 'FAILED' }
+      }).catch(() => {});
       this.logger.error(`[AI-AUDIT] event=PIPELINE_FAILED stage=Processing callId=${sessionId} error="${err.message}"`);
     }
   }
