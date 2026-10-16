@@ -1,19 +1,26 @@
 const nodemailer = require('nodemailer');
 
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 465,
-  secure: true, // true for 465, false for other ports
-  auth: {
-    user: process.env.EMAIL_USER || 'testingforcompany.0@gmail.com',
-    pass: process.env.EMAIL_PASS || 'qxmj ibnc fleg gsyy'
-  }
-});
+const user = process.env.EMAIL_USER;
+const pass = process.env.EMAIL_PASS;
+
+let transporter = null;
+if (user && pass) {
+  transporter = nodemailer.createTransport({
+    host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.EMAIL_PORT, 10) || 465,
+    secure: true,
+    auth: { user, pass }
+  });
+}
 
 const sendEmailReply = async (toEmail, subject, htmlBody, inReplyTo, references) => {
+  if (!transporter) {
+    console.warn('❌ Email provider not configured (missing EMAIL_USER or EMAIL_PASS)');
+    return { success: false, error: 'Email service credentials not configured' };
+  }
   try {
     const mailOptions = {
-      from: `"ElderCare CRM" <${process.env.EMAIL_USER || 'testingforcompany.0@gmail.com'}>`,
+      from: `"ElderCare CRM" <${user}>`,
       to: toEmail,
       subject: subject,
       html: htmlBody,

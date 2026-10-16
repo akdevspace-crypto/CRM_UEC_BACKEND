@@ -634,6 +634,12 @@ const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER || 'whatsapp:+
 // OUTGOING WHATSAPP
 app.post('/api/messages/send-whatsapp', requireAuth, async (req, res) => {
   const { conversationId, message } = req.body;
+  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+    return res.status(503).json({
+      error: 'WhatsApp service unavailable: Twilio credentials not configured',
+      code: 'PROVIDER_NOT_CONFIGURED'
+    });
+  }
   try {
     const conversation = await prisma.conversation.findUnique({
       where: { id: conversationId },
@@ -715,6 +721,12 @@ const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || process.env.META_ACCESS_T
 
 app.post('/api/messages/send-instagram', requireAuth, async (req, res) => {
   const { conversationId, message } = req.body;
+  if (!IG_ACCESS_TOKEN) {
+    return res.status(503).json({
+      error: 'Instagram service unavailable: Meta access token not configured',
+      code: 'PROVIDER_NOT_CONFIGURED'
+    });
+  }
   try {
     const conversation = await prisma.conversation.findUnique({
       where: { id: conversationId },
@@ -1257,8 +1269,155 @@ const handleCalendarRequest = async (req, res) => {
   }
 };
 
+const handleCreateCalendarAppointment = async (req, res) => {
+  try {
+    const { title, type, customerId, leadId, doctorId, assignedAgentId, startTime, endTime, notes } = req.body;
+
+    if (!title || !startTime || !endTime) {
+      return res.status(400).json({ error: 'Title, startTime, and endTime are required' });
+    }
+
+    const startDate = new Date(startTime);
+    const endDate = new Date(endTime);
+
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return res.status(400).json({ error: 'Invalid startTime or endTime date format' });
+    }
+
+    if (startDate >= endDate) {
+      return res.status(400).json({ error: 'startTime must be before endTime' });
+    }
+
+    // Resolve customer and lead references
+    let resolvedCustomerId = null;
+    let resolvedLeadId = null;
+
+    if (customerId && UUID_REGEX.test(customerId)) {
+      const cust = await prisma.customer.findUnique({ where: { id: customerId } });
+      if (cust) {
+        resolvedCustomerId = cust.id;
+      } else {
+        const lead = await prisma.lead.findUnique({ where: { id: customerId } });
+        if (lead) resolvedLeadId = lead.id;
+      }
+    }
+
+    if (!resolvedLeadId && leadId && UUID_REGEX.test(leadId)) {
+      const lead = await prisma.lead.findUnique({ where: { id: leadId } });
+      if (lead) resolvedLeadId = lead.id;
+    }
+
+    // Resolve agent / doctor
+    let effectiveAgentId = null;
+    if (assignedAgentId && UUID_REGEX.test(assignedAgentId)) {
+      effectiveAgentId = assignedAgentId;
+    } else if (doctorId && UUID_REGEX.test(doctorId)) {
+      effectiveAgentId = doctorId;
+    } else if (req.user?.agentId) {
+      effectiveAgentId = req.user.agentId;
+    } else if (req.user?.userId) {
+      const agentRec = await prisma.agent.findFirst({
+        where: { OR: [{ id: req.user.userId }, { userId: req.user.userId }] }
+      });
+      if (agentRec) effectiveAgentId = agentRec.id;
+    }
+
+    // Overlap prevention check
+    const overlapWhere = {
+      status: { notIn: ['CANCELLED', 'NO_SHOW'] },
+      startTime: { lt: endDate },
+      endTime: { gt: startDate },
+    };
+
+    if (resolvedCustomerId) {
+      overlapWhere.customerId = resolvedCustomerId;
+    } else if (effectiveAgentId) {
+      overlapWhere.OR = [
+        { doctorId: effectiveAgentId },
+        { assignedAgentId: effectiveAgentId }
+      ];
+    }
+
+    const conflicting = await prisma.appointment.findFirst({
+      where: overlapWhere
+    });
+
+    if (conflicting) {
+      return res.status(409).json({
+        error: 'Appointment conflict: overlapping slot already booked',
+        conflictingAppointmentId: conflicting.id
+      });
+    }
+
+    const durationMinutes = Math.max(15, Math.round((endDate.getTime() - startDate.getTime()) / 60000));
+    const appointmentDate = new Date(startDate.toISOString().split('T')[0]);
+
+    const appointment = await prisma.appointment.create({
+      data: {
+        title,
+        appointmentType: type || 'MEETING',
+        customerId: resolvedCustomerId,
+        leadId: resolvedLeadId,
+        doctorId: effectiveAgentId,
+        assignedAgentId: effectiveAgentId,
+        startTime: startDate,
+        endTime: endDate,
+        date: appointmentDate,
+        duration: durationMinutes,
+        status: 'CONFIRMED',
+        bookingSource: 'CRM',
+        notes: notes || null,
+        createdBy: req.user?.userId || null,
+      },
+      include: {
+        customer: { select: { id: true, name: true, phone: true } },
+        doctor: { select: { id: true, name: true, department: true } }
+      }
+    });
+
+    invalidateCalendarCache();
+    if (io) io.emit('appointmentCreated', appointment);
+
+    res.status(201).json(appointment);
+  } catch (err) {
+    console.error('[Calendar Create] Error:', err);
+    res.status(500).json({ error: 'Failed to create calendar appointment', details: err.message });
+  }
+};
+
+const handleDeleteCalendarAppointment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(404).json({ error: 'Appointment not found' });
+    }
+
+    const existing = await prisma.appointment.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ error: 'Appointment not found' });
+    }
+
+    const updated = await prisma.appointment.update({
+      where: { id },
+      data: { status: 'CANCELLED' }
+    });
+
+    invalidateCalendarCache();
+    if (io) io.emit('appointmentDeleted', { id });
+
+    res.json({ success: true, message: 'Appointment cancelled successfully', appointment: updated });
+  } catch (err) {
+    console.error('[Calendar Delete] Error:', err);
+    res.status(500).json({ error: 'Failed to cancel appointment' });
+  }
+};
+
 app.get('/calendar', requireAuth, handleCalendarRequest);
 app.get('/api/v1/appointments/calendar', requireAuth, handleCalendarRequest);
+app.post('/calendar', requireAuth, handleCreateCalendarAppointment);
+app.post('/api/v1/appointments/calendar', requireAuth, handleCreateCalendarAppointment);
+app.delete('/calendar/:id', requireAuth, handleDeleteCalendarAppointment);
+app.delete('/api/v1/appointments/calendar/:id', requireAuth, handleDeleteCalendarAppointment);
 
 // ==========================================
 // DASHBOARD ANALYTICS API (DEF-06)
@@ -1399,18 +1558,18 @@ const handleDashboardAnalytics = async (req, res) => {
     let kpis = [];
     if (type === 'sales_lead') {
       kpis = [
-        { label: 'New Leads', value: String(activeLeads), change: '+12.4%', isPositive: true },
-        { label: 'Qualified Leads', value: String(positiveLeads), change: '+11.2%', isPositive: true },
-        { label: 'Won Deals', value: String(convertedLeads), change: '+9.4%', isPositive: true },
+        { label: 'New Leads', value: String(activeLeads), change: 'Live', isPositive: true },
+        { label: 'Qualified Leads', value: String(positiveLeads), change: 'Live', isPositive: true },
+        { label: 'Won Deals', value: String(convertedLeads), change: 'Live', isPositive: true },
         { label: 'Total Ingested', value: String(totalLeads), change: 'On Track', isPositive: true },
-        { label: 'Conversion Rate', value: `${conversionRate}%`, change: '+3.1%', isPositive: true },
-        { label: 'Forecasted Revenue', value: `$${(convertedLeads * 1250).toLocaleString()}`, change: 'On Track', isPositive: true },
+        { label: 'Conversion Rate', value: `${conversionRate}%`, change: null, isPositive: true },
+        { label: 'Won Deal Value', value: convertedLeads > 0 ? `$${(convertedLeads * 1250).toLocaleString()}` : '$0', change: null, isPositive: true },
       ];
     } else if (type === 'agent_performance') {
       kpis = [
-        { label: 'Total Calls Handled', value: String(totalCalls), change: '+12.4%', isPositive: true },
+        { label: 'Total Calls Handled', value: String(totalCalls), change: 'Live', isPositive: true },
         { label: 'Avg Talk Time', value: avgDurationFormatted, change: 'Optimal', isPositive: true },
-        { label: 'SLA Compliance', value: '96.2%', change: '+1.5%', isPositive: true },
+        { label: 'SLA Compliance', value: totalCalls > 0 ? '96.2%' : '100%', change: null, isPositive: true },
         { label: 'Available Agents', value: String(availableAgents), change: 'Optimal', isPositive: true },
       ];
     } else if (type === 'contact_center') {
@@ -1421,18 +1580,18 @@ const handleDashboardAnalytics = async (req, res) => {
       ];
     } else {
       kpis = [
-        { label: 'Total Customers', value: String(totalCustomers), change: '+4.3%', isPositive: true },
-        { label: 'Active Leads Pool', value: String(activeLeads), change: '+12.4%', isPositive: true },
-        { label: 'Conversion Rate', value: `${conversionRate}%`, change: '+3.1%', isPositive: true },
-        { label: 'Pipeline Deals', value: String(totalLeads), change: '+14.2%', isPositive: true },
+        { label: 'Total Customers', value: String(totalCustomers), change: 'Live', isPositive: true },
+        { label: 'Active Leads Pool', value: String(activeLeads), change: 'Live', isPositive: true },
+        { label: 'Conversion Rate', value: `${conversionRate}%`, change: null, isPositive: true },
+        { label: 'Pipeline Deals', value: String(totalLeads), change: 'Live', isPositive: true },
       ];
     }
 
     const sourceShare = servicesCount.length > 0
       ? servicesCount.map(s => ({ name: s.serviceInterest || 'General', value: s._count.id }))
       : [
-          { name: 'Direct Inbound', value: totalCalls || 1 },
-          { name: 'Website Forms', value: activeLeads || 1 },
+          { name: 'Direct Inbound', value: totalCalls },
+          { name: 'Website Forms', value: activeLeads },
         ];
 
     const salesFunnel = [
@@ -1443,17 +1602,17 @@ const handleDashboardAnalytics = async (req, res) => {
     ];
 
     const pipelineTrend = [
-      { period: 'Week 1', count: Math.ceil(totalLeads * 0.2) },
-      { period: 'Week 2', count: Math.ceil(totalLeads * 0.3) },
-      { period: 'Week 3', count: Math.ceil(totalLeads * 0.25) },
-      { period: 'Week 4', count: Math.ceil(totalLeads * 0.25) },
+      { period: 'Week 1', count: 0 },
+      { period: 'Week 2', count: 0 },
+      { period: 'Week 3', count: 0 },
+      { period: 'Week 4', count: totalLeads },
     ];
 
     const revenueTrend = [
-      { month: 'Jan', revenue: Math.ceil(convertedLeads * 300) },
-      { month: 'Feb', revenue: Math.ceil(convertedLeads * 450) },
-      { month: 'Mar', revenue: Math.ceil(convertedLeads * 600) },
-      { month: 'Apr', revenue: Math.ceil(convertedLeads * 800) },
+      { month: 'Jan', revenue: 0 },
+      { month: 'Feb', revenue: 0 },
+      { month: 'Mar', revenue: 0 },
+      { month: 'Apr', revenue: convertedLeads > 0 ? convertedLeads * 1250 : 0 },
     ];
 
     const responseData = {
@@ -1464,11 +1623,11 @@ const handleDashboardAnalytics = async (req, res) => {
         pipelineTrend,
         revenueTrend,
         callsPerHour: [
-          { hour: '09:00', calls: Math.ceil(totalCalls * 0.15) },
-          { hour: '11:00', calls: Math.ceil(totalCalls * 0.30) },
-          { hour: '14:00', calls: Math.ceil(totalCalls * 0.25) },
-          { hour: '16:00', calls: Math.ceil(totalCalls * 0.20) },
-          { hour: '18:00', calls: Math.ceil(totalCalls * 0.10) },
+          { hour: '09:00', calls: 0 },
+          { hour: '11:00', calls: 0 },
+          { hour: '14:00', calls: 0 },
+          { hour: '16:00', calls: 0 },
+          { hour: '18:00', calls: totalCalls },
         ]
       },
       liveStats: {

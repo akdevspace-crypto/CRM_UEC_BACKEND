@@ -112,21 +112,37 @@ router.post('/upload', requireRole(['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIO
 // POST /api/v1/leads - Create single lead
 router.post('/', async (req, res) => {
   try {
-    const { customerName, phoneNumber, email, serviceInterest, notes, source, city, assignedAgentId, status } = req.body;
+    const { customerName, phoneNumber, email, serviceInterest, notes, source, city, assignedAgentId, agentId, status } = req.body;
     if (!phoneNumber) {
       return res.status(400).json({ error: 'Phone number is required' });
     }
 
+    const trimmedPhone = String(phoneNumber).trim();
+
+    // Check for duplicate lead by phone number
+    const existing = await prisma.lead.findUnique({
+      where: { phoneNumber: trimmedPhone }
+    });
+    if (existing) {
+      return res.status(409).json({
+        error: 'Duplicate lead: A lead with this phone number already exists',
+        code: 'DUPLICATE_PHONE_NUMBER',
+        leadId: existing.id
+      });
+    }
+
+    const effectiveAgentId = assignedAgentId || agentId || null;
+
     const lead = await prisma.lead.create({
       data: {
         customerName: customerName || 'Unknown Lead',
-        phoneNumber: String(phoneNumber).trim(),
+        phoneNumber: trimmedPhone,
         email: email || null,
         serviceInterest: serviceInterest || null,
         notes: notes || null,
         source: source || 'Manual Entry',
         city: city || null,
-        assignedAgentId: assignedAgentId || null,
+        assignedAgentId: effectiveAgentId,
         status: status || 'NEW'
       }
     });
@@ -135,8 +151,14 @@ router.post('/', async (req, res) => {
     const io = req.app.get('io');
     if (io) io.emit('leadsUpdated', lead);
 
-    res.json(lead);
+    res.status(200).json(lead);
   } catch (err) {
+    if (err.code === 'P2002') {
+      return res.status(409).json({
+        error: 'Duplicate lead: A lead with this phone number already exists',
+        code: 'DUPLICATE_PHONE_NUMBER'
+      });
+    }
     console.error('[Leads Create] Error:', err);
     res.status(500).json({ error: 'Failed to create lead', details: err.message });
   }
@@ -170,7 +192,9 @@ router.get('/', async (req, res) => {
     }
 
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
-    const cacheKey = JSON.stringify({ whereClause, limit });
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const skip = req.query.skip !== undefined ? Math.max(0, parseInt(req.query.skip, 10) || 0) : (page - 1) * limit;
+    const cacheKey = JSON.stringify({ whereClause, limit, skip });
     const now = Date.now();
 
     let leads;
@@ -205,6 +229,7 @@ router.get('/', async (req, res) => {
             }
           },
           orderBy: { createdAt: 'desc' },
+          skip: skip,
           take: limit,
         });
       })();
@@ -286,7 +311,7 @@ router.put('/:id', async (req, res) => {
 
     const updateData = {};
     if (customerName !== undefined) updateData.customerName = customerName;
-    if (phoneNumber !== undefined) updateData.phoneNumber = phoneNumber;
+    if (phoneNumber !== undefined) updateData.phoneNumber = String(phoneNumber).trim();
     if (email !== undefined) updateData.email = email;
     if (serviceInterest !== undefined) updateData.serviceInterest = serviceInterest;
     if (notes !== undefined) updateData.notes = notes;
@@ -304,6 +329,12 @@ router.put('/:id', async (req, res) => {
 
     res.json(updatedLead);
   } catch (err) {
+    if (err.code === 'P2002') {
+      return res.status(409).json({
+        error: 'Duplicate lead: A lead with this phone number already exists',
+        code: 'DUPLICATE_PHONE_NUMBER'
+      });
+    }
     console.error(err);
     res.status(500).json({ error: 'Failed to update lead' });
   }
@@ -331,44 +362,6 @@ router.delete('/:id', requireRole(['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR']), async
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to delete lead' });
-  }
-});
-
-// POST /api/v1/leads (Manual Entry)
-router.post('/', async (req, res) => {
-  const { customerName, phoneNumber, email, serviceInterest, source, notes, agentId } = req.body;
-  try {
-    if (!phoneNumber) return res.status(400).json({ error: 'Phone number is required' });
-
-    const newLead = await prisma.lead.upsert({
-      where: { phoneNumber },
-      update: {
-        customerName: customerName || undefined,
-        email: email || undefined,
-        serviceInterest: serviceInterest || undefined,
-        source: source || undefined,
-        notes: notes || undefined,
-      },
-      create: {
-        customerName: customerName || 'Unknown',
-        phoneNumber,
-        email: email || null,
-        serviceInterest: serviceInterest || null,
-        source: source || 'Manual Entry',
-        notes: notes || null,
-        status: 'NEW',
-        uploadedById: agentId || null,
-      }
-    });
-
-    invalidateLeadsCache();
-    const io = req.app.get('io');
-    if (io) io.emit('leadsUpdated');
-
-    res.json({ success: true, lead: newLead });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to create lead' });
   }
 });
 

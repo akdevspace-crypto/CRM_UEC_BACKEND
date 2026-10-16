@@ -1,11 +1,11 @@
-import { Controller, Post, Req, Logger, Header, UnauthorizedException, ForbiddenException } from '@nestjs/common';
+import { Controller, Post, Req, Logger, Header, HttpCode, HttpStatus, UnauthorizedException, ForbiddenException } from '@nestjs/common';
 import type { Request } from 'express';
 import { TelephonyService } from './telephony.service';
 import { VobizProvider } from './providers/vobiz.provider';
 import { Public } from '../api-gateway/auth.guard';
 import * as crypto from 'crypto';
 
-@Controller('vobiz')
+@Controller(['vobiz', 'telephony/vobiz'])
 export class VobizController {
   private readonly logger = new Logger(VobizController.name);
 
@@ -16,6 +16,7 @@ export class VobizController {
 
   @Public()
   @Post('incoming')
+  @HttpCode(HttpStatus.OK)
   @Header('Content-Type', 'text/xml')
   async handleVobizIncoming(@Req() req: Request) {
     this.logger.log(`Received incoming call webhook from Vobiz`);
@@ -34,6 +35,7 @@ export class VobizController {
 
   @Public()
   @Post('status')
+  @HttpCode(HttpStatus.OK)
   async handleVobizStatus(@Req() req: Request) {
     this.verifySignature(req);
     const payload = req.body;
