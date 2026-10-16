@@ -3,6 +3,7 @@ import {
   NotFoundException,
   BadRequestException,
   ConflictException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
@@ -318,13 +319,27 @@ export class BookingService {
   /**
    * Cancel an appointment
    */
-  async cancelAppointment(id: string, reason?: string) {
+  async cancelAppointment(id: string, reason?: string, user?: any) {
     const existing = await this.prisma.appointment.findUnique({
       where: { id },
     });
 
     if (!existing) {
       throw new NotFoundException('APPOINTMENT_NOT_FOUND');
+    }
+
+    if (user) {
+      const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+      const isOwner = existing.assignedAgentId === user.agentId ||
+                      existing.doctorId === user.agentId ||
+                      existing.assignedAgentId === user.id ||
+                      existing.doctorId === user.id ||
+                      existing.createdBy === user.userId ||
+                      existing.createdBy === user.id;
+
+      if (!isElevated && !isOwner) {
+        throw new ForbiddenException('Forbidden: Insufficient permissions to cancel this appointment');
+      }
     }
 
     if (existing.status === 'CANCELLED' || existing.status === 'COMPLETED') {

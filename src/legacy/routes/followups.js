@@ -115,6 +115,21 @@ router.post('/', async (req, res) => {
 router.put('/:id/status', async (req, res) => {
   try {
     const { status } = req.body;
+    const existing = await prisma.leadFollowup.findUnique({
+      where: { id: req.params.id }
+    });
+    if (!existing) {
+      return res.status(404).json({ error: 'Followup not found' });
+    }
+
+    const reqRole = req.user?.role;
+    const reqAgentId = req.user?.agentId || req.user?.userId;
+    const isElevated = reqRole && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(reqRole);
+
+    if (!isElevated && existing.assignedAgentId && existing.assignedAgentId !== reqAgentId && existing.assignedAgentId !== req.user?.id) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to update this followup' });
+    }
+
     const followup = await prisma.leadFollowup.update({
       where: { id: req.params.id },
       data: { status }

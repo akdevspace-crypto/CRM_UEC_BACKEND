@@ -293,7 +293,20 @@ router.get('/:id', async (req, res) => {
       }
     });
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
-    res.json(lead);
+
+    const reqRole = req.user?.role;
+    const reqAgentId = req.user?.agentId || req.user?.userId;
+    const isElevated = reqRole && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(reqRole);
+
+    let phone = lead.phoneNumber;
+    if (!isElevated && lead.assignedAgentId && lead.assignedAgentId !== reqAgentId) {
+      phone = phone.length > 4 ? 'X'.repeat(phone.length - 4) + phone.slice(-4) : 'XXXX';
+    }
+
+    res.json({
+      ...lead,
+      phoneNumber: phone
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch lead' });
@@ -309,6 +322,20 @@ router.put('/:id', async (req, res) => {
     const existing = await prisma.lead.findUnique({ where: { id: leadId } });
     if (!existing) return res.status(404).json({ error: 'Lead not found' });
 
+    const reqRole = req.user?.role;
+    const reqAgentId = req.user?.agentId || req.user?.userId;
+    const isElevated = reqRole && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(reqRole);
+
+    // If non-elevated and the lead is assigned to someone else, reject
+    if (!isElevated && existing.assignedAgentId && existing.assignedAgentId !== reqAgentId) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to modify this lead' });
+    }
+
+    // Only elevated users can reassign lead ownership
+    if (!isElevated && assignedAgentId !== undefined && assignedAgentId !== existing.assignedAgentId) {
+      return res.status(403).json({ error: 'Forbidden: Only administrators and supervisors can reassign leads' });
+    }
+
     const updateData = {};
     if (customerName !== undefined) updateData.customerName = customerName;
     if (phoneNumber !== undefined) updateData.phoneNumber = String(phoneNumber).trim();
@@ -316,7 +343,7 @@ router.put('/:id', async (req, res) => {
     if (serviceInterest !== undefined) updateData.serviceInterest = serviceInterest;
     if (notes !== undefined) updateData.notes = notes;
     if (source !== undefined) updateData.source = source;
-    if (assignedAgentId !== undefined) updateData.assignedAgentId = assignedAgentId;
+    if (assignedAgentId !== undefined && isElevated) updateData.assignedAgentId = assignedAgentId;
 
     const updatedLead = await prisma.lead.update({
       where: { id: leadId },
@@ -426,13 +453,19 @@ router.post('/:id/claim', async (req, res) => {
 router.put('/:id/status', async (req, res) => {
   const leadId = req.params.id;
   const { status, notes } = req.body;
-  const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER'].includes(req.user?.role);
-  const agentId = (isElevated && req.body.agentId) ? req.body.agentId : (req.user?.agentId || req.user?.userId);
+  const reqRole = req.user?.role;
+  const reqAgentId = req.user?.agentId || req.user?.userId;
+  const isElevated = reqRole && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(reqRole);
+  const agentId = (isElevated && req.body.agentId) ? req.body.agentId : reqAgentId;
   
   try {
     if (!UUID_REGEX.test(leadId)) return res.status(404).json({ error: 'Lead not found' });
     const oldLead = await prisma.lead.findUnique({ where: { id: leadId } });
     if (!oldLead) return res.status(404).json({ error: 'Lead not found' });
+
+    if (!isElevated && oldLead.assignedAgentId && oldLead.assignedAgentId !== reqAgentId && oldLead.assignedAgentId !== req.user?.id) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to update this lead status' });
+    }
 
     let effectiveAgentId = null;
     if (agentId && UUID_REGEX.test(agentId)) {
@@ -475,13 +508,19 @@ router.put('/:id/status', async (req, res) => {
 router.post('/:id/convert', async (req, res) => {
   const leadId = req.params.id;
   const { notes, appointmentDate, appointmentPurpose, sentiment: manualSentiment } = req.body;
-  const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER'].includes(req.user?.role);
-  const agentId = (isElevated && req.body.agentId) ? req.body.agentId : (req.user?.agentId || req.user?.userId);
+  const reqRole = req.user?.role;
+  const reqAgentId = req.user?.agentId || req.user?.userId;
+  const isElevated = reqRole && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(reqRole);
+  const agentId = (isElevated && req.body.agentId) ? req.body.agentId : reqAgentId;
   
   try {
     if (!UUID_REGEX.test(leadId)) return res.status(404).json({ error: 'Lead not found' });
     const oldLead = await prisma.lead.findUnique({ where: { id: leadId } });
     if (!oldLead) return res.status(404).json({ error: 'Lead not found' });
+
+    if (!isElevated && oldLead.assignedAgentId && oldLead.assignedAgentId !== reqAgentId && oldLead.assignedAgentId !== req.user?.id) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to convert this lead' });
+    }
 
     let effectiveAgentId = null;
     if (agentId && UUID_REGEX.test(agentId)) {

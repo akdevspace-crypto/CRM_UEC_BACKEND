@@ -107,7 +107,21 @@ export class OmnichannelController {
   }
 
   @Put(':id/read')
-  async markRead(@Param('id') id: string) {
+  async markRead(@Param('id') id: string, @Req() req: any) {
+    if (!UUID_REGEX.test(id)) {
+      throw new NotFoundException('Conversation not found');
+    }
+    const conversation = await this.prisma.conversation.findUnique({
+      where: { id },
+    });
+    if (!conversation) {
+      throw new NotFoundException('Conversation not found');
+    }
+    const user = req?.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+    if (!isElevated && user && conversation.agentId && conversation.agentId !== user.agentId && conversation.agentId !== user.id) {
+      throw new ForbiddenException('Forbidden: Not authorized to modify this conversation');
+    }
     await this.prisma.conversation.update({
       where: { id },
       data: { unreadCount: 0 },

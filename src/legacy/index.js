@@ -861,6 +861,20 @@ app.put('/api/v1/conversations/:id/read', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Conversation not found' });
     }
 
+    const conversation = await prisma.conversation.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    const user = req.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+    if (!isElevated && user && conversation.agentId && conversation.agentId !== user.agentId && conversation.agentId !== user.userId && conversation.agentId !== user.id) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to modify this conversation' });
+    }
+
     const updatedConv = await prisma.conversation.update({
       where: { id: req.params.id },
       data: { unreadCount: 0 }
@@ -1208,12 +1222,24 @@ app.put('/api/v1/tickets/:id/status', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { status, resolution } = req.body;
   try {
+    const existing = await prisma.ticket.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+
+    const reqRole = req.user?.role;
+    const reqAgentId = req.user?.agentId || req.user?.userId;
+    const isElevated = reqRole && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(reqRole);
+
+    if (!isElevated && existing.agentId && existing.agentId !== reqAgentId && existing.agentId !== req.user?.id) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to update this ticket' });
+    }
+
     const updated = await prisma.ticket.update({
       where: { id },
       data: {
         status: status || undefined,
         resolution: resolution || undefined,
-        resolvedAt: (status === 'RESOLVED' || status === 'CLOSED') ? new Date() : undefined,
       },
       include: { customer: true, agent: true }
     });
@@ -1418,6 +1444,20 @@ const handleDeleteCalendarAppointment = async (req, res) => {
     const existing = await prisma.appointment.findUnique({ where: { id } });
     if (!existing) {
       return res.status(404).json({ error: 'Appointment not found' });
+    }
+
+    const reqRole = req.user?.role;
+    const reqAgentId = req.user?.agentId || req.user?.userId;
+    const isElevated = reqRole && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(reqRole);
+    const isOwner = existing.assignedAgentId === reqAgentId ||
+                    existing.doctorId === reqAgentId ||
+                    existing.assignedAgentId === req.user?.id ||
+                    existing.doctorId === req.user?.id ||
+                    existing.createdBy === req.user?.userId ||
+                    existing.createdBy === req.user?.id;
+
+    if (!isElevated && !isOwner) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to cancel this appointment' });
     }
 
     const updated = await prisma.appointment.update({

@@ -115,12 +115,13 @@ export class BookingController {
   @Patch(':id/cancel')
   async cancelAppointment(
     @Param('id') id: string,
+    @Req() req: any,
     @Body('reason') reason?: string,
   ) {
     if (!UUID_REGEX.test(id)) {
       throw new NotFoundException('Appointment not found');
     }
-    return this.bookingService.cancelAppointment(id, reason);
+    return this.bookingService.cancelAppointment(id, reason, req?.user);
   }
 
   @Patch(':id/status')
