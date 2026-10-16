@@ -93,7 +93,7 @@ export class VobizProvider implements TelephonyProvider {
 
   async initiateOutboundCall(request: OutboundCallRequest, roomName: string): Promise<any> {
     this.logger.log(`Initiating Vobiz Outbound SIP Call to ${request.to} via LiveKit`);
-    const trunkId = process.env.LIVEKIT_VOBIZ_OUTBOUND_TRUNK_ID || 'ST_xSShWdBTtHZR';
+    const trunkId = process.env.LIVEKIT_VOBIZ_OUTBOUND_TRUNK_ID || 'ST_xsShWdBTtHZR';
     
     // Use LivekitService to create SIP Participant
     const sipParticipantIdentity = await this.livekitService.createSipParticipant(roomName, trunkId, request.to);
