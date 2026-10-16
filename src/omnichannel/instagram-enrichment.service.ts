@@ -37,15 +37,28 @@ export class InstagramProfileEnrichmentService {
     let accessToken =
       process.env.META_PAGE_ACCESS_TOKEN ||
       process.env.META_ACCESS_TOKEN ||
-      process.env.ACCESS_TOKEN ||
-      'IGAAOguCTltA9BZAGF1eWE4cEt1dGRRNGJSX1pNOE5ZATHJwaUxpZAG91YV9PTkd0c0NUTlJmQ2M2WjlGNURuN2ZA4Y25LeE5WejNFQ0haTmJhQW9DU0pOVGExRmREUkJ0VUlJbTJrSk00RDY0OGNHbmZAxbkhPaF9BX0x2ZAE8xZAUhqbwZDZD';
+      process.env.ACCESS_TOKEN;
 
     // Fallback to WHATSAPP_TOKEN if the active token is a legacy/deprecated Instagram Basic Display token starting with 'IG'
-    if (accessToken.startsWith('IG') && process.env.WHATSAPP_TOKEN) {
+    if (accessToken && accessToken.startsWith('IG') && process.env.WHATSAPP_TOKEN) {
       this.logger.log(
         'Detected legacy IG token prefix. Falling back to WHATSAPP_TOKEN for Facebook Graph API request.',
       );
       accessToken = process.env.WHATSAPP_TOKEN;
+    }
+
+    if (!accessToken) {
+      this.logger.warn(
+        `Meta Access Token not configured. Using fallback profile for ${platformUserId}.`,
+      );
+      const mockProfile = {
+        username: `Instagram Contact`,
+        profilePictureUrl: ``,
+        id: platformUserId,
+        enrichmentFailed: true,
+      };
+      await this.updateCustomerIdentity(customerId, platformUserId, mockProfile);
+      return mockProfile;
     }
 
     const fields = 'username,profile_pic';

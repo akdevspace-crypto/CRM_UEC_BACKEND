@@ -3,8 +3,21 @@ const router = express.Router();
 const prisma = require('../prisma');
 const { enqueueInstagramEnrichment } = require('../queues/instagramEnrichment');
 const crypto = require('crypto');
+const Redis = require('ioredis');
 
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || 'my_instagram_verify_token';
+
+// Connect to Redis for webhook idempotency
+const redisConnection = process.env.REDIS_URL 
+  ? new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null }) 
+  : new Redis({
+      host: process.env.REDIS_HOST || '127.0.0.1',
+      port: process.env.REDIS_PORT || 6379,
+    });
+
+redisConnection.on('error', (err) => {
+  console.warn('[Redis Meta Webhook] Warning:', err.message);
+});
 
 // GET /webhook - Meta Webhook Verification
 router.get(['/webhook', '/webhooks/meta'], (req, res) => {
@@ -141,8 +154,20 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
               console.log(`[DB] Created new conversation: ${conversation.id}`);
             }
 
-            // 4. Check for duplicate message (using mid if possible, but our schema doesn't have a mid column yet)
-            // So we just save it
+            // 4. Idempotent check for duplicate message using provider messageId (mid)
+            if (messageId) {
+              const dedupKey = `meta_msg_dedup:${messageId}`;
+              try {
+                const isNew = await redisConnection.set(dedupKey, '1', 'EX', 86400, 'NX');
+                if (!isNew) {
+                  console.log(`[Meta ${platform}] Duplicate message event ignored: ${messageId}`);
+                  continue;
+                }
+              } catch (dedupErr) {
+                console.warn('[Meta Webhook] Dedup check error:', dedupErr.message);
+              }
+            }
+
             const savedMessage = await prisma.message.create({
               data: {
                 conversationId: conversation.id,

@@ -3,13 +3,17 @@ const simpleParser = require('mailparser').simpleParser;
 const prisma = require('./prisma');
 
 const startEmailListener = async (io) => {
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.warn('⚠️ [EMAIL-INBOUND] IMAP credentials missing in environment variables. Email listener disabled.');
+    return;
+  }
   const client = new ImapFlow({
-    host: 'imap.gmail.com',
-    port: 993,
+    host: process.env.EMAIL_IMAP_HOST || 'imap.gmail.com',
+    port: parseInt(process.env.EMAIL_IMAP_PORT || '993', 10),
     secure: true,
     auth: {
-      user: process.env.EMAIL_USER || 'testingforcompany.0@gmail.com',
-      pass: process.env.EMAIL_PASS || 'qxmj ibnc fleg gsyy'
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS
     },
     logger: false // Set to true for deep debugging
   });

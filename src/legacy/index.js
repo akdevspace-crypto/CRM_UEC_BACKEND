@@ -11,9 +11,18 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const Redis = require('ioredis');
 require('dotenv').config();
 const { setupSignaling } = require('./signaling');
 const { vobizWebhookRouter } = require('./vobiz');
+
+const redisClient = process.env.REDIS_URL
+  ? new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null })
+  : new Redis({
+      host: process.env.REDIS_HOST || '127.0.0.1',
+      port: process.env.REDIS_PORT || 6379,
+    });
+redisClient.on('error', (err) => console.warn('[Redis Legacy] Warning:', err.message));
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
@@ -428,7 +437,7 @@ app.post('/api/messages/send-email', requireAuth, async (req, res) => {
         conversationId,
         content: message,
         senderType: 'AGENT',
-        status: emailResult.success ? 'DELIVERED' : 'FAILED'
+        status: emailResult.success ? 'SENT' : 'FAILED'
       }
     });
 
@@ -546,6 +555,20 @@ app.post("/webhooks/signalwire", async (req, res) => {
 
 app.post('/webhooks/whatsapp', async (req, res) => {
   console.log("WHATSAPP MESSAGE RECEIVED");
+
+  const messageSid = req.body.MessageSid || req.body.SmsMessageSid;
+  if (messageSid) {
+    const dedupKey = `wa_msg_dedup:${messageSid}`;
+    try {
+      const isNew = await redisClient.set(dedupKey, '1', 'EX', 86400, 'NX');
+      if (!isNew) {
+        console.log(`[WhatsApp Webhook] Duplicate message event ignored: ${messageSid}`);
+        return res.sendStatus(200);
+      }
+    } catch (dedupErr) {
+      console.warn('[WhatsApp Webhook] Dedup check error:', dedupErr.message);
+    }
+  }
 
   const fromNumber = req.body.From; // format: 'whatsapp:+1234567890'
   const bodyText = req.body.Body;
@@ -669,7 +692,7 @@ app.post('/api/messages/send-whatsapp', requireAuth, async (req, res) => {
         conversationId,
         content: message,
         senderType: 'AGENT',
-        status: 'DELIVERED' // Simplification; Twilio gives queued/sent/delivered via webhooks
+        status: 'SENT' // Initially SENT upon provider submission; transitions to DELIVERED/READ via webhook
       }
     });
 
@@ -765,7 +788,7 @@ app.post('/api/messages/send-instagram', requireAuth, async (req, res) => {
         conversationId,
         content: message,
         senderType: 'AGENT',
-        status: 'DELIVERED'
+        status: 'SENT' // Initially SENT upon provider submission; transitions to DELIVERED/READ via webhook
       }
     });
 
