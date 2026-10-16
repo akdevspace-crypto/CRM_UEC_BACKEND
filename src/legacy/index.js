@@ -1036,6 +1036,15 @@ app.get('/api/v1/calls/records', requireAuth, async (req, res) => {
 // TICKETING API
 // ==========================================
 
+// Short-lived query cache with single-flight de-duplication to prevent DB pool exhaustion under high concurrency
+const ticketsDbCache = new Map();
+const inFlightTicketsQueries = new Map();
+const TICKETS_CACHE_TTL = 3000; // 3 seconds
+
+function invalidateTicketsCache() {
+  ticketsDbCache.clear();
+}
+
 app.get('/api/v1/tickets', requireAuth, async (req, res) => {
   try {
     const role = req.user?.role;
@@ -1051,12 +1060,40 @@ app.get('/api/v1/tickets', requireAuth, async (req, res) => {
     }
 
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
-    const tickets = await prisma.ticket.findMany({
-      where: whereClause,
-      include: { customer: true, agent: true },
-      orderBy: { updatedAt: 'desc' },
-      take: limit,
-    });
+    const cacheKey = JSON.stringify({ whereClause, limit });
+    const now = Date.now();
+
+    let tickets;
+    const cached = ticketsDbCache.get(cacheKey);
+    if (cached && (now - cached.timestamp < TICKETS_CACHE_TTL)) {
+      tickets = cached.data;
+    } else if (inFlightTicketsQueries.has(cacheKey)) {
+      tickets = await inFlightTicketsQueries.get(cacheKey);
+    } else {
+      const fetchPromise = (async () => {
+        return await prisma.ticket.findMany({
+          where: whereClause,
+          select: {
+            id: true,
+            category: true,
+            status: true,
+            priority: true,
+            updatedAt: true,
+            customer: { select: { name: true } },
+          },
+          orderBy: { updatedAt: 'desc' },
+          take: limit,
+        });
+      })();
+
+      inFlightTicketsQueries.set(cacheKey, fetchPromise);
+      try {
+        tickets = await fetchPromise;
+        ticketsDbCache.set(cacheKey, { data: tickets, timestamp: Date.now() });
+      } finally {
+        inFlightTicketsQueries.delete(cacheKey);
+      }
+    }
 
     res.json(tickets.map(t => ({
       id: t.id,
@@ -1064,7 +1101,7 @@ app.get('/api/v1/tickets', requireAuth, async (req, res) => {
       subject: t.category,
       status: t.status,
       priority: t.priority,
-      updated: t.updatedAt.toLocaleDateString()
+      updated: (t.updatedAt instanceof Date ? t.updatedAt : new Date(t.updatedAt)).toLocaleDateString()
     })));
   } catch (err) {
     console.error(err);
@@ -1120,6 +1157,7 @@ app.post('/api/v1/tickets', requireAuth, async (req, res) => {
       }
     });
 
+    invalidateTicketsCache();
     io.emit('ticketCreated', ticket);
     io.emit('admin_ticket_alert', ticket);
 
@@ -1144,6 +1182,7 @@ app.put('/api/v1/tickets/:id/status', requireAuth, async (req, res) => {
       },
       include: { customer: true, agent: true }
     });
+    invalidateTicketsCache();
     io.emit('ticketUpdated', updated);
     res.json(updated);
   } catch (err) {
@@ -1155,27 +1194,61 @@ app.put('/api/v1/tickets/:id/status', requireAuth, async (req, res) => {
 // ==========================================
 // CALENDAR & APPOINTMENTS (DEF-07 / DEF-08)
 // ==========================================
+const calendarDbCache = new Map();
+const inFlightCalendarQueries = new Map();
+const CALENDAR_CACHE_TTL = 3000; // 3 seconds
+
+function invalidateCalendarCache() {
+  calendarDbCache.clear();
+}
+
 const handleCalendarRequest = async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const now = new Date();
     const start = startDate ? new Date(startDate) : new Date(now.getFullYear(), now.getMonth(), 1);
     const end = endDate ? new Date(endDate) : new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 200);
 
-    const appointments = await prisma.appointment.findMany({
-      where: {
-        startTime: {
-          gte: start,
-          lte: end,
-        },
-      },
-      include: {
-        customer: true,
-        doctor: true,
-      },
-      orderBy: { startTime: 'asc' },
-      take: Math.min(parseInt(req.query.limit, 10) || 100, 200),
-    });
+    const cacheKey = `${start.toISOString()}_${end.toISOString()}_${limit}`;
+    const cacheNow = Date.now();
+
+    let appointments;
+    const cached = calendarDbCache.get(cacheKey);
+    if (cached && (cacheNow - cached.timestamp < CALENDAR_CACHE_TTL)) {
+      appointments = cached.data;
+    } else if (inFlightCalendarQueries.has(cacheKey)) {
+      appointments = await inFlightCalendarQueries.get(cacheKey);
+    } else {
+      const fetchPromise = (async () => {
+        return await prisma.appointment.findMany({
+          where: {
+            startTime: {
+              gte: start,
+              lte: end,
+            },
+          },
+          include: {
+            customer: {
+              select: { id: true, name: true, phone: true }
+            },
+            doctor: {
+              select: { id: true, name: true, department: true }
+            }
+          },
+          orderBy: { startTime: 'asc' },
+          take: limit,
+        });
+      })();
+
+      inFlightCalendarQueries.set(cacheKey, fetchPromise);
+      try {
+        appointments = await fetchPromise;
+        calendarDbCache.set(cacheKey, { data: appointments, timestamp: Date.now() });
+      } finally {
+        inFlightCalendarQueries.delete(cacheKey);
+      }
+    }
 
     res.json(appointments);
   } catch (err) {

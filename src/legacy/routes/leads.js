@@ -98,6 +98,7 @@ router.post('/upload', requireRole(['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIO
       }
     });
 
+    invalidateLeadsCache();
     const io = req.app.get('io');
     if (io) io.emit('leadsUpdated'); // Broadcast change
 
@@ -130,6 +131,7 @@ router.post('/', async (req, res) => {
       }
     });
 
+    invalidateLeadsCache();
     const io = req.app.get('io');
     if (io) io.emit('leadsUpdated', lead);
 
@@ -139,6 +141,15 @@ router.post('/', async (req, res) => {
     res.status(500).json({ error: 'Failed to create lead', details: err.message });
   }
 });
+
+// Short-lived query cache with single-flight de-duplication to prevent DB pool exhaustion under high concurrency
+const leadsDbCache = new Map();
+const inFlightLeadsQueries = new Map();
+const LEADS_CACHE_TTL = 3000; // 3 seconds
+
+function invalidateLeadsCache() {
+  leadsDbCache.clear();
+}
 
 // GET /api/v1/leads
 router.get('/', async (req, res) => {
@@ -159,15 +170,53 @@ router.get('/', async (req, res) => {
     }
 
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
-    const leads = await prisma.lead.findMany({
-      where: whereClause,
-      include: {
-        assignedAgent: true,
-        followups: { orderBy: { followupDate: 'asc' }, take: 1 }
-      },
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-    });
+    const cacheKey = JSON.stringify({ whereClause, limit });
+    const now = Date.now();
+
+    let leads;
+    const cached = leadsDbCache.get(cacheKey);
+    if (cached && (now - cached.timestamp < LEADS_CACHE_TTL)) {
+      leads = cached.data;
+    } else if (inFlightLeadsQueries.has(cacheKey)) {
+      leads = await inFlightLeadsQueries.get(cacheKey);
+    } else {
+      const fetchPromise = (async () => {
+        return await prisma.lead.findMany({
+          where: whereClause,
+          select: {
+            id: true,
+            customerName: true,
+            phoneNumber: true,
+            email: true,
+            serviceInterest: true,
+            source: true,
+            status: true,
+            conversionScore: true,
+            sentiment: true,
+            createdAt: true,
+            assignedAgentId: true,
+            assignedAgent: {
+              select: { name: true }
+            },
+            followups: {
+              select: { followupDate: true },
+              orderBy: { followupDate: 'asc' },
+              take: 1
+            }
+          },
+          orderBy: { createdAt: 'desc' },
+          take: limit,
+        });
+      })();
+
+      inFlightLeadsQueries.set(cacheKey, fetchPromise);
+      try {
+        leads = await fetchPromise;
+        leadsDbCache.set(cacheKey, { data: leads, timestamp: Date.now() });
+      } finally {
+        inFlightLeadsQueries.delete(cacheKey);
+      }
+    }
 
     // Mask phone numbers if agent is requesting and lead is not assigned to them
     const reqAgentId = req.user?.agentId || req.user?.userId;
@@ -249,6 +298,7 @@ router.put('/:id', async (req, res) => {
       data: updateData
     });
 
+    invalidateLeadsCache();
     const io = req.app.get('io');
     if (io) io.emit('leadUpdated', updatedLead);
 
@@ -273,6 +323,7 @@ router.delete('/:id', requireRole(['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR']), async
       prisma.lead.delete({ where: { id: leadId } })
     ]);
     
+    invalidateLeadsCache();
     const io = req.app.get('io');
     if (io) io.emit('leadDeleted', { id: leadId });
 
@@ -310,6 +361,7 @@ router.post('/', async (req, res) => {
       }
     });
 
+    invalidateLeadsCache();
     const io = req.app.get('io');
     if (io) io.emit('leadsUpdated');
 
@@ -363,6 +415,7 @@ router.post('/:id/claim', async (req, res) => {
     });
 
     // 5. Broadcast to update everyone's pool
+    invalidateLeadsCache();
     const io = req.app.get('io');
     if (io) io.emit('leadClaimed', { leadId, agentId, status: 'IN_PROGRESS' });
 
@@ -414,6 +467,7 @@ router.put('/:id/status', async (req, res) => {
       }
     });
 
+    invalidateLeadsCache();
     const io = req.app.get('io');
     if (io) io.emit('leadUpdated', updatedLead);
 
@@ -509,6 +563,7 @@ router.post('/:id/convert', async (req, res) => {
       }
     }
 
+    invalidateLeadsCache();
     const io = req.app.get('io');
     if (io) io.emit('leadUpdated', updatedLead);
 
