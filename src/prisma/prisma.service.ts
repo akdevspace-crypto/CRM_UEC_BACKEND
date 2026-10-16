@@ -8,6 +8,13 @@ export class PrismaService
 {
   private readonly logger = new Logger(PrismaService.name);
 
+  constructor() {
+    super({
+      log: ['warn', 'error'],
+    });
+    (global as any).__prismaInstance = this;
+  }
+
   async onModuleInit() {
     let retries = 5;
     while (retries > 0) {

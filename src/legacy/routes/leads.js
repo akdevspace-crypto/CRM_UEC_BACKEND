@@ -7,6 +7,7 @@ const { requireRole } = require('../middleware/auth');
 const prisma = require('../prisma');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // Connect to Redis for distributed locks
 const redisConnection = process.env.REDIS_URL 
@@ -107,14 +108,55 @@ router.post('/upload', requireRole(['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIO
   }
 });
 
+// POST /api/v1/leads - Create single lead
+router.post('/', async (req, res) => {
+  try {
+    const { customerName, phoneNumber, email, serviceInterest, notes, source, city, assignedAgentId, status } = req.body;
+    if (!phoneNumber) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+    const lead = await prisma.lead.create({
+      data: {
+        customerName: customerName || 'Unknown Lead',
+        phoneNumber: String(phoneNumber).trim(),
+        email: email || null,
+        serviceInterest: serviceInterest || null,
+        notes: notes || null,
+        source: source || 'Manual Entry',
+        city: city || null,
+        assignedAgentId: assignedAgentId || null,
+        status: status || 'NEW'
+      }
+    });
+
+    const io = req.app.get('io');
+    if (io) io.emit('leadsUpdated', lead);
+
+    res.json(lead);
+  } catch (err) {
+    console.error('[Leads Create] Error:', err);
+    res.status(500).json({ error: 'Failed to create lead', details: err.message });
+  }
+});
+
 // GET /api/v1/leads
 router.get('/', async (req, res) => {
   try {
-    const { status, agentId, service } = req.query;
+    const { status, agentId, service, search, q, query } = req.query;
     const whereClause = {};
     if (status) whereClause.status = status;
     if (agentId) whereClause.assignedAgentId = agentId;
     if (service) whereClause.serviceInterest = service;
+
+    const searchTerm = search || q || query;
+    if (searchTerm) {
+      whereClause.OR = [
+        { customerName: { contains: searchTerm, mode: 'insensitive' } },
+        { phoneNumber: { contains: searchTerm } },
+        { email: { contains: searchTerm, mode: 'insensitive' } },
+      ];
+    }
 
     const leads = await prisma.lead.findMany({
       where: whereClause,
@@ -160,6 +202,82 @@ router.get('/', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch leads' });
+  }
+});
+
+// GET /api/v1/leads/:id
+router.get('/:id', async (req, res) => {
+  try {
+    const leadId = req.params.id;
+    const lead = await prisma.lead.findUnique({
+      where: { id: leadId },
+      include: {
+        assignedAgent: true,
+        followups: { orderBy: { followupDate: 'asc' } },
+      }
+    });
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    res.json(lead);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch lead' });
+  }
+});
+
+// PUT /api/v1/leads/:id (Full Lead Update)
+router.put('/:id', async (req, res) => {
+  try {
+    const leadId = req.params.id;
+    const { customerName, phoneNumber, email, serviceInterest, notes, source, assignedAgentId } = req.body;
+    
+    const existing = await prisma.lead.findUnique({ where: { id: leadId } });
+    if (!existing) return res.status(404).json({ error: 'Lead not found' });
+
+    const updateData = {};
+    if (customerName !== undefined) updateData.customerName = customerName;
+    if (phoneNumber !== undefined) updateData.phoneNumber = phoneNumber;
+    if (email !== undefined) updateData.email = email;
+    if (serviceInterest !== undefined) updateData.serviceInterest = serviceInterest;
+    if (notes !== undefined) updateData.notes = notes;
+    if (source !== undefined) updateData.source = source;
+    if (assignedAgentId !== undefined) updateData.assignedAgentId = assignedAgentId;
+
+    const updatedLead = await prisma.lead.update({
+      where: { id: leadId },
+      data: updateData
+    });
+
+    const io = req.app.get('io');
+    if (io) io.emit('leadUpdated', updatedLead);
+
+    res.json(updatedLead);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update lead' });
+  }
+});
+
+// DELETE /api/v1/leads/:id
+router.delete('/:id', requireRole(['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR']), async (req, res) => {
+  try {
+    const leadId = req.params.id;
+    const existing = await prisma.lead.findUnique({ where: { id: leadId } });
+    if (!existing) return res.status(404).json({ error: 'Lead not found' });
+
+    // Delete related conversion logs and followups safely in transaction
+    await prisma.$transaction([
+      prisma.leadConversionLog.deleteMany({ where: { leadId } }),
+      prisma.leadFollowup.deleteMany({ where: { leadId } }),
+      prisma.lead.delete({ where: { id: leadId } })
+    ]);
+    
+    const io = req.app.get('io');
+    if (io) io.emit('leadDeleted', { id: leadId });
+
+    res.json({ success: true, message: 'Lead deleted successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete lead' });
   }
 });
 
@@ -264,20 +382,33 @@ router.put('/:id/status', async (req, res) => {
   const agentId = (isElevated && req.body.agentId) ? req.body.agentId : (req.user?.agentId || req.user?.userId);
   
   try {
+    if (!UUID_REGEX.test(leadId)) return res.status(404).json({ error: 'Lead not found' });
     const oldLead = await prisma.lead.findUnique({ where: { id: leadId } });
+    if (!oldLead) return res.status(404).json({ error: 'Lead not found' });
+
+    let effectiveAgentId = null;
+    if (agentId && UUID_REGEX.test(agentId)) {
+      const agentRecord = await prisma.agent.findFirst({
+        where: { OR: [{ id: agentId }, { userId: agentId }] }
+      });
+      if (agentRecord) effectiveAgentId = agentRecord.id;
+    }
     
     const updatedLead = await prisma.lead.update({
       where: { id: leadId },
-      data: { status }
+      data: { 
+        status,
+        ...(notes !== undefined ? { notes } : {})
+      }
     });
 
     await prisma.leadConversionLog.create({
       data: {
         leadId,
-        agentId,
+        agentId: effectiveAgentId,
         oldStatus: oldLead.status,
         newStatus: status,
-        notes
+        notes: notes || null
       }
     });
 
@@ -299,27 +430,39 @@ router.post('/:id/convert', async (req, res) => {
   const agentId = (isElevated && req.body.agentId) ? req.body.agentId : (req.user?.agentId || req.user?.userId);
   
   try {
+    if (!UUID_REGEX.test(leadId)) return res.status(404).json({ error: 'Lead not found' });
     const oldLead = await prisma.lead.findUnique({ where: { id: leadId } });
     if (!oldLead) return res.status(404).json({ error: 'Lead not found' });
 
+    let effectiveAgentId = null;
+    if (agentId && UUID_REGEX.test(agentId)) {
+      const agentRecord = await prisma.agent.findFirst({
+        where: { OR: [{ id: agentId }, { userId: agentId }] }
+      });
+      if (agentRecord) effectiveAgentId = agentRecord.id;
+    }
+
     let sentiment = 'NEUTRAL';
-    let newStatus = 'IN_PROGRESS';
+    let newStatus = 'CONVERTED';
 
     if (manualSentiment) {
       sentiment = manualSentiment;
-      newStatus = manualSentiment;
+      newStatus = manualSentiment === 'POSITIVE' || manualSentiment === 'NEGATIVE' ? 'CONVERTED' : manualSentiment;
     } else {
-      // Simple mock sentiment analysis (Fallback)
-      const lowerNotes = notes.toLowerCase();
+      // Safe fallback sentiment analysis against null/undefined notes (DEF-23)
+      const lowerNotes = (typeof notes === 'string' ? notes : (notes ? String(notes) : '')).toLowerCase();
       const positiveWords = ['interested', 'yes', 'schedule', 'positive', 'good', 'great', 'callback', 'meet'];
       const negativeWords = ['not interested', 'no', 'negative', 'bad', 'angry', 'do not call', 'wrong number'];
 
-      if (positiveWords.some(w => lowerNotes.includes(w))) {
-        sentiment = 'POSITIVE';
-        newStatus = 'POSITIVE';
-      } else if (negativeWords.some(w => lowerNotes.includes(w))) {
+      if (negativeWords.some(w => lowerNotes.includes(w))) {
         sentiment = 'NEGATIVE';
         newStatus = 'NEGATIVE';
+      } else if (positiveWords.some(w => lowerNotes.includes(w))) {
+        sentiment = 'POSITIVE';
+        newStatus = 'CONVERTED';
+      } else {
+        sentiment = 'NEUTRAL';
+        newStatus = 'CONVERTED';
       }
     }
 
@@ -337,24 +480,31 @@ router.post('/:id/convert', async (req, res) => {
     await prisma.leadConversionLog.create({
       data: {
         leadId,
-        agentId,
+        agentId: effectiveAgentId,
         oldStatus: oldLead.status,
         newStatus,
-        notes
+        notes: notes || null
       }
     });
 
-    // If positive and date provided, schedule follow-up
-    if (sentiment === 'POSITIVE' && appointmentDate) {
-      await prisma.leadFollowup.create({
-        data: {
-          leadId,
-          assignedAgentId: agentId || oldLead.assignedAgentId,
-          followupDate: new Date(appointmentDate),
-          purpose: appointmentPurpose || 'Follow-up meeting',
-          meetingType: 'APPOINTMENT'
-        }
-      });
+    // If appointment date provided, schedule follow-up with safe agent resolution
+    if (appointmentDate) {
+      let agentForFollowup = effectiveAgentId || oldLead.assignedAgentId;
+      if (!agentForFollowup) {
+        const firstAgent = await prisma.agent.findFirst();
+        if (firstAgent) agentForFollowup = firstAgent.id;
+      }
+      if (agentForFollowup) {
+        await prisma.leadFollowup.create({
+          data: {
+            leadId,
+            assignedAgentId: agentForFollowup,
+            followupDate: new Date(appointmentDate),
+            purpose: appointmentPurpose || 'Follow-up meeting',
+            meetingType: 'APPOINTMENT'
+          }
+        }).catch(err => console.warn('[Followup Warning]', err.message));
+      }
     }
 
     const io = req.app.get('io');

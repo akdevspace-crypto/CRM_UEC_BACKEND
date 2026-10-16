@@ -34,7 +34,8 @@ export class AnalyticsService {
       return;
     }
 
-    this.logger.log(`[AI-AUDIT] event=MODEL_CONFIG provider=@google/genai model=gemini-3.8-flash apiKeyConfigured=true authenticationMode=Developer_API_Key`);
+    const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+    this.logger.log(`[AI-AUDIT] event=MODEL_CONFIG provider=@google/genai model=${modelName} apiKeyConfigured=true authenticationMode=Developer_API_Key`);
 
     try {
       const supabaseUrl = process.env.SUPABASE_URL || 'https://aws-1-ap-southeast-1.pooler.supabase.com';
@@ -77,7 +78,7 @@ export class AnalyticsService {
       `;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: modelName,
         contents: [
           {
             inlineData: {

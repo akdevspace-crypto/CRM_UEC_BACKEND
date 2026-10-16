@@ -20,14 +20,20 @@ function setupSignaling(io) {
       if (!rawToken) {
         return; // Handled / rejected by gateway with auth_error
       }
+      let decoded;
       try {
         const secret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
-        jwt.verify(rawToken, secret);
+        decoded = jwt.verify(rawToken, secret);
       } catch (err) {
         return;
       }
 
       const { agentId, name, skills } = data;
+      const isAdmin = ['ADMIN', 'SUPER_ADMIN'].includes(decoded?.role);
+      const isOwner = decoded?.agentId === agentId || decoded?.userId === agentId || decoded?.id === agentId;
+      if (!isAdmin && !isOwner) {
+        return; // Spoofing attempt blocked
+      }
       const agentData = { agentId, name, skills, status: 'AVAILABLE', socketId: socket.id };
       await redis.set(redisKey(socket.id), JSON.stringify(agentData));
       console.log(`Agent ${name} logged in. Available for calls.`);

@@ -96,16 +96,23 @@ export class TelephonyGateway
     }
 
     if (agentId) {
+      const isAdmin = ['ADMIN', 'SUPER_ADMIN'].includes(authenticatedUser.role);
+      const tokenAgentId = authenticatedUser.agentId;
+      const tokenUserId = authenticatedUser.userId || authenticatedUser.sub || authenticatedUser.id;
+
+      if (!isAdmin && tokenAgentId && tokenAgentId !== agentId && tokenUserId !== agentId) {
+        this.logger.warn(`[SECURITY] WebSocket spoofing attempt blocked immediately: token agent/user ${tokenAgentId || tokenUserId} attempted to bind agent ${agentId}`);
+        client.emit('auth_error', { message: 'Unauthorized: cannot impersonate other agents' });
+        return;
+      }
+
       try {
-        // Find agent by Agent ID or User ID
-        let agent = await this.prisma.agent.findUnique({
-          where: { id: agentId },
+        // Find agent by Agent ID or User ID in a single query
+        const agent = await this.prisma.agent.findFirst({
+          where: {
+            OR: [{ id: agentId }, { userId: agentId }],
+          },
         });
-        if (!agent) {
-          agent = await this.prisma.agent.findUnique({
-            where: { userId: agentId },
-          });
-        }
 
         if (agent) {
           // Verify user is authorized to bind this agent socket
@@ -139,6 +146,8 @@ export class TelephonyGateway
           this.logger.warn(
             `Agent login failed: No agent found for ID ${agentId}`,
           );
+          client.emit('auth_error', { message: 'Unauthorized: Agent not found or identity mismatch' });
+          return;
         }
       } catch (e) {
         this.logger.error(`Agent login error: ${e.message}`);

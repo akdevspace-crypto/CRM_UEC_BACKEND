@@ -12,7 +12,12 @@ const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || 'dummy_key';
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
 const Redis = require('ioredis');
-const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+  maxRetriesPerRequest: 1,
+  connectTimeout: 500,
+  enableOfflineQueue: false,
+  lazyConnect: true
+});
 
 redis.on('error', (err) => {
   console.error('[Redis Agents] Error:', err.message);
@@ -22,39 +27,40 @@ redis.on('error', (err) => {
 router.get('/', async (req, res) => {
   console.log('[Agents Route] Received GET /');
   try {
-    const agents = await prisma.agent.findMany({
-      where: { isDeleted: false },
-      include: { user: true },
-      orderBy: { createdAt: 'desc' }
-    });
-    console.log('[Agents Route] Prisma query complete');
-
-    // Fetch real-time presence from Redis with fast fallback (150ms timeout)
-    const onlineAgents = {};
-    try {
-      if (redis.status === 'ready') {
-        const fetchRedis = async () => {
-          const keys = await redis.keys('agent:*');
-          if (keys && keys.length > 0) {
-            const values = await redis.mget(keys);
-            for (const val of values) {
-              if (val) {
-                try {
-                  const parsed = JSON.parse(val);
-                  if (parsed.agentId) onlineAgents[parsed.agentId] = parsed.status;
-                } catch (_) {}
-              }
-            }
-          }
-        };
-        await Promise.race([
-          fetchRedis(),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Redis timeout')), 150))
-        ]);
-      }
-    } catch (e) {
-      // Gracefully fall back to DB status without stalling HTTP response
-    }
+    // Run Prisma query and Redis presence lookups concurrently
+    const [agents, onlineAgents] = await Promise.all([
+      prisma.agent.findMany({
+        where: { isDeleted: false },
+        include: { user: true },
+        orderBy: { createdAt: 'desc' }
+      }),
+      (async () => {
+        const presenceMap = {};
+        if (redis.status === 'ready') {
+          try {
+            await Promise.race([
+              (async () => {
+                const keys = await redis.keys('agent:*');
+                if (keys && keys.length > 0) {
+                  const values = await redis.mget(keys);
+                  for (const val of values) {
+                    if (val) {
+                      try {
+                        const parsed = JSON.parse(val);
+                        if (parsed.agentId) presenceMap[parsed.agentId] = parsed.status;
+                      } catch (_) {}
+                    }
+                  }
+                }
+              })(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Redis timeout')), 100))
+            ]);
+          } catch (_) {}
+        }
+        return presenceMap;
+      })()
+    ]);
+    console.log('[Agents Route] Query and presence lookup complete');
     
     console.log('[Agents Route] Formatting response');
     const isElevated = req.user && ['SUPER_ADMIN', 'ADMIN'].includes(req.user.role);
@@ -163,17 +169,21 @@ router.get('/dashboard-metrics', async (req, res) => {
       if (redis.status === 'ready') {
         const fetchDashboardRedis = async () => {
           const dashboardKeys = await redis.keys('agent:*');
-          for (const key of dashboardKeys) {
-            const agentStr = await redis.get(key);
-            if (agentStr) {
-              const parsed = JSON.parse(agentStr);
-              dashboardOnlineAgents[parsed.agentId] = parsed.status;
+          if (dashboardKeys && dashboardKeys.length > 0) {
+            const values = await redis.mget(dashboardKeys);
+            for (const agentStr of values) {
+              if (agentStr) {
+                try {
+                  const parsed = JSON.parse(agentStr);
+                  if (parsed.agentId) dashboardOnlineAgents[parsed.agentId] = parsed.status;
+                } catch (_) {}
+              }
             }
           }
         };
         await Promise.race([
           fetchDashboardRedis(),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Redis timeout')), 2000))
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Redis timeout')), 200))
         ]);
       }
     } catch (e) {}

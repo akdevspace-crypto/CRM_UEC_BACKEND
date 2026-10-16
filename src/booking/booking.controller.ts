@@ -17,7 +17,7 @@ import { AppointmentStatus } from '@prisma/client';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-@Controller('appointments')
+@Controller(['api/v1/appointments', 'appointments'])
 export class BookingController {
   constructor(private readonly bookingService: BookingService) {}
 
@@ -54,11 +54,13 @@ export class BookingController {
 
   @Get('calendar')
   async getCalendar(
-    @Query('startDate') startDate: string,
-    @Query('endDate') endDate: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
   ) {
-    if (!startDate || !endDate) throw new BadRequestException('startDate and endDate are required');
-    return this.bookingService.getCalendar(startDate, endDate);
+    const now = new Date();
+    const start = startDate || new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const end = endDate || new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59).toISOString();
+    return this.bookingService.getCalendar(start, end);
   }
 
   @Post()
@@ -127,5 +129,21 @@ export class BookingController {
     @Body('status') status: AppointmentStatus,
   ) {
     return this.bookingService.updateStatus(id, status);
+  }
+}
+
+@Controller('calendar')
+export class CalendarController {
+  constructor(private readonly bookingService: BookingService) {}
+
+  @Get()
+  async getCalendar(
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+  ) {
+    const now = new Date();
+    const start = startDate || new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const end = endDate || new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59).toISOString();
+    return this.bookingService.getCalendar(start, end);
   }
 }
