@@ -1783,6 +1783,215 @@ app.get('/api/v1/automations', requireAuth, async (req, res) => {
   }
 });
 
+app.post('/api/v1/automations', requireAuth, async (req, res) => {
+  try {
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(req.user?.role);
+    if (!isElevated) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to create automation rules' });
+    }
+
+    const { name, description, triggerType, actionType, actionConfig, isActive } = req.body;
+    if (!name || !triggerType || !actionType) {
+      return res.status(400).json({ error: 'Missing required fields: name, triggerType, and actionType are mandatory' });
+    }
+
+    const created = await prisma.workflowAutomation.create({
+      data: {
+        name,
+        description: description || null,
+        triggerType,
+        actionType,
+        actionConfig: actionConfig || {},
+        isActive: isActive !== undefined ? Boolean(isActive) : true
+      }
+    });
+
+    res.status(201).json(created);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create automation rule' });
+  }
+});
+
+app.put('/api/v1/automations/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(req.user?.role);
+    if (!isElevated) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to update automation rules' });
+    }
+
+    const existing = await prisma.workflowAutomation.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ error: 'Automation rule not found' });
+    }
+
+    const { name, description, triggerType, actionType, actionConfig, isActive } = req.body;
+    const updated = await prisma.workflowAutomation.update({
+      where: { id },
+      data: {
+        name: name !== undefined ? name : undefined,
+        description: description !== undefined ? description : undefined,
+        triggerType: triggerType !== undefined ? triggerType : undefined,
+        actionType: actionType !== undefined ? actionType : undefined,
+        actionConfig: actionConfig !== undefined ? actionConfig : undefined,
+        isActive: isActive !== undefined ? Boolean(isActive) : undefined
+      }
+    });
+
+    res.json(updated);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update automation rule' });
+  }
+});
+
+app.patch('/api/v1/automations/:id/toggle', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(req.user?.role);
+    if (!isElevated) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to toggle automation rules' });
+    }
+
+    const existing = await prisma.workflowAutomation.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ error: 'Automation rule not found' });
+    }
+
+    const updated = await prisma.workflowAutomation.update({
+      where: { id },
+      data: { isActive: !existing.isActive }
+    });
+
+    res.json(updated);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to toggle automation rule' });
+  }
+});
+
+app.delete('/api/v1/automations/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(req.user?.role);
+    if (!isElevated) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to delete automation rules' });
+    }
+
+    const existing = await prisma.workflowAutomation.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ error: 'Automation rule not found' });
+    }
+
+    await prisma.workflowAutomation.delete({ where: { id } });
+    res.json({ success: true, message: 'Automation rule deleted successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete automation rule' });
+  }
+});
+
+// ==========================================
+// SETTINGS: DEPARTMENTS API (DEF-10)
+// ==========================================
+app.get('/api/v1/departments', requireAuth, async (req, res) => {
+  try {
+    const departments = await prisma.department.findMany({
+      include: {
+        agents: { select: { id: true, name: true, status: true } }
+      },
+      orderBy: { name: 'asc' }
+    });
+    res.json(departments);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch departments' });
+  }
+});
+
+app.post('/api/v1/departments', requireAuth, async (req, res) => {
+  try {
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(req.user?.role);
+    if (!isElevated) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to create departments' });
+    }
+
+    const { name, description } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'Department name is required' });
+    }
+
+    const existing = await prisma.department.findUnique({ where: { name: name.trim() } });
+    if (existing) {
+      return res.status(409).json({ error: 'Department with this name already exists' });
+    }
+
+    const created = await prisma.department.create({
+      data: {
+        name: name.trim(),
+        description: description ? String(description).trim() : null
+      }
+    });
+
+    res.status(201).json(created);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create department' });
+  }
+});
+
+app.put('/api/v1/departments/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(req.user?.role);
+    if (!isElevated) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to update departments' });
+    }
+
+    const existing = await prisma.department.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ error: 'Department not found' });
+    }
+
+    const { name, description } = req.body;
+    const updated = await prisma.department.update({
+      where: { id },
+      data: {
+        name: name ? String(name).trim() : undefined,
+        description: description !== undefined ? String(description).trim() : undefined
+      }
+    });
+
+    res.json(updated);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update department' });
+  }
+});
+
+app.delete('/api/v1/departments/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const isElevated = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(req.user?.role);
+    if (!isElevated) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to delete departments' });
+    }
+
+    const existing = await prisma.department.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ error: 'Department not found' });
+    }
+
+    await prisma.department.delete({ where: { id } });
+    res.json({ success: true, message: 'Department deleted successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete department' });
+  }
+});
+
+
 // ==========================================
 // TELEPHONY: CALL TRANSFER (SIP)
 // ==========================================
