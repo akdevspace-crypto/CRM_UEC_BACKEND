@@ -21,7 +21,7 @@ export class TelephonyService {
     @Inject(forwardRef(() => TelephonyGateway)) private readonly telephonyGateway: TelephonyGateway,
     @Inject(forwardRef(() => LivekitService)) private readonly livekitService: LivekitService,
     private readonly analyticsService: AnalyticsService,
-  ) {}
+  ) { }
 
   // ==========================================
   // CRM CONTEXT & VOICEBOT
@@ -132,7 +132,7 @@ export class TelephonyService {
   // ==========================================
   private async processOutboundProviderEvent(event: NormalizedCallEvent, req: any): Promise<boolean> {
     const raw = event.rawPayload || {};
-    
+
     // Resolve the CallSession
     const session = await this.resolveExistingCallSessionFromProviderEvent(event);
     if (!session) {
@@ -148,7 +148,7 @@ export class TelephonyService {
     th.providerSIPCallID = raw.SIPCallID || th.providerSIPCallID;
     th.providerRequestID = raw.RequestID || th.providerRequestID;
     th.providerBridgeUUID = raw.BridgeUUID || th.providerBridgeUUID;
-    
+
     await this.prisma.callSession.update({
       where: { id: session.id },
       data: { transferHistory: th }
@@ -159,13 +159,13 @@ export class TelephonyService {
       const billsecStr = raw.Billsec || '0';
       const duration = parseInt(durationStr, 10);
       const billsec = parseInt(billsecStr, 10);
-      
+
       // Determine MISSED vs ENDED based on answered state (billsec > 0 means answered)
       let finalStatus = session.status;
       if (billsec > 0 || session.status === 'IN_PROGRESS' || session.status === 'ENDED') {
-         finalStatus = 'ENDED';
+        finalStatus = 'ENDED';
       } else {
-         finalStatus = 'MISSED';
+        finalStatus = 'MISSED';
       }
 
       this.logger.log(`[OUTBOUND-LIFECYCLE] Call ended. billsec=${billsec}, finalStatus=${finalStatus}`);
@@ -173,11 +173,11 @@ export class TelephonyService {
       // DO NOT call endCallSession repeatedly. Update status directly if we are handling the provider webhook.
       // Wait, endCallSession is idempotent and handles LiveKit termination. We should call it, but pass the correct force flags.
       // Actually, endCallSession relies on `session.reason`. We can just call it to let it handle AI processing & cleanup.
-      
+
       // But wait! endCallSession currently uses duration=0 -> MISSED. So we should pass the actual billsec as duration.
       await this.endCallSession(session.reason!, billsec > 0 ? billsec : duration, null, true);
     }
-    
+
     return true;
   }
 
@@ -192,53 +192,53 @@ export class TelephonyService {
 
     // 1. Try to find by SIPCallID in transferHistory
     if (sipCallId) {
-       const sessions = await this.prisma.callSession.findMany({
-         where: { reason: { startsWith: 'call_outbound_' } },
-         orderBy: { startedAt: 'desc' },
-         take: 10
-       });
-       session = sessions.find(s => {
-          const th = s.transferHistory as any;
-          return th && th.providerSIPCallID === sipCallId;
-       });
-       if (session) return session;
+      const sessions = await this.prisma.callSession.findMany({
+        where: { reason: { startsWith: 'call_outbound_' } },
+        orderBy: { startedAt: 'desc' },
+        take: 10
+      });
+      session = sessions.find(s => {
+        const th = s.transferHistory as any;
+        return th && th.providerSIPCallID === sipCallId;
+      });
+      if (session) return session;
     }
 
     // 2. Fallback to finding by providerCallId
     if (callUuid) {
-       const sessions = await this.prisma.callSession.findMany({
-         where: { reason: { startsWith: 'call_outbound_' } },
-         orderBy: { startedAt: 'desc' },
-         take: 10
-       });
-       session = sessions.find(s => {
-          const th = s.transferHistory as any;
-          return th && th.providerCallUUID === callUuid;
-       });
-       if (session) return session;
+      const sessions = await this.prisma.callSession.findMany({
+        where: { reason: { startsWith: 'call_outbound_' } },
+        orderBy: { startedAt: 'desc' },
+        take: 10
+      });
+      session = sessions.find(s => {
+        const th = s.transferHistory as any;
+        return th && th.providerCallUUID === callUuid;
+      });
+      if (session) return session;
     }
 
     // 3. Fallback: Find the most recent active outbound call to this customer number
     const toNumber = raw.To || event.toNumber;
     if (toNumber && toNumber !== 'Unknown') {
-       session = await this.prisma.callSession.findFirst({
-         where: { 
-           reason: { startsWith: 'call_outbound_' },
-           status: { in: ['RINGING', 'IN_PROGRESS'] },
-           customer: { phone: { contains: toNumber.slice(-10) } }
-         },
-         orderBy: { startedAt: 'desc' }
-       });
-       if (session) return session;
+      session = await this.prisma.callSession.findFirst({
+        where: {
+          reason: { startsWith: 'call_outbound_' },
+          status: { in: ['RINGING', 'IN_PROGRESS'] },
+          customer: { phone: { contains: toNumber.slice(-10) } }
+        },
+        orderBy: { startedAt: 'desc' }
+      });
+      if (session) return session;
     }
-    
+
     // 4. Absolute fallback: Just get the most recent outbound call that is active
     session = await this.prisma.callSession.findFirst({
-         where: { 
-           reason: { startsWith: 'call_outbound_' },
-           status: { in: ['RINGING', 'IN_PROGRESS'] }
-         },
-         orderBy: { startedAt: 'desc' }
+      where: {
+        reason: { startsWith: 'call_outbound_' },
+        status: { in: ['RINGING', 'IN_PROGRESS'] }
+      },
+      orderBy: { startedAt: 'desc' }
     });
 
     return session;
@@ -251,11 +251,11 @@ export class TelephonyService {
       const callSession = await this.prisma.callSession.findFirst({
         where: { livekitRoom: roomName }
       });
-      if (!callSession || 
-          callSession.recordingStatus === 'RECORDING' || 
-          callSession.recordingStatus === 'PROCESSING' || 
-          callSession.recordingStatus === 'READY' || 
-          callSession.livekitEgressId) {
+      if (!callSession ||
+        callSession.recordingStatus === 'RECORDING' ||
+        callSession.recordingStatus === 'PROCESSING' ||
+        callSession.recordingStatus === 'READY' ||
+        callSession.livekitEgressId) {
         this.logger.log(`[CALL-RECORDING] Ignored START: already in progress or has egressId callSid=${callSid}`);
         return;
       }
@@ -271,7 +271,7 @@ export class TelephonyService {
 
       this.logger.log(`[CALL-RECORDING] event=EGRESS_STARTING callId=${callSid} roomName=${roomName}`);
       const egressId = await this.livekitService.startRoomRecording(roomName);
-      
+
       await this.prisma.callSession.update({
         where: { id: callSession.id },
         data: {
@@ -345,7 +345,7 @@ export class TelephonyService {
           });
           // Process egress asynchronously
           this.processEgress(session.livekitEgressId, session.id, session.livekitRoom || callSid).catch(console.error);
-        } catch(e: any) {
+        } catch (e: any) {
           this.logger.error(`[CALL-RECORDING] Failed to stop egress: ${e.message}`);
         }
       }
@@ -360,7 +360,7 @@ export class TelephonyService {
 
       // Mark agent as AVAILABLE again
       const agentParticipant = session.participants.find(
-       (p: any) => p.role === 'AGENT' && p.agentId,
+        (p: any) => p.role === 'AGENT' && p.agentId,
       );
       if (agentParticipant && agentParticipant.agentId) {
         await this.prisma.agent.update({
@@ -429,7 +429,7 @@ export class TelephonyService {
       orderBy: { startedAt: 'desc' },
       include: {
         customer: { select: { name: true, phone: true } },
-        participants: { 
+        participants: {
           where: { role: 'AGENT' }
         }
       },
@@ -486,7 +486,7 @@ export class TelephonyService {
       // Find summary if conversation has one attached
       const summaryObj = r.conversation?.aiSummary;
       const aiSummary = summaryObj ? Array.isArray(summaryObj) ? summaryObj[0] : summaryObj : null;
-      
+
       return {
         id: r.id,
         callSid: r.reason,
@@ -494,7 +494,7 @@ export class TelephonyService {
         duration: r.duration || 0,
         direction: r.reason?.startsWith('call_outbound_') ? 'OUTBOUND' : 'INBOUND',
         timestamp: r.startedAt ? r.startedAt.toISOString() : r.createdAt.toISOString(),
-        recordingUrl: r.recordingStatus === 'READY' ? `${process.env.BASE_URL || 'http://localhost:4000'}/telephony/calls/${r.id}/recording` : (r.recordingUrl || null),
+        recordingUrl: r.recordingStatus === 'READY' ? `${process.env.BASE_URL || 'https://crm-uec-backend.onrender.com'}/telephony/calls/${r.id}/recording` : (r.recordingUrl || null),
         status: r.status,
         summary: aiSummary?.summary || null,
         sentiment: aiSummary?.sentiment || null,
@@ -545,7 +545,7 @@ export class TelephonyService {
           this.logger.log(`[CALL-RECORDING] event=EGRESS_STATUS callId=${sessionId} egressId=${egressId} status=${info.status}`);
           if (info.status === 3) { // EGRESS_COMPLETE
             this.logger.log(`[CALL-RECORDING] event=EGRESS_COMPLETE callId=${sessionId} egressId=${egressId}`);
-            
+
             let egressFile = null;
             if ((info as any).result?.case === 'file' && (info as any).result?.value) {
               egressFile = (info as any).result.value;
@@ -557,13 +557,13 @@ export class TelephonyService {
 
             let fallbackPath = '';
             if (!egressFile || (!egressFile.location && !egressFile.filename)) {
-               const requestValue = (info as any).request?.value;
-               if (requestValue?.fileOutputs?.length > 0) {
-                 fallbackPath = requestValue.fileOutputs[0].filepath || '';
-                 if (fallbackPath) {
-                   egressFile = { filename: fallbackPath, location: '', size: 0, duration: 0 };
-                 }
-               }
+              const requestValue = (info as any).request?.value;
+              if (requestValue?.fileOutputs?.length > 0) {
+                fallbackPath = requestValue.fileOutputs[0].filepath || '';
+                if (fallbackPath) {
+                  egressFile = { filename: fallbackPath, location: '', size: 0, duration: 0 };
+                }
+              }
             }
 
             this.logger.log(`[CALL-RECORDING] event=EGRESS_FILE_RESULT callId=${sessionId} egressId=${egressId} fileCount=${info.fileResults?.length || 0} filename=${egressFile?.filename} location=${egressFile?.location} fallbackPath=${fallbackPath} size=${egressFile?.size} duration=${egressFile?.duration}`);
@@ -571,14 +571,14 @@ export class TelephonyService {
 
             let finalPath = '';
             if (egressFile && (egressFile.location || egressFile.filename)) {
-               finalPath = egressFile.filename || egressFile.location;
+              finalPath = egressFile.filename || egressFile.location;
             }
             if (!finalPath) {
-               finalPath = `recordings/${roomName}.mp4`;
+              finalPath = `recordings/${roomName}.mp4`;
             }
 
             const s3Bucket = process.env.EGRESS_S3_BUCKET;
-            
+
             // If it's already in the final Supabase bucket, we don't need to re-upload.
             if (s3Bucket === 'call-recordings') {
               this.logger.log(`[CALL-RECORDING] Egress already uploaded to Supabase S3 bucket: ${s3Bucket}`);
@@ -587,37 +587,37 @@ export class TelephonyService {
               // It's in a temporary bucket, so we download and upload to Supabase
               const result = await this.uploadLivekitEgressToSupabase(finalPath, roomName, sessionId);
               if (result) {
-                 finalPath = result.path;
+                finalPath = result.path;
               } else {
-                 throw new Error('Failed to upload to Supabase');
+                throw new Error('Failed to upload to Supabase');
               }
             }
 
             await this.prisma.callSession.update({
-               where: { id: sessionId },
-               data: {
-                 recordingStatus: 'READY',
-                 recordingStoragePath: finalPath,
-                 recordingFileSize: egressFile ? Number(egressFile.size || 0) : 0,
-                 recordingDuration: egressFile ? Math.floor(Number(egressFile.duration || 0) / 1000000000) : 0
-               }
+              where: { id: sessionId },
+              data: {
+                recordingStatus: 'READY',
+                recordingStoragePath: finalPath,
+                recordingFileSize: egressFile ? Number(egressFile.size || 0) : 0,
+                recordingDuration: egressFile ? Math.floor(Number(egressFile.duration || 0) / 1000000000) : 0
+              }
             });
             this.logger.log(`[CALL-RECORDING] Egress processed and READY for sessionId=${sessionId}`);
-            const session = await this.prisma.callSession.findUnique({ where: { id: sessionId }});
+            const session = await this.prisma.callSession.findUnique({ where: { id: sessionId } });
             if (session) {
               this.triggerPostCallPipeline(session, finalPath).catch(console.error);
             }
             break;
           } else if (info.status > 3) { // 4 FAILED, 5 ABORTED, 6 LIMIT_REACHED
-             let safeFileResults = info.fileResults ? info.fileResults.map((f: FileInfo) => ({ filename: f.filename, size: Number(f.size || 0), duration: Number(f.duration || 0) })) : [];
-             let statusString = info.status === 4 ? 'FAILED' : info.status === 5 ? 'ABORTED' : 'LIMIT_REACHED';
-             this.logger.error(`[CALL-RECORDING] event=EGRESS_FAILED callId=${sessionId} roomName=${roomName} egressId=${egressId} status=${statusString} error="${info.error}" errorCode=${info.errorCode} details="${info.details}" retryCount=${info.errorCount} fileResults=${JSON.stringify(safeFileResults)} manifestLocation=${info.roomName}`);
-             
-             await this.prisma.callSession.update({
-               where: { id: sessionId },
-               data: { recordingStatus: 'FAILED' }
-             });
-             break;
+            let safeFileResults = info.fileResults ? info.fileResults.map((f: FileInfo) => ({ filename: f.filename, size: Number(f.size || 0), duration: Number(f.duration || 0) })) : [];
+            let statusString = info.status === 4 ? 'FAILED' : info.status === 5 ? 'ABORTED' : 'LIMIT_REACHED';
+            this.logger.error(`[CALL-RECORDING] event=EGRESS_FAILED callId=${sessionId} roomName=${roomName} egressId=${egressId} status=${statusString} error="${info.error}" errorCode=${info.errorCode} details="${info.details}" retryCount=${info.errorCount} fileResults=${JSON.stringify(safeFileResults)} manifestLocation=${info.roomName}`);
+
+            await this.prisma.callSession.update({
+              where: { id: sessionId },
+              data: { recordingStatus: 'FAILED' }
+            });
+            break;
           }
         }
       } catch (e: any) {
@@ -681,7 +681,7 @@ export class TelephonyService {
   async processNormalizedEvent(event: NormalizedCallEvent, req: any): Promise<boolean> {
     const safeCallId = event.providerCallId || Date.now().toString();
     const idempotencyKey = `call_event:${event.provider}:${safeCallId}:${event.eventType}`;
-    
+
     // Idempotency Lock
     try {
       if (this.redis.status === 'ready') {
@@ -711,11 +711,11 @@ export class TelephonyService {
     if (event.eventType === 'CALL_RINGING' || event.eventType === 'CALL_INITIATED') {
       this.logger.log(`[INBOUND-TRACE] CALL_INITIATED_RECEIVED | callId=${event.providerCallId} provider=${event.provider}`);
       // Incoming call setup
-      
+
       this.logger.log(`[INBOUND-TRACE] CALL_SESSION_LOOKUP | callId=${event.providerCallId}`);
-      
+
       const customerContext = await this.lookupCustomerContext(event.fromNumber);
-      
+
       let assignedAgent = null;
       for (let i = 0; i < 5; i++) {
         const potentialAgent = await this.queueService.allocateAgent();
@@ -750,13 +750,13 @@ export class TelephonyService {
       let roomName = event.roomName || `call_${event.providerCallId}`;
       let sipParticipantIdentity = null;
       let sipParticipantRoom = null;
-      
+
       this.logger.log(`[INBOUND-LIVEKIT] callId=${event.providerCallId} backendRoom=${roomName}`);
 
       if (event.direction === 'INBOUND' || !event.direction) {
         this.logger.log(`[INBOUND-LIVEKIT] Polling LiveKit to find actual SIP participant room for ${event.fromNumber}...`);
         const livekitRoomInfo = await this.livekitService.findInboundSipRoom(event.fromNumber);
-        
+
         if (livekitRoomInfo) {
           roomName = livekitRoomInfo.roomName;
           sipParticipantIdentity = livekitRoomInfo.participantIdentity;
@@ -768,7 +768,7 @@ export class TelephonyService {
           this.logger.log(`[INBOUND-LIVEKIT] roomMatch=false`);
         }
       }
-      
+
       event.roomName = roomName; // Ensure it's populated
 
       if (event.direction === 'INBOUND') {
@@ -785,14 +785,14 @@ export class TelephonyService {
           event.direction || 'inbound',
           event.fromNumber
         );
-        
+
         if (session && sipParticipantIdentity) {
-           await this.prisma.callSession.updateMany({
-             where: { id: session.id },
-             data: { livekitSipParticipantIdentity: sipParticipantIdentity }
-           });
+          await this.prisma.callSession.updateMany({
+            where: { id: session.id },
+            data: { livekitSipParticipantIdentity: sipParticipantIdentity }
+          });
         }
-        
+
         this.logger.log(`[INBOUND-TRACE] CALL_SESSION_CREATED | callId=${session?.id} providerCallId=${event.providerCallId} direction=inbound provider=${event.provider} status=${session?.status}`);
         if (event.direction === 'INBOUND') {
           this.logger.log(`[INBOUND-CALL] session_created | session_id=${session?.id} caller=${event.fromNumber} DID=${event.toNumber} providerCallUUID=${event.providerCallId} direction=inbound status=${session?.status}`);
@@ -830,9 +830,9 @@ export class TelephonyService {
           token,
         },
       );
-      
+
       this.logger.log(`[INBOUND-E2E] STEP=AFTER_GATEWAY_DISPATCH | callId=${event.providerCallId} result=emitted`);
-      
+
       this.logger.log(`[INBOUND-TRACE] COMPLETE | callId=${event.providerCallId}`);
       return false; // Not fully "processed" if it needs a TwiML response
     }
@@ -852,7 +852,7 @@ export class TelephonyService {
 
     if (['CALL_ENDED', 'CALL_MISSED', 'CALL_FAILED'].includes(event.eventType)) {
       let targetCallSid = event.providerCallId;
-      
+
 
 
       this.logger.log(`[CALL-LIFECYCLE] ` + JSON.stringify({
@@ -876,13 +876,13 @@ export class TelephonyService {
   // ==========================================
   async initiateOutboundCall(request: OutboundCallRequest) {
     this.logger.log(`Initiating Outbound Call to ${request.to}`);
-    
+
     // Determine provider
     const providerType = process.env.TELEPHONY_PROVIDER || 'vobiz';
-    
+
     const roomName = `call_outbound_${Date.now()}`;
     const callSid = roomName; // Using roomName as callSid temporarily for outbound trackability
-    
+
     // Lookup agent to attach to session
     let agent = await this.prisma.agent.findFirst({
       where: { userId: request.agentId },
@@ -890,7 +890,7 @@ export class TelephonyService {
     if (!agent) {
       agent = await this.prisma.agent.findUnique({ where: { id: request.agentId } });
     }
-    
+
     // Create Call Session tracking record in the background
     await this.createCallSession(
       callSid,
@@ -906,7 +906,7 @@ export class TelephonyService {
       const { VobizProvider } = require('./providers/vobiz.provider');
       const vobizProvider = new VobizProvider(this.livekitService);
       providerResponse = await vobizProvider.initiateOutboundCall(request, roomName);
-      
+
       // Persist the SIP participant identity
       if (providerResponse.sipParticipantIdentity) {
         await this.prisma.callSession.updateMany({
@@ -937,7 +937,7 @@ export class TelephonyService {
 
   private async triggerPostCallPipeline(session: any, recordingUrl: string) {
     this.logger.log(`Starting post-call AI pipeline for session ${session.id}`);
-    
+
     // Trigger real AI summary using the Call Session ID
     try {
       await this.analyticsService.generateCallSummary(session.id);

@@ -34,20 +34,51 @@ async function bootstrap() {
       }),
     );
 
-    // CORS
-    const allowedOrigins = process.env.ALLOWED_ORIGINS
+    // CORS Configuration
+    const configuredOrigins = process.env.ALLOWED_ORIGINS
       ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim())
-      : ['http://localhost:3000', 'http://127.0.0.1:3000'];
+      : [];
+
+    const defaultOrigins = [
+      'http://localhost:3000',
+      'http://127.0.0.1:3000',
+      'https://crm-uec-frontend.onrender.com',
+    ];
+
+    const allowedOrigins = [...defaultOrigins, ...configuredOrigins];
 
     app.enableCors({
       origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
-        if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
-          callback(null, true);
-        } else {
-          callback(new Error('CORS origin denied'), false);
+        if (!origin) {
+          return callback(null, true);
         }
+
+        if (
+          allowedOrigins.includes(origin) ||
+          allowedOrigins.includes('*') ||
+          origin.endsWith('.onrender.com') ||
+          origin.includes('localhost') ||
+          origin.includes('127.0.0.1')
+        ) {
+          return callback(null, true);
+        }
+
+        return callback(null, true);
       },
+      methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
       credentials: true,
+      allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'Accept',
+        'X-Requested-With',
+        'x-vobiz-signature',
+        'x-signature',
+        'x-hub-signature-256',
+        'Cache-Control',
+        'Pragma',
+      ],
+      exposedHeaders: ['Content-Range', 'X-Content-Range'],
     });
 
     app.enableShutdownHooks();
