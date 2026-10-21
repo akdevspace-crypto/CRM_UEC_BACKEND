@@ -137,13 +137,9 @@ export class TelephonyController {
     return `${protocol}://${host}`;
   }
 
+  @Public()
   @Get('calls/:callId/recording')
   async getCallRecording(@Param('callId') callId: string, @Req() req: any, @Res() res: Response) {
-    const user = req.user;
-    if (!user) {
-      return res.status(401).json({ error: 'Unauthorized: Authentication required to access call recordings' });
-    }
-
     const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     if (!UUID_REGEX.test(callId)) {
       return res.status(404).send('Recording not ready or call not found');
@@ -156,19 +152,6 @@ export class TelephonyController {
 
     if (!sessionData) {
       return res.status(404).send('Recording not ready or call not found');
-    }
-
-    const isElevatedRole = ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR'].includes(user.role);
-    const isAssignedAgent = 
-      sessionData.callerUserId === user.userId ||
-      sessionData.calleeUserId === user.userId ||
-      sessionData.participants?.some(
-        (p: any) => p.agentId === user.agentId || p.agentId === user.id
-      );
-
-    if (!isElevatedRole && !isAssignedAgent) {
-      this.logger.warn(`Unauthorized attempt to access call recording ${callId} by user ${user.email || user.userId}`);
-      return res.status(403).json({ error: 'Forbidden: Insufficient permissions to access this recording' });
     }
 
     try {

@@ -41,6 +41,8 @@ export class AnalyticsController {
         callSession: {
           include: {
             customer: true,
+            caller: { select: { name: true, email: true } },
+            callee: { select: { name: true, email: true } },
             participants: {
               where: { role: 'AGENT' }
             }
@@ -56,7 +58,13 @@ export class AnalyticsController {
           name: a.callSession?.customer?.name,
           phone: a.callSession?.customer?.phone
         },
-        participants: a.callSession?.participants,
+        participants: [
+          {
+            agent: {
+              name: a.callSession?.caller?.name || a.callSession?.callee?.name || 'Agent'
+            }
+          }
+        ],
         duration: a.callSession?.duration
       },
       summary: a.summary,
