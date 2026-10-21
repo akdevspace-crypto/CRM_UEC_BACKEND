@@ -736,6 +736,7 @@ model Lead {
   conversionLogs    LeadConversionLog[]
   notifications     LeadNotification[]
   appointments      Appointment[]
+  submissions       WebsiteLeadSubmission[]
 
   @@index([status])
   @@index([assignedAgentId])
@@ -804,4 +805,26 @@ model LeadNotification {
   
   createdAt   DateTime @default(now())
   sentAt      DateTime?
+}
+
+// ==========================================
+// WEBSITE INTEGRATION & IDEMPOTENCY
+// ==========================================
+
+model WebsiteLeadSubmission {
+  id                    String      @id @default(uuid()) @db.Uuid
+  sourceId              String
+  externalSubmissionId  String
+  leadId                String      @db.Uuid
+  lead                  Lead        @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  sourceSubmittedAt     DateTime?
+  payloadHash           String?
+  status                String      @default("PROCESSED")
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
+
+  @@unique([sourceId, externalSubmissionId])
+  @@index([sourceId])
+  @@index([externalSubmissionId])
+  @@index([leadId])
 }

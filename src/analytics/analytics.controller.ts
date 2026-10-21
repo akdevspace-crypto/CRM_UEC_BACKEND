@@ -210,21 +210,84 @@ export class AnalyticsController {
     const conversionRate = totalLeads > 0 ? ((convertedLeads / totalLeads) * 100).toFixed(1) : '0';
     const avgDurationFormatted = `${Math.floor(avgDurationSec / 60)}m ${avgDurationSec % 60}s`;
 
+    const [unreadMessages, assignedTickets, agentsListRaw, channelCounts, callSessions] = await Promise.all([
+      this.prisma.message.count({ where: { status: { in: ['SENT', 'DELIVERED'] } } }).catch(() => 0),
+      this.prisma.ticket.count({ where: { status: 'OPEN' } }).catch(() => 0),
+      this.prisma.agent.findMany({
+        take: 10,
+        select: {
+          id: true,
+          name: true,
+          department: true,
+          status: true,
+          _count: { select: { assignedTickets: true } }
+        }
+      }).catch(() => []),
+      this.prisma.conversation.groupBy({
+        by: ['channel'],
+        _count: { id: true }
+      }).catch(() => []),
+      this.prisma.callSession.findMany({
+        where: { startedAt: { not: null } },
+        select: { startedAt: true }
+      }).catch(() => [])
+    ]);
+
+    const agentsList = agentsListRaw.map((a: any, i: number) => ({
+      name: a.name || `Agent ${i + 1}`,
+      department: a.department || 'General',
+      calls: totalCalls > 0 ? Math.round(totalCalls / (agentsListRaw.length || 1)) : 0,
+      tickets: a._count?.assignedTickets || 0,
+      aht: avgDurationFormatted,
+      csat: '4.8',
+      sla: '96%',
+      status: a.status
+    }));
+
+    const channelDistribution = channelCounts.length > 0
+      ? channelCounts.map((c: any) => {
+          const ch = (c.channel || 'chat').toLowerCase();
+          return {
+            name: ch === 'whatsapp' ? 'WhatsApp' : ch === 'instagram' ? 'Instagram' : ch === 'email' ? 'Emails' : 'Voice Calls',
+            value: c._count.id,
+            color: ch === 'whatsapp' ? '#25D366' : ch === 'instagram' ? '#E1306C' : ch === 'email' ? '#3b82f6' : '#f97316'
+          };
+        })
+      : [
+          { name: 'WhatsApp', value: 0, color: '#25D366' },
+          { name: 'Instagram', value: 0, color: '#E1306C' },
+          { name: 'Voice Calls', value: totalCalls, color: '#f97316' },
+          { name: 'Emails', value: 0, color: '#3b82f6' }
+        ];
+
+    const hourCounts: { [hour: number]: number } = {};
+    for (let h = 0; h < 24; h++) hourCounts[h] = 0;
+    for (const cs of callSessions) {
+      if (cs.startedAt) {
+        const h = new Date(cs.startedAt).getHours();
+        hourCounts[h] = (hourCounts[h] || 0) + 1;
+      }
+    }
+    const callsPerHour = Array.from({ length: 24 }, (_, i) => ({
+      hour: `${String(i).padStart(2, '0')}:00`,
+      calls: hourCounts[i] || 0
+    }));
+
     let kpis = [];
     if (type === 'sales_lead') {
       kpis = [
-        { label: 'New Leads', value: String(activeLeads), change: '+12.4%', isPositive: true },
-        { label: 'Qualified Leads', value: String(positiveLeads), change: '+11.2%', isPositive: true },
-        { label: 'Won Deals', value: String(convertedLeads), change: '+9.4%', isPositive: true },
+        { label: 'New Leads', value: String(activeLeads), change: 'Live', isPositive: true },
+        { label: 'Qualified Leads', value: String(positiveLeads), change: 'Live', isPositive: true },
+        { label: 'Won Deals', value: String(convertedLeads), change: 'Live', isPositive: true },
         { label: 'Total Ingested', value: String(totalLeads), change: 'On Track', isPositive: true },
-        { label: 'Conversion Rate', value: `${conversionRate}%`, change: '+3.1%', isPositive: true },
-        { label: 'Forecasted Revenue', value: `$${(convertedLeads * 1250).toLocaleString()}`, change: 'On Track', isPositive: true },
+        { label: 'Conversion Rate', value: `${conversionRate}%`, change: null, isPositive: true },
+        { label: 'Won Deal Value', value: convertedLeads > 0 ? `$${(convertedLeads * 1250).toLocaleString()}` : '$0', change: null, isPositive: true },
       ];
     } else if (type === 'agent_performance') {
       kpis = [
-        { label: 'Total Calls Handled', value: String(totalCalls), change: '+12.4%', isPositive: true },
+        { label: 'Total Calls Handled', value: String(totalCalls), change: 'Live', isPositive: true },
         { label: 'Avg Talk Time', value: avgDurationFormatted, change: 'Optimal', isPositive: true },
-        { label: 'SLA Compliance', value: '96.2%', change: '+1.5%', isPositive: true },
+        { label: 'SLA Compliance', value: totalCalls > 0 ? '96.2%' : '100%', change: null, isPositive: true },
         { label: 'Available Agents', value: String(availableAgents), change: 'Optimal', isPositive: true },
       ];
     } else if (type === 'contact_center') {
@@ -235,18 +298,18 @@ export class AnalyticsController {
       ];
     } else {
       kpis = [
-        { label: 'Total Customers', value: String(totalCustomers), change: '+4.3%', isPositive: true },
-        { label: 'Active Leads Pool', value: String(activeLeads), change: '+12.4%', isPositive: true },
-        { label: 'Conversion Rate', value: `${conversionRate}%`, change: '+3.1%', isPositive: true },
-        { label: 'Pipeline Deals', value: String(totalLeads), change: '+14.2%', isPositive: true },
+        { label: 'Total Customers', value: String(totalCustomers), change: 'Live', isPositive: true },
+        { label: 'Active Leads Pool', value: String(activeLeads), change: 'Live', isPositive: true },
+        { label: 'Conversion Rate', value: `${conversionRate}%`, change: null, isPositive: true },
+        { label: 'Pipeline Deals', value: String(totalLeads), change: 'Live', isPositive: true },
       ];
     }
 
     const sourceShare = servicesCount.length > 0
       ? servicesCount.map((s: any) => ({ name: s.serviceInterest || 'General', value: s._count.id }))
       : [
-          { name: 'Direct Inbound', value: totalCalls || 1 },
-          { name: 'Website Forms', value: activeLeads || 1 },
+          { name: 'Direct Inbound', value: totalCalls },
+          { name: 'Website Forms', value: activeLeads },
         ];
 
     const salesFunnel = [
@@ -256,34 +319,55 @@ export class AnalyticsController {
       { stage: 'Converted', count: convertedLeads },
     ];
 
-    const pipelineTrend = [
-      { period: 'Week 1', count: Math.ceil(totalLeads * 0.2) },
-      { period: 'Week 2', count: Math.ceil(totalLeads * 0.3) },
-      { period: 'Week 3', count: Math.ceil(totalLeads * 0.25) },
-      { period: 'Week 4', count: Math.ceil(totalLeads * 0.25) },
-    ];
-
-    const revenueTrend = [
-      { month: 'Jan', revenue: Math.ceil(convertedLeads * 300) },
-      { month: 'Feb', revenue: Math.ceil(convertedLeads * 450) },
-      { month: 'Mar', revenue: Math.ceil(convertedLeads * 600) },
-      { month: 'Apr', revenue: Math.ceil(convertedLeads * 800) },
-    ];
+    const positiveSentimentPercent = positiveLeads > 0 ? Math.round((positiveLeads / (totalLeads || 1)) * 100) : 0;
+    const negativeSentimentPercent = 0;
+    const neutralSentimentPercent = Math.max(0, 100 - positiveSentimentPercent - negativeSentimentPercent);
 
     return {
+      totalCalls,
+      activeAgents: availableAgents,
+      openTickets: assignedTickets,
+      sentiment: {
+        positive: positiveSentimentPercent,
+        neutral: neutralSentimentPercent,
+        negative: negativeSentimentPercent
+      },
       kpis,
       charts: {
         sourceShare,
         salesFunnel,
-        pipelineTrend,
-        revenueTrend,
-        callsPerHour: [
-          { hour: '09:00', calls: Math.ceil(totalCalls * 0.15) },
-          { hour: '11:00', calls: Math.ceil(totalCalls * 0.30) },
-          { hour: '14:00', calls: Math.ceil(totalCalls * 0.25) },
-          { hour: '16:00', calls: Math.ceil(totalCalls * 0.20) },
-          { hour: '18:00', calls: Math.ceil(totalCalls * 0.10) },
-        ]
+        pipelineTrend: [
+          { period: 'Week 1', count: 0 },
+          { period: 'Week 2', count: 0 },
+          { period: 'Week 3', count: 0 },
+          { period: 'Week 4', count: totalLeads },
+        ],
+        revenueTrend: [
+          { month: 'Jan', revenue: 0 },
+          { month: 'Feb', revenue: 0 },
+          { month: 'Mar', revenue: 0 },
+          { month: 'Apr', revenue: convertedLeads > 0 ? convertedLeads * 1250 : 0 },
+        ],
+        callsPerHour,
+        omnichannelShare: channelDistribution,
+        agentLeaderboard: agentsList
+      },
+      metrics: {
+        activeCalls,
+        queueCalls: waitingQueue,
+        totalCalls,
+        totalCustomers,
+        totalLeads,
+        activeLeads,
+        convertedLeads,
+        avgDurationSec,
+        avgHandleTime: avgDurationFormatted,
+        slaMet: totalCalls > 0 ? '96%' : '100%',
+        unreadMessages,
+        assignedTickets,
+        agentLeaderboard: agentsList,
+        omnichannelShare: channelDistribution,
+        callsPerHour
       },
       liveStats: {
         activeCalls,
@@ -291,7 +375,9 @@ export class AnalyticsController {
         availableAgents,
         totalCustomers,
         totalLeads,
-        conversionRate
+        conversionRate,
+        unreadMessages,
+        assignedTickets
       }
     };
   }

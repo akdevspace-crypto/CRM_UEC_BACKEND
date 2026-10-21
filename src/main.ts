@@ -14,7 +14,7 @@ const legacyModule = require('./legacy/index.js');
 async function bootstrap() {
   console.log(`[ENV-AUDIT]\ncwd=${process.cwd()}\ngeminiKeyConfigured=${!!process.env.GEMINI_API_KEY}\ngeminiKeyLength=${process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.length : 0}`);
   try {
-    const app = await NestFactory.create(AppModule);
+    const app = await NestFactory.create(AppModule, { rawBody: true });
 
     // Enterprise Security Headers (DEF-17)
     app.use(
@@ -24,9 +24,15 @@ async function bootstrap() {
       }),
     );
 
-    // Middleware
+    // Middleware with exact raw body preservation for HMAC signature verification
     app.use(express.urlencoded({ extended: true }));
-    app.use(express.json());
+    app.use(
+      express.json({
+        verify: (req: any, _res, buf) => {
+          req.rawBody = buf;
+        },
+      }),
+    );
 
     // CORS
     const allowedOrigins = process.env.ALLOWED_ORIGINS

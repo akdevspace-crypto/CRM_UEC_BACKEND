@@ -15,6 +15,6 @@ import { AnalyticsModule } from '../analytics/analytics.module';
   imports: [PrismaModule, QueueOrchestrationModule, RedisModule, AnalyticsModule],
   controllers: [TelephonyController, VobizController],
   providers: [TelephonyService, LivekitService, TelephonyGateway, VobizProvider, ExotelProvider],
-  exports: [TelephonyService, LivekitService],
+  exports: [TelephonyService, LivekitService, TelephonyGateway],
 })
 export class TelephonyModule {}

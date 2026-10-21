@@ -36,9 +36,18 @@ function initCronJobs(io) {
           });
         }
 
-        // 2. Mock notify Customer via Webhook/Email
+        // 2. Notify Customer via Email
         if (followup.lead?.email) {
-          console.log(`[CRON] Sending Email Reminder to ${followup.lead.email} for Appointment at ${followup.followupDate}`);
+          try {
+            const { sendEmailReply } = require('./mailer');
+            await sendEmailReply(
+              followup.lead.email,
+              'Upcoming Follow-up Appointment Reminder',
+              `Hello ${followup.lead.customerName || 'Customer'}, this is a friendly reminder of your upcoming follow-up with our care team in 15 minutes.`
+            );
+          } catch (mErr) {
+            console.warn('[CRON] Mailer notification skipped:', mErr.message);
+          }
         }
         
         console.log(`[CRON] Reminded agent ${followup.assignedAgentId} about followup ${followup.id}`);

@@ -16,15 +16,39 @@ export class SessionLifecycleService {
     customerId: string,
     queueId?: string,
   ) {
-    // 1. Mock session object to bypass Prisma relation mismatches on this unused endpoint
-    const session = { id: 'mock-session-id' };
+    // 1. Resolve authentic user and customer records to satisfy relations
+    let validUserId: string | null = null;
+    if (agentId) {
+      const user = await this.prisma.user.findFirst({
+        where: { OR: [{ id: agentId }, { agentProfile: { id: agentId } }] }
+      }).catch(() => null);
+      if (user) validUserId = user.id;
+    }
+
+    let validCustomerId: string | null = null;
+    if (customerId) {
+      const customer = await this.prisma.customer.findUnique({
+        where: { id: customerId }
+      }).catch(() => null);
+      if (customer) validCustomerId = customer.id;
+    }
+
+    const session = await this.prisma.callSession.create({
+      data: {
+        calleeUserId: validUserId,
+        customerId: validCustomerId,
+        status: 'RINGING',
+        startedAt: new Date(),
+        reason: queueId ? `Queue:${queueId}` : undefined,
+      }
+    });
 
     // 2. Cache active session in Redis for fast failover recovery
     await this.redis.set(
       `active_session:${agentId}`,
       JSON.stringify({
         sessionId: session.id,
-        customerId,
+        customerId: validCustomerId || customerId,
         timestamp: Date.now(),
       }),
       'EX',
@@ -46,7 +70,20 @@ export class SessionLifecycleService {
   }
 
   async endCallSession(agentId: string, sessionId: string) {
-    // Mock database update and clear redis session cache
+    // 1. Update authentic database session
+    if (sessionId) {
+      await this.prisma.callSession.updateMany({
+        where: { id: sessionId },
+        data: {
+          status: 'ENDED',
+          endedAt: new Date(),
+        }
+      }).catch((err) => {
+        this.logger.warn(`Failed to update CallSession in DB: ${err.message}`);
+      });
+    }
+
+    // 2. Clear Redis session cache
     await this.redis.del(`active_session:${agentId}`);
     this.logger.log(`Session ended: ${sessionId}`);
   }

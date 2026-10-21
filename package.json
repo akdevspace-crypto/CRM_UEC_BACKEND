@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "src/index.js",
   "scripts": {
-    "build": "npx @nestjs/cli build",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/src/main.js",
     "dev": "npx @nestjs/cli start --watch"
   },

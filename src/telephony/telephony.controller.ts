@@ -120,11 +120,13 @@ export class TelephonyController {
   @Public()
   @Get('health')
   async getHealth() {
+    const livekitConfigured = !!(process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET);
+    const vobizConfigured = !!(process.env.VOBIZ_AUTH_TOKEN || process.env.VOBIZ_WEBHOOK_SECRET);
     return {
       status: 'ok',
       provider: process.env.TELEPHONY_PROVIDER || 'vobiz',
-      livekit: 'connected',
-      vobiz: 'configured'
+      livekit: livekitConfigured ? 'connected' : 'missing_credentials',
+      vobiz: vobizConfigured ? 'configured' : 'missing_credentials'
     };
   }
 

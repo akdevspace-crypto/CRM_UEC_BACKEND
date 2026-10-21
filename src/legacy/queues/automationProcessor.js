@@ -2,6 +2,16 @@ const { Queue, Worker } = require('bullmq');
 const Redis = require('ioredis');
 const prisma = require('../prisma');
 
+let twilioClient = null;
+if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  try {
+    const twilio = require('twilio');
+    twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  } catch (e) {
+    console.warn('[Automation] Twilio client initialization failed:', e.message);
+  }
+}
+
 const redisOptions = {
   host: process.env.REDIS_HOST || '127.0.0.1',
   port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
@@ -37,9 +47,23 @@ const automationWorker = new Worker('automation-queue', async (job) => {
   try {
     switch(actionType) {
       case 'SEND_WHATSAPP':
-        // Execute Twilio WhatsApp API
-        console.log(`[Action] Sending WhatsApp to ${actionConfig.phone}: ${actionConfig.template}`);
-        log = 'WhatsApp message dispatched';
+        if (!twilioClient) {
+          throw new Error('Twilio credentials not configured for WhatsApp dispatch');
+        }
+        if (!actionConfig || !actionConfig.phone) {
+          throw new Error('Destination phone number required for WhatsApp dispatch');
+        }
+        {
+          const twilioFrom = process.env.TWILIO_WHATSAPP_NUMBER || 'whatsapp:+14155238886';
+          const formattedTo = actionConfig.phone.startsWith('whatsapp:') ? actionConfig.phone : `whatsapp:${actionConfig.phone}`;
+          const sent = await twilioClient.messages.create({
+            from: twilioFrom,
+            to: formattedTo,
+            body: actionConfig.template || actionConfig.message || 'Notification from Paramantra CRM'
+          });
+          log = `WhatsApp message dispatched: ${sent.sid}`;
+          console.log(`[Action] ${log}`);
+        }
         break;
         
       case 'CREATE_TICKET':

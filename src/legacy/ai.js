@@ -1,10 +1,35 @@
 const { GoogleGenAI } = require('@google/genai');
 require('dotenv').config();
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const getAiClient = () => {
+  if (!process.env.GEMINI_API_KEY) return null;
+  return new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+};
+
+const getModelName = () => process.env.GEMINI_MODEL || 'gemini-1.5-flash';
 
 async function generateCallSummary(transcript) {
+  if (!transcript || typeof transcript !== 'string' || !transcript.trim()) {
+    return {
+      success: false,
+      failed: true,
+      error: "Transcript is empty or missing",
+      summary: null
+    };
+  }
+
   try {
+    const ai = getAiClient();
+    if (!ai) {
+      console.warn("[AI] GEMINI_API_KEY is not configured. Skipping summary generation.");
+      return {
+        success: false,
+        failed: true,
+        error: "GEMINI_API_KEY is not configured",
+        summary: null
+      };
+    }
+
     const prompt = `
     Analyze the following customer service call transcript for an ElderCare CRM:
     
@@ -24,7 +49,7 @@ async function generateCallSummary(transcript) {
     `;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-pro',
+      model: getModelName(),
       contents: prompt,
       config: {
         responseMimeType: "application/json"
@@ -32,15 +57,17 @@ async function generateCallSummary(transcript) {
     });
 
     const result = JSON.parse(response.text);
-    return result;
-  } catch (error) {
-    console.error("AI Generation Error:", error);
     return {
-      summary: "Failed to generate summary.",
-      actionItems: "None",
-      sentiment: "NEUTRAL",
-      escalationRisk: "LOW",
-      recommendations: "Review call recording manually."
+      success: true,
+      ...result
+    };
+  } catch (error) {
+    console.error("AI Generation Error:", error.message);
+    return {
+      success: false,
+      failed: true,
+      error: error.message,
+      summary: null
     };
   }
 }
@@ -49,6 +76,17 @@ async function generateCallSummaryFromAudio(audioUrl, isOutbound) {
   try {
     if (!audioUrl) throw new Error("No audio URL provided");
     
+    const ai = getAiClient();
+    if (!ai) {
+      console.warn("[AI] GEMINI_API_KEY is not configured. Skipping audio summary generation.");
+      return {
+        success: false,
+        failed: true,
+        error: "GEMINI_API_KEY is not configured",
+        summary: null
+      };
+    }
+
     console.log(`[AI] Fetching audio from ${audioUrl} for processing...`);
     const audioRes = await fetch(audioUrl);
     if (!audioRes.ok) throw new Error(`Failed to fetch audio: ${audioRes.statusText}`);
@@ -73,7 +111,7 @@ async function generateCallSummaryFromAudio(audioUrl, isOutbound) {
     `;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-pro',
+      model: getModelName(),
       contents: [
         {
           inlineData: {
@@ -89,15 +127,17 @@ async function generateCallSummaryFromAudio(audioUrl, isOutbound) {
     });
 
     const result = JSON.parse(response.text);
-    return result;
-  } catch (error) {
-    console.error("AI Audio Processing Error:", error);
     return {
-      summary: "Failed to generate summary from audio. " + error.message,
-      actionItems: "None",
-      sentiment: "NEUTRAL",
-      escalationRisk: "LOW",
-      recommendations: "Review call recording manually."
+      success: true,
+      ...result
+    };
+  } catch (error) {
+    console.error("AI Audio Processing Error:", error.message);
+    return {
+      success: false,
+      failed: true,
+      error: error.message,
+      summary: null
     };
   }
 }

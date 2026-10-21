@@ -1,4 +1,4 @@
-import { Controller, Post, Req, Logger, Header, HttpCode, HttpStatus, UnauthorizedException, ForbiddenException } from '@nestjs/common';
+import { Controller, Post, Req, Logger, Header, HttpCode, HttpStatus, UnauthorizedException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import type { Request } from 'express';
 import { TelephonyService } from './telephony.service';
 import { VobizProvider } from './providers/vobiz.provider';
@@ -22,6 +22,11 @@ export class VobizController {
     this.logger.log(`Received incoming call webhook from Vobiz`);
     this.verifySignature(req);
     const payload = req.body;
+
+    const fromCaller = payload?.From || payload?.CallFrom;
+    if (!fromCaller) {
+      throw new BadRequestException('From caller number is required');
+    }
     
     // Normalize event using Vobiz Provider
     const event = this.vobizProvider.normalizeWebhookEvent(payload, req.method);
