@@ -107,7 +107,7 @@ export class LivekitService implements OnModuleInit {
     const secret = process.env.EGRESS_S3_SECRET;
     const region = process.env.EGRESS_S3_REGION;
     const bucket = process.env.EGRESS_S3_BUCKET;
-    const endpoint = process.env.EGRESS_S3_ENDPOINT;
+    const endpoint = process.env.EGRESS_S3_ENDPOINT || (process.env.SUPABASE_URL ? `${process.env.SUPABASE_URL}/storage/v1/s3` : undefined);
 
     if (!accessKey || !secret || !region || !bucket) {
       this.logger.error(`[CALL-RECORDING] Missing EGRESS_S3 credentials`);
@@ -219,8 +219,12 @@ export class LivekitService implements OnModuleInit {
     this.logger.log(`Creating SIP Participant in room ${roomName} via trunk ${sipTrunkId} to ${normalizedDestination}`);
     
     const participantIdentity = `sip_${normalizedDestination.replace('+', '')}_${Date.now()}`;
+    const callerId = process.env.VOBIZ_PHONE_NUMBER || '+918064267760';
     await this.sipClient.createSipParticipant(sipTrunkId, normalizedDestination, roomName, {
       participantIdentity,
+      fromNumber: callerId,
+      playDialtone: true,
+      playRingtone: true,
     });
     return participantIdentity;
   }

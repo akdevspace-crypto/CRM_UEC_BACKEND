@@ -249,7 +249,13 @@ export class TelephonyService {
       this.logger.log(`[CALL-RECORDING] provider=livekit_egress callId=${callSid} roomName=${roomName}`);
       this.logger.log(`[CALL-RECORDING] event=START_REQUEST callId=${callSid} roomName=${roomName}`);
       const callSession = await this.prisma.callSession.findFirst({
-        where: { livekitRoom: roomName }
+        where: {
+          OR: [
+            { livekitRoom: roomName },
+            { reason: callSid },
+            { id: callSid }
+          ]
+        }
       });
       if (!callSession ||
         callSession.recordingStatus === 'RECORDING' ||
@@ -260,12 +266,26 @@ export class TelephonyService {
         return;
       }
 
-      // Check participants
-      const participants = await this.livekitService.getRoomParticipants(roomName);
+      // Check participants with polling retry so we don't abort if the 2nd participant is still joining
+      let participants = await this.livekitService.getRoomParticipants(roomName);
       this.logger.log(`[CALL-RECORDING] event=ROOM_PARTICIPANTS callId=${callSid} roomName=${roomName} participantCount=${participants.length} participants=${participants.map(p => p.identity).join(',')}`);
 
       if (participants.length < 2) {
-        this.logger.log(`[CALL-RECORDING] Room has < 2 participants. Waiting to start recording.`);
+        this.logger.log(`[CALL-RECORDING] Room has < 2 participants. Polling up to 15s for 2nd participant...`);
+        for (let i = 0; i < 10; i++) {
+          await new Promise(r => setTimeout(r, 1500));
+          const current = await this.prisma.callSession.findUnique({ where: { id: callSession.id } });
+          if (!current || current.status === 'ENDED' || current.status === 'MISSED') {
+            this.logger.log(`[CALL-RECORDING] Call ended while waiting for participants. Aborting recording start.`);
+            return;
+          }
+          participants = await this.livekitService.getRoomParticipants(roomName);
+          if (participants.length >= 2) break;
+        }
+      }
+
+      if (participants.length < 2) {
+        this.logger.warn(`[CALL-RECORDING] Timed out waiting for 2nd participant in room ${roomName}.`);
         return;
       }
 
@@ -322,15 +342,23 @@ export class TelephonyService {
         return; // Wait for webhook
       }
 
-      const finalStatus = duration === 0 && session.status === 'RINGING' ? 'MISSED' : 'ENDED';
+      let finalDuration = duration;
+      if ((!finalDuration || finalDuration <= 0) && session.createdAt) {
+        const elapsed = Math.floor((Date.now() - new Date(session.createdAt).getTime()) / 1000);
+        if (elapsed > 0 && session.status !== 'RINGING') {
+          finalDuration = elapsed;
+        }
+      }
+
+      const finalStatus = finalDuration === 0 && session.status === 'RINGING' ? 'MISSED' : 'ENDED';
 
       await this.prisma.callSession.update({
         where: { id: session.id },
         data: {
           endedAt: new Date(),
-          duration: duration,
+          duration: finalDuration,
           status: finalStatus,
-          aiProcessingStatus: (finalStatus === 'ENDED' && duration > 0) ? 'RECORDING_PENDING' : 'COMPLETED',
+          aiProcessingStatus: (finalStatus === 'ENDED' && (finalDuration > 0 || session.recordingStatus === 'RECORDING')) ? 'RECORDING_PENDING' : 'COMPLETED',
         },
       });
 
@@ -925,6 +953,13 @@ export class TelephonyService {
       roomName,
       agent?.name || 'Agent',
     );
+
+    // Auto-poll to start recording in background when participants connect
+    setTimeout(() => {
+      this.startLivekitRecording(callSid, roomName).catch(err => {
+        this.logger.warn(`[CALL-RECORDING] Auto-start recording background error: ${err.message}`);
+      });
+    }, 2000);
 
     return {
       success: true,
