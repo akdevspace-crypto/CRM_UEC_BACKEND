@@ -247,13 +247,13 @@ export class TelephonyService {
   async startLivekitRecording(callSid: string, roomName: string) {
     try {
       this.logger.log(`[CALL-RECORDING] provider=livekit_egress callId=${callSid} roomName=${roomName}`);
-      this.logger.log(`[CALL-RECORDING] event=START_REQUEST callId=${callSid} roomName=${roomName}`);
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(callSid);
       const callSession = await this.prisma.callSession.findFirst({
         where: {
           OR: [
             { livekitRoom: roomName },
             { reason: callSid },
-            { id: callSid }
+            ...(isUuid ? [{ id: callSid }] : [])
           ]
         }
       });
@@ -362,17 +362,19 @@ export class TelephonyService {
         },
       });
 
-      if (session.livekitEgressId && session.recordingStatus === 'RECORDING') {
+      const latestSession = await this.prisma.callSession.findUnique({ where: { id: session.id } }) || session;
+
+      if (latestSession.livekitEgressId && (latestSession.recordingStatus === 'RECORDING' || latestSession.recordingStatus === 'PENDING')) {
         try {
-          this.logger.log(`[CALL-RECORDING] event=EGRESS_STOP_REQUEST callId=${session.id} roomName=${session.livekitRoom} egressId=${session.livekitEgressId}`);
-          await this.livekitService.stopRoomRecording(session.livekitEgressId);
-          this.logger.log(`[CALL-RECORDING] event=EGRESS_STOPPED callId=${session.id} egressId=${session.livekitEgressId}`);
+          this.logger.log(`[CALL-RECORDING] event=EGRESS_STOP_REQUEST callId=${latestSession.id} roomName=${latestSession.livekitRoom} egressId=${latestSession.livekitEgressId}`);
+          await this.livekitService.stopRoomRecording(latestSession.livekitEgressId);
+          this.logger.log(`[CALL-RECORDING] event=EGRESS_STOPPED callId=${latestSession.id} egressId=${latestSession.livekitEgressId}`);
           await this.prisma.callSession.update({
-            where: { id: session.id },
+            where: { id: latestSession.id },
             data: { recordingStatus: 'PROCESSING', recordingCompletedAt: new Date() }
           });
           // Process egress asynchronously
-          this.processEgress(session.livekitEgressId, session.id, session.livekitRoom || callSid).catch(console.error);
+          this.processEgress(latestSession.livekitEgressId, latestSession.id, latestSession.livekitRoom || callSid).catch(console.error);
         } catch (e: any) {
           this.logger.error(`[CALL-RECORDING] Failed to stop egress: ${e.message}`);
         }
