@@ -41,8 +41,18 @@ export class AnalyticsController {
         callSession: {
           include: {
             customer: true,
-            caller: { select: { name: true, email: true } },
-            callee: { select: { name: true, email: true } },
+            caller: {
+              select: {
+                email: true,
+                agentProfile: { select: { name: true } }
+              }
+            },
+            callee: {
+              select: {
+                email: true,
+                agentProfile: { select: { name: true } }
+              }
+            },
             participants: {
               where: { role: 'AGENT' }
             }
@@ -61,7 +71,7 @@ export class AnalyticsController {
         participants: [
           {
             agent: {
-              name: a.callSession?.caller?.name || a.callSession?.callee?.name || 'Agent'
+              name: a.callSession?.caller?.agentProfile?.name || a.callSession?.callee?.agentProfile?.name || 'Agent'
             }
           }
         ],
