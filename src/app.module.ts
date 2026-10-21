@@ -22,6 +22,7 @@ import { BookingModule } from './booking/booking.module';
 import { AuthModule } from './auth/auth.module';
 import { ApprovalsModule } from './approvals/approvals.module';
 import { WebsiteLeadsModule } from './webhooks/leads/website-leads.module';
+import { SuperAdminModule } from './super-admin/super-admin.module';
 
 const getRedisConnectionOptions = () => {
   const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
@@ -69,6 +70,7 @@ const getRedisConnectionOptions = () => {
     AuthModule,
     ApprovalsModule,
     WebsiteLeadsModule,
+    SuperAdminModule,
   ],
   controllers: [AppController],
   providers: [

@@ -122,6 +122,7 @@ model User {
   supervisorLogs SupervisorLog[]
   uploadedLeads Lead[] @relation("UploadedLeads")
   leadUploads   LeadUploadHistory[] @relation("LeadUploads")
+  unitMemberships UnitMembership[]
 }
 
 model Agent {
@@ -625,7 +626,35 @@ model CallAnalytics {
   silenceRatio   Float?
   talkRatio      Float?
   summary        String?
+  aiHandling     Boolean?
+  callOutcome    String?
+  duration       Int?
+  language       String?
+  sentiment      String?
+  transcript     String?
+  transferStatus String?
   createdAt      DateTime    @default(now())
+}
+
+model AiSettings {
+  id                         String    @id
+  aiEnabled                  Boolean
+  defaultLanguage            String
+  supportedLanguages         String[]
+  tanglishEnabled            Boolean
+  voice                      String
+  greeting                   String
+  businessName               String
+  businessHours              String
+  humanTransferEnabled       Boolean
+  maxCallDurationSeconds     Int
+  afterHoursBehavior         String
+  emergencyEscalation        Boolean
+  appointmentBookingEnabled  Boolean
+  leadCreationEnabled        Boolean
+  recordingRetentionDays     Int
+  updatedAt                  DateTime  @updatedAt
+  updatedBy                  String?
 }
 
 // ==========================================
@@ -827,4 +856,82 @@ model WebsiteLeadSubmission {
   @@index([sourceId])
   @@index([externalSubmissionId])
   @@index([leadId])
+}
+
+// ==========================================
+// HYBRID MULTI-UNIT & PLATFORM GOVERNANCE
+// ==========================================
+
+model BusinessUnit {
+  id              String      @id @default(uuid()) @db.Uuid
+  code            String      @unique // e.g. 'UEC', 'UNCF', 'HOME_CARE'
+  name            String
+  description     String?
+  status          String      @default("ACTIVE") // ACTIVE, DISABLED, ARCHIVED
+  isolationMode   String      @default("SHARED") // SHARED, ISOLATED
+  enabledProducts String[]    @default(["CRM"])  // CRM, ERP
+  enabledModules  String[]    @default(["TELEPHONY", "OMNICHANNEL", "LEADS", "APPOINTMENTS", "ANALYTICS"])
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  memberships     UnitMembership[]
+  integrations    IntegrationConfiguration[]
+
+  @@index([status])
+  @@index([code])
+}
+
+model UnitMembership {
+  id          String       @id @default(uuid()) @db.Uuid
+  unitId      String       @db.Uuid
+  unit        BusinessUnit @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  userId      String       @db.Uuid
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roleInUnit  String       @default("MEMBER") // ADMIN, SUPERVISOR, MEMBER
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@unique([unitId, userId])
+  @@index([unitId])
+  @@index([userId])
+}
+
+model IntegrationConfiguration {
+  id              String        @id @default(uuid()) @db.Uuid
+  provider        String        // LIVEKIT, VOBIZ, WHATSAPP, INSTAGRAM, EMAIL, GEMINI, SUPABASE, TWILIO
+  unitId          String?       @db.Uuid
+  unit            BusinessUnit? @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  enabled         Boolean       @default(true)
+  settings        Json?         // Public/non-secret parameters
+  secretEncrypted String?       // Protected/encrypted or system-managed reference
+  secretLast4     String?       // Safe masked identifier e.g. "••••3b8b"
+  status          String        @default("NOT_CONFIGURED") // CONFIGURED, NOT_CONFIGURED, HEALTHY, FAILED
+  lastTestedAt    DateTime?
+  lastTestStatus  String?
+  lastTestError   String?
+  version         Int           @default(1)
+  updatedBy       String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([provider])
+  @@index([unitId])
+}
+
+model AdminAuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  actorId     String?
+  actorEmail  String
+  action      String
+  resource    String
+  resourceId  String?
+  outcome     String   @default("SUCCESS") // SUCCESS, FAILED, DENIED
+  details     Json?
+  ipAddress   String?
+  createdAt   DateTime @default(now())
+
+  @@index([actorEmail])
+  @@index([action])
+  @@index([resource])
+  @@index([createdAt])
 }
