@@ -42,8 +42,16 @@ export class AnalyticsService {
       return;
     }
 
-    const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash'; // Supported catalog models: gemini-1.5-flash, gemini-3.5-flash
-    this.logger.log(`[AI-AUDIT] event=MODEL_CONFIG provider=@google/genai model=${modelName} apiKeyConfigured=true authenticationMode=Developer_API_Key`);
+    const configuredModel = process.env.GEMINI_MODEL;
+    const candidateModels = Array.from(
+      new Set([configuredModel, 'gemini-3.8-flash', 'gemini-3.5-flash'].filter(Boolean)),
+    ) as string[];
+
+    this.logger.log(
+      `[AI-AUDIT] event=MODEL_CONFIG provider=@google/genai candidates=${candidateModels.join(
+        ',',
+      )} apiKeyConfigured=true authenticationMode=Developer_API_Key`,
+    );
 
     try {
       await this.prisma.callSession.update({
@@ -90,26 +98,69 @@ export class AnalyticsService {
       Respond ONLY with valid JSON.
       `;
 
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: [
-          {
-            inlineData: {
-              data: base64Audio,
-              mimeType: 'video/mp4'
+      let responseText: string | null = null;
+      let lastError: any = null;
+
+      for (const model of candidateModels) {
+        this.logger.log(`[AI-AUDIT] event=MODEL_ATTEMPT model=${model} callId=${sessionId}`);
+        let attempts = 0;
+        const maxAttempts = 3;
+
+        while (attempts < maxAttempts) {
+          attempts++;
+          try {
+            const response = await ai.models.generateContent({
+              model,
+              contents: [
+                {
+                  inlineData: {
+                    data: base64Audio,
+                    mimeType: 'video/mp4',
+                  },
+                },
+                prompt,
+              ],
+              config: {
+                responseMimeType: 'application/json',
+              },
+            });
+
+            if (response && response.text) {
+              responseText = response.text;
+              this.logger.log(
+                `[AI-AUDIT] event=MODEL_SUCCESS model=${model} attempts=${attempts} callId=${sessionId}`,
+              );
+              break;
             }
-          },
-          prompt
-        ],
-        config: {
-          responseMimeType: "application/json"
+          } catch (e: any) {
+            lastError = e;
+            const isTransient =
+              e.message?.includes('503') ||
+              e.message?.includes('429') ||
+              e.message?.includes('high demand') ||
+              e.message?.includes('UNAVAILABLE');
+            this.logger.warn(
+              `[AI-AUDIT] event=MODEL_RETRY model=${model} attempt=${attempts}/${maxAttempts} isTransient=${isTransient} error="${e.message}"`,
+            );
+            if (isTransient && attempts < maxAttempts) {
+              await new Promise((r) => setTimeout(r, attempts * 2000));
+            } else {
+              break;
+            }
+          }
         }
-      });
+
+        if (responseText) break;
+      }
+
+      if (!responseText) {
+        throw new Error(lastError?.message || 'Failed to generate summary with all candidate models');
+      }
 
       this.logger.log(`[AI-AUDIT] event=SUMMARY_COMPLETE callId=${sessionId}`);
       this.logger.log(`[AI-AUDIT] event=SENTIMENT_COMPLETE callId=${sessionId}`);
 
-      const result = JSON.parse(response.text || '{}');
+      const result = JSON.parse(responseText || '{}');
 
       let sentimentScoreNum = 5;
       if (result.sentiment === 'POSITIVE') sentimentScoreNum = 9;

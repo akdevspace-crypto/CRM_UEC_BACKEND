@@ -159,7 +159,35 @@ export class TelephonyController {
       if (!session) {
         return res.status(404).send('Recording not ready or call not found');
       }
-      return res.redirect(session);
+
+      // Stream recording directly to avoid cross-origin redirect and CORP issues
+      const fetchHeaders: Record<string, string> = {};
+      if (req.headers.range) {
+        fetchHeaders['Range'] = req.headers.range;
+      }
+
+      const audioRes = await fetch(session, { headers: fetchHeaders });
+      if (!audioRes.ok && audioRes.status !== 206) {
+        return res.redirect(session);
+      }
+
+      res.status(audioRes.status);
+      res.setHeader('Content-Type', 'audio/mp4');
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+
+      const contentRange = audioRes.headers.get('content-range');
+      if (contentRange) {
+        res.setHeader('Content-Range', contentRange);
+      }
+      const contentLength = audioRes.headers.get('content-length');
+      if (contentLength) {
+        res.setHeader('Content-Length', contentLength);
+      }
+
+      const buffer = Buffer.from(await audioRes.arrayBuffer());
+      return res.send(buffer);
     } catch (err: any) {
       this.logger.error(`Error resolving recording playback for ${callId}: ${err.message}`);
       return res.status(404).send('Recording not ready or call not found');

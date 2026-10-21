@@ -21,6 +21,7 @@ async function bootstrap() {
       helmet({
         contentSecurityPolicy: false, // Prevents breaking WebRTC/WebSocket client signaling in local/dev environments
         crossOriginEmbedderPolicy: false,
+        crossOriginResourcePolicy: { policy: 'cross-origin' },
       }),
     );
 

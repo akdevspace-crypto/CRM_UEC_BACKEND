@@ -1,15 +1,39 @@
 import { Controller, Get, Logger, Req } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { AnalyticsService } from './analytics.service';
 
 @Controller(['api/v1/analytics', 'api/v1/dashboard', 'dashboard'])
 export class AnalyticsController {
   private readonly logger = new Logger(AnalyticsController.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly analyticsService: AnalyticsService,
+  ) {}
 
   @Get('summaries')
   async getAiSummaries(@Req() req: any) {
     this.logger.log('Fetching AI Summaries...');
+
+    // Auto-heal: Check for recent calls where recording is READY but AI processing failed or is pending
+    try {
+      this.prisma.callSession.findMany({
+        where: {
+          recordingStatus: 'READY',
+          aiProcessingStatus: { in: ['FAILED', 'PENDING'] },
+        },
+        take: 3,
+        orderBy: { createdAt: 'desc' }
+      }).then((failedSessions) => {
+        for (const s of failedSessions) {
+          this.logger.log(`[AI-AUDIT] Triggering auto-heal for session ${s.id}`);
+          this.analyticsService.generateCallSummary(s.id).catch((e) => {
+            this.logger.warn(`Auto-heal summary failed for ${s.id}: ${e.message}`);
+          });
+        }
+      }).catch(() => {});
+    } catch (_) {}
+
     const user = req?.user;
     const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
 
