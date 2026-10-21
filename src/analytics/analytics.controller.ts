@@ -1,4 +1,4 @@
-import { Controller, Get, Logger, Req } from '@nestjs/common';
+import { Controller, Get, Post, Param, Logger, Req, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AnalyticsService } from './analytics.service';
 
@@ -14,25 +14,6 @@ export class AnalyticsController {
   @Get('summaries')
   async getAiSummaries(@Req() req: any) {
     this.logger.log('Fetching AI Summaries...');
-
-    // Auto-heal: Check for recent calls where recording is READY but AI processing failed or is pending
-    try {
-      this.prisma.callSession.findMany({
-        where: {
-          recordingStatus: 'READY',
-          aiProcessingStatus: { in: ['FAILED', 'PENDING'] },
-        },
-        take: 3,
-        orderBy: { createdAt: 'desc' }
-      }).then((failedSessions) => {
-        for (const s of failedSessions) {
-          this.logger.log(`[AI-AUDIT] Triggering auto-heal for session ${s.id}`);
-          this.analyticsService.generateCallSummary(s.id).catch((e) => {
-            this.logger.warn(`Auto-heal summary failed for ${s.id}: ${e.message}`);
-          });
-        }
-      }).catch(() => {});
-    } catch (_) {}
 
     const user = req?.user;
     const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
@@ -110,6 +91,37 @@ export class AnalyticsController {
       actionItems: [],
       followUpRecommendation: 'Review call details to determine next steps.'
     }));
+  }
+
+  @Post('calls/:callId/reprocess')
+  async reprocessCallSummary(@Param('callId') callId: string, @Req() req: any) {
+    const user = req?.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+
+    const session = await this.prisma.callSession.findUnique({
+      where: { id: callId },
+      include: { participants: true },
+    });
+
+    if (!session) {
+      throw new NotFoundException('Call session not found');
+    }
+
+    if (!isElevated) {
+      const isCaller = session.callerUserId === user?.userId || session.callerUserId === user?.id || session.callerUserId === user?.sub;
+      const isCallee = session.calleeUserId === user?.userId || session.calleeUserId === user?.id || session.calleeUserId === user?.sub;
+      const isParticipant = session.participants?.some(
+        (p: any) => p.agentId === user?.agentId || p.agentId === user?.userId || p.agentId === user?.id || p.agentId === user?.sub
+      );
+
+      if (!isCaller && !isCallee && !isParticipant) {
+        throw new ForbiddenException('Forbidden: You do not have permission to reprocess this call');
+      }
+    }
+
+    this.logger.log(`[AI-AUDIT] Explicit reprocess requested for callId=${callId} by user=${user?.userId || user?.sub}`);
+    const result = await this.analyticsService.generateCallSummary(callId);
+    return { success: true, result };
   }
 
   private static inFlightRawMetrics: Promise<any> | null = null;

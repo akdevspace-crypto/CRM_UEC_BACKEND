@@ -137,7 +137,6 @@ export class TelephonyController {
     return `${protocol}://${host}`;
   }
 
-  @Public()
   @Get('calls/:callId/recording')
   async getCallRecording(@Param('callId') callId: string, @Req() req: any, @Res() res: Response) {
     const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -154,13 +153,29 @@ export class TelephonyController {
       return res.status(404).send('Recording not ready or call not found');
     }
 
+    // Role and Resource-level Authorization (Phase 6)
+    const user = req.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+    if (!isElevated) {
+      const isCaller = sessionData.callerUserId === user?.userId || sessionData.callerUserId === user?.id || sessionData.callerUserId === user?.sub;
+      const isCallee = sessionData.calleeUserId === user?.userId || sessionData.calleeUserId === user?.id || sessionData.calleeUserId === user?.sub;
+      const isParticipant = sessionData.participants?.some(
+        (p: any) => p.agentId === user?.agentId || p.agentId === user?.userId || p.agentId === user?.id || p.agentId === user?.sub
+      );
+
+      if (!isCaller && !isCallee && !isParticipant) {
+        this.logger.warn(`[SECURITY] Unauthorized recording playback attempt for callId=${callId} by user=${user?.userId || user?.sub}`);
+        return res.status(403).json({ error: 'Forbidden: You do not have permission to access this call recording' });
+      }
+    }
+
     try {
       const session = await this.telephonyService.getCallSessionRecordingUrl(callId);
       if (!session) {
         return res.status(404).send('Recording not ready or call not found');
       }
 
-      // Stream recording directly to avoid cross-origin redirect and CORP issues
+      // Stream recording with byte-range forwarding and backpressure
       const fetchHeaders: Record<string, string> = {};
       if (req.headers.range) {
         fetchHeaders['Range'] = req.headers.range;
@@ -168,7 +183,8 @@ export class TelephonyController {
 
       const audioRes = await fetch(session, { headers: fetchHeaders });
       if (!audioRes.ok && audioRes.status !== 206) {
-        return res.redirect(session);
+        this.logger.error(`[CALL-RECORDING] Upstream storage fetch failed with status=${audioRes.status}`);
+        return res.status(502).json({ error: 'Failed to retrieve media from storage' });
       }
 
       res.status(audioRes.status);
@@ -186,11 +202,26 @@ export class TelephonyController {
         res.setHeader('Content-Length', contentLength);
       }
 
-      const buffer = Buffer.from(await audioRes.arrayBuffer());
-      return res.send(buffer);
+      // Handle HEAD requests gracefully
+      if (req.method === 'HEAD') {
+        return res.end();
+      }
+
+      // Pipe stream with backpressure and client disconnect handling
+      if (audioRes.body) {
+        const { Readable } = require('stream');
+        const stream = Readable.fromWeb(audioRes.body as any);
+        req.on('close', () => {
+          stream.destroy();
+        });
+        return stream.pipe(res);
+      } else {
+        const buffer = Buffer.from(await audioRes.arrayBuffer());
+        return res.send(buffer);
+      }
     } catch (err: any) {
       this.logger.error(`Error resolving recording playback for ${callId}: ${err.message}`);
-      return res.status(404).send('Recording not ready or call not found');
+      return res.status(500).send('Internal server error during recording playback');
     }
   }
 }

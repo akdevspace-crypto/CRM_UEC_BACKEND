@@ -38,17 +38,15 @@ export class AuthGuard implements CanActivate {
 
     const authHeader = request.headers['authorization'] || request.headers['Authorization'];
 
-    if (!authHeader) {
-      throw new UnauthorizedException('JWT Token missing');
-    }
-
     let token = authHeader;
     if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
       token = authHeader.substring(7).trim();
+    } else if (!token && request.query && typeof request.query.token === 'string') {
+      token = request.query.token.trim();
     }
 
     if (!token) {
-      throw new UnauthorizedException('JWT Token missing');
+      throw new UnauthorizedException('Authentication token missing');
     }
 
     if (this.redisClient) {

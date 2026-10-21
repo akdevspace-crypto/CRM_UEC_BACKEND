@@ -512,10 +512,31 @@ export class TelephonyService {
       },
     });
 
+    const jwt = require('jsonwebtoken');
+    const jwtSecret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
+    const baseUrl = process.env.BASE_URL || 'https://crm-uec-backend.onrender.com';
+
     return records.map(r => {
       // Find summary if conversation has one attached
       const summaryObj = r.conversation?.aiSummary;
       const aiSummary = summaryObj ? Array.isArray(summaryObj) ? summaryObj[0] : summaryObj : null;
+
+      let tokenQuery = '';
+      if (user && (user.userId || user.id || user.sub)) {
+        try {
+          const token = jwt.sign(
+            {
+              sub: user.userId || user.id || user.sub,
+              userId: user.userId || user.id || user.sub,
+              role: user.role,
+              callId: r.id
+            },
+            jwtSecret,
+            { expiresIn: '2h' }
+          );
+          tokenQuery = `?token=${token}`;
+        } catch (_) {}
+      }
 
       return {
         id: r.id,
@@ -524,7 +545,9 @@ export class TelephonyService {
         duration: r.duration || 0,
         direction: r.reason?.startsWith('call_outbound_') ? 'OUTBOUND' : 'INBOUND',
         timestamp: r.startedAt ? r.startedAt.toISOString() : r.createdAt.toISOString(),
-        recordingUrl: r.recordingStatus === 'READY' ? `${process.env.BASE_URL || 'https://crm-uec-backend.onrender.com'}/telephony/calls/${r.id}/recording` : (r.recordingUrl || null),
+        recordingUrl: r.recordingStatus === 'READY' ? `${baseUrl}/telephony/calls/${r.id}/recording${tokenQuery}` : (r.recordingUrl || null),
+        recordingStatus: r.recordingStatus || 'NOT_AVAILABLE',
+        aiProcessingStatus: r.aiProcessingStatus || 'PENDING',
         status: r.status,
         summary: aiSummary?.summary || null,
         sentiment: aiSummary?.sentiment || null,

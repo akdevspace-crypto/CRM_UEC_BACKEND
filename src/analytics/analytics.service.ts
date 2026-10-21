@@ -6,54 +6,83 @@ import { createClient } from '@supabase/supabase-js';
 @Injectable()
 export class AnalyticsService {
   private readonly logger = new Logger(AnalyticsService.name);
+  private readonly activeJobs = new Set<string>();
 
   constructor(private readonly prisma: PrismaService) {}
 
   async generateCallSummary(sessionId: string) {
-    this.logger.log(`[AI-AUDIT] event=PIPELINE_START callId=${sessionId}`);
-
-    const session = await this.prisma.callSession.findUnique({
-      where: { id: sessionId },
-    });
-
-    if (!session) {
-      this.logger.error(`[AI-AUDIT] event=PIPELINE_FAILED callId=${sessionId} error="Session not found"`);
-      return;
+    if (this.activeJobs.has(sessionId)) {
+      this.logger.warn(`[AI-AUDIT] event=CONCURRENT_JOB_IGNORED callId=${sessionId} reason="Session is already being processed"`);
+      return null;
     }
 
-    if (session.recordingStatus !== 'READY' || !session.recordingStoragePath) {
-      this.logger.error(`[AI-AUDIT] event=PIPELINE_FAILED callId=${sessionId} error="Recording not ready or path missing"`);
-      await this.prisma.callSession.update({
-        where: { id: sessionId },
-        data: { aiProcessingStatus: 'FAILED' }
-      }).catch(() => {});
-      return;
-    }
-
-    this.logger.log(`[AI-AUDIT] event=RECORDING_RESOLVED callId=${sessionId} storagePath=${session.recordingStoragePath} recordingStatus=${session.recordingStatus}`);
-
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      this.logger.error(`[AI-AUDIT] event=PIPELINE_FAILED callId=${sessionId} error="GEMINI_API_KEY is not set"`);
-      await this.prisma.callSession.update({
-        where: { id: sessionId },
-        data: { aiProcessingStatus: 'FAILED' }
-      }).catch(() => {});
-      return;
-    }
-
-    const configuredModel = process.env.GEMINI_MODEL;
-    const candidateModels = Array.from(
-      new Set([configuredModel, 'gemini-3.8-flash', 'gemini-3.5-flash'].filter(Boolean)),
-    ) as string[];
-
-    this.logger.log(
-      `[AI-AUDIT] event=MODEL_CONFIG provider=@google/genai candidates=${candidateModels.join(
-        ',',
-      )} apiKeyConfigured=true authenticationMode=Developer_API_Key`,
-    );
+    this.activeJobs.add(sessionId);
 
     try {
+      this.logger.log(`[AI-AUDIT] event=PIPELINE_START callId=${sessionId}`);
+
+      const session = await this.prisma.callSession.findUnique({
+        where: { id: sessionId },
+        include: { conversation: true },
+      });
+
+      if (!session) {
+        this.logger.error(`[AI-AUDIT] event=PIPELINE_FAILED callId=${sessionId} error="Session not found"`);
+        return null;
+      }
+
+      // Check if this session is already completed with analytics
+      const existingAnalytics = await this.prisma.callAnalytics.findFirst({
+        where: { callSessionId: sessionId },
+      });
+
+      if (existingAnalytics && session.aiProcessingStatus === 'COMPLETED') {
+        this.logger.log(`[AI-AUDIT] event=ALREADY_COMPLETED callId=${sessionId} skipping redundant processing`);
+        return existingAnalytics;
+      }
+
+      if (session.recordingStatus !== 'READY' || !session.recordingStoragePath) {
+        this.logger.error(`[AI-AUDIT] event=PIPELINE_FAILED callId=${sessionId} error="Recording not ready or path missing"`);
+        if (!existingAnalytics) {
+          await this.prisma.callSession.update({
+            where: { id: sessionId },
+            data: { aiProcessingStatus: 'FAILED' }
+          }).catch(() => {});
+        }
+        return null;
+      }
+
+      this.logger.log(`[AI-AUDIT] event=RECORDING_RESOLVED callId=${sessionId} storagePath=${session.recordingStoragePath} recordingStatus=${session.recordingStatus}`);
+
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        this.logger.error(`[AI-AUDIT] event=PIPELINE_FAILED callId=${sessionId} error="GEMINI_API_KEY is not set"`);
+        if (!existingAnalytics) {
+          await this.prisma.callSession.update({
+            where: { id: sessionId },
+            data: { aiProcessingStatus: 'FAILED' }
+          }).catch(() => {});
+        }
+        return null;
+      }
+
+      // Filter out retired models to avoid unnecessary 404 errors
+      const retiredModels = new Set(['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-3.0-flash']);
+      const configuredModel = process.env.GEMINI_MODEL;
+      const candidateModels = Array.from(
+        new Set([configuredModel, 'gemini-3.8-flash', 'gemini-3.5-flash'].filter(m => m && !retiredModels.has(m))),
+      ) as string[];
+
+      if (candidateModels.length === 0) {
+        candidateModels.push('gemini-3.8-flash', 'gemini-3.5-flash');
+      }
+
+      this.logger.log(
+        `[AI-AUDIT] event=MODEL_CONFIG provider=@google/genai candidates=${candidateModels.join(
+          ',',
+        )} apiKeyConfigured=true authenticationMode=Developer_API_Key`,
+      );
+
       await this.prisma.callSession.update({
         where: { id: sessionId },
         data: { aiProcessingStatus: 'ANALYZING' }
@@ -143,7 +172,8 @@ export class AnalyticsService {
               `[AI-AUDIT] event=MODEL_RETRY model=${model} attempt=${attempts}/${maxAttempts} isTransient=${isTransient} error="${e.message}"`,
             );
             if (isTransient && attempts < maxAttempts) {
-              await new Promise((r) => setTimeout(r, attempts * 2000));
+              const jitter = Math.floor(Math.random() * 500);
+              await new Promise((r) => setTimeout(r, attempts * 2000 + jitter));
             } else {
               break;
             }
@@ -188,12 +218,21 @@ export class AnalyticsService {
       this.logger.log(`[AI-AUDIT] event=PIPELINE_COMPLETE callId=${sessionId}`);
 
       return result;
-    } catch (err) {
-      await this.prisma.callSession.update({
-        where: { id: sessionId },
-        data: { aiProcessingStatus: 'FAILED' }
-      }).catch(() => {});
+    } catch (err: any) {
+      const existing = await this.prisma.callAnalytics.findFirst({
+        where: { callSessionId: sessionId }
+      }).catch(() => null);
+
+      if (!existing) {
+        await this.prisma.callSession.update({
+          where: { id: sessionId },
+          data: { aiProcessingStatus: 'FAILED' }
+        }).catch(() => {});
+      }
       this.logger.error(`[AI-AUDIT] event=PIPELINE_FAILED stage=Processing callId=${sessionId} error="${err.message}"`);
+      return null;
+    } finally {
+      this.activeJobs.delete(sessionId);
     }
   }
 }
