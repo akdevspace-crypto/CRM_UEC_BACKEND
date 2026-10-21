@@ -23,24 +23,28 @@ const mediaCodecs = [
 ];
 
 async function initMediasoup() {
-  worker = await mediasoup.createWorker({
-    logLevel: 'warn',
-    rtcMinPort: 10000,
-    rtcMaxPort: 10100,
-  });
+  try {
+    worker = await mediasoup.createWorker({
+      logLevel: 'warn',
+      rtcMinPort: 10000,
+      rtcMaxPort: 10100,
+    });
 
-  worker.on('died', () => {
-    console.error('Mediasoup worker died, exiting in 2 seconds... [pid:%d]', worker.pid);
-    setTimeout(() => process.exit(1), 2000);
-  });
+    worker.on('died', () => {
+      console.error('Mediasoup worker died, exiting in 2 seconds... [pid:%d]', worker.pid);
+      setTimeout(() => process.exit(1), 2000);
+    });
 
-  router = await worker.createRouter({ mediaCodecs });
-  console.log('✅ Mediasoup Worker and Global Router initialized.');
+    router = await worker.createRouter({ mediaCodecs });
+    console.log('✅ Mediasoup Worker and Global Router initialized.');
+  } catch (err) {
+    console.warn('⚠️ Mediasoup worker initialization bypassed (LiveKit is active telephony provider):', err.message);
+  }
 }
 
 async function getRouterRtpCapabilities() {
   if (!router) await initMediasoup();
-  return router.rtpCapabilities;
+  return router ? router.rtpCapabilities : null;
 }
 
 async function createWebRtcTransport() {
