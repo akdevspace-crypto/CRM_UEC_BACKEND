@@ -110,7 +110,47 @@ function setupSignaling(io) {
     });
 
     // ==========================================
-    // MEDIASOUP SFU SIGNALING
+    // PURE WEBRTC SIGNALING (Peer-to-Peer)
+    // ==========================================
+    socket.on('webrtc_join', ({ callSid }) => {
+      console.log(`[Pure WebRTC] Socket ${socket.id} joined room webrtc_${callSid}`);
+      socket.join(`webrtc_${callSid}`);
+      socket.to(`webrtc_${callSid}`).emit('webrtc_peer_joined', { socketId: socket.id, callSid });
+    });
+
+    socket.on('webrtc_offer', ({ callSid, sdp, targetSocketId }) => {
+      console.log(`[Pure WebRTC] Relaying SDP Offer for call ${callSid} from ${socket.id}`);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('webrtc_offer', { from: socket.id, callSid, sdp });
+      } else {
+        socket.to(`webrtc_${callSid}`).emit('webrtc_offer', { from: socket.id, callSid, sdp });
+      }
+    });
+
+    socket.on('webrtc_answer', ({ callSid, sdp, targetSocketId }) => {
+      console.log(`[Pure WebRTC] Relaying SDP Answer for call ${callSid} from ${socket.id}`);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('webrtc_answer', { from: socket.id, callSid, sdp });
+      } else {
+        socket.to(`webrtc_${callSid}`).emit('webrtc_answer', { from: socket.id, callSid, sdp });
+      }
+    });
+
+    socket.on('webrtc_ice_candidate', ({ callSid, candidate, targetSocketId }) => {
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('webrtc_ice_candidate', { from: socket.id, callSid, candidate });
+      } else {
+        socket.to(`webrtc_${callSid}`).emit('webrtc_ice_candidate', { from: socket.id, callSid, candidate });
+      }
+    });
+
+    socket.on('webrtc_leave', ({ callSid }) => {
+      socket.leave(`webrtc_${callSid}`);
+      socket.to(`webrtc_${callSid}`).emit('webrtc_peer_left', { socketId: socket.id, callSid });
+    });
+
+    // ==========================================
+    // LEGACY WEBRTC COMPATIBILITY STUBS
     // ==========================================
     const { getRouterRtpCapabilities, createWebRtcTransport, startRecording, stopRecordingAndUpload, getRouter } = require('./mediasoup');
     const prisma = require('./prisma');
