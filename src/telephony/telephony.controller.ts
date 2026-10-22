@@ -28,6 +28,11 @@ export class TelephonyController {
     return await this.telephonyService.getDashboardCalls();
   }
 
+  @Get('queue/operations')
+  async getQueueOperations() {
+    return await this.queueService.getQueueOperationsDashboard();
+  }
+
   @Get('history')
   async getCallHistoryLegacy(@Req() req: Request) {
     return await this.telephonyService.getCallHistory((req as any).user);

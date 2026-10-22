@@ -16,6 +16,15 @@ import {
   CreateSopDocumentDto,
   SopHandoffDto,
   SopQueryDto,
+  CreateStaffProfileDto,
+  UpdateStaffProfileDto,
+  StaffQueryDto,
+  CreateStaffRequirementDto,
+  UpdateStaffRequirementDto,
+  TransitionSalesStageDto,
+  CreateCcrComplaintDto,
+  UpdateCcrComplaintDto,
+  SubmitSopDailyReportDto,
 } from './dto/sop.dto';
 import {
   SopDepartment,
@@ -1254,4 +1263,427 @@ export class SopService {
     const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
     return isUuid ? id : null;
   }
+
+  // ==========================================
+  // PHASE 16: HR STAFF MANAGEMENT & RECRUITMENT PIPELINE
+  // ==========================================
+
+  async getStaffProfiles(query: StaffQueryDto, user: any) {
+    const page = Number(query.page) || 1;
+    const limit = Math.min(Number(query.limit) || 20, 100);
+    const skip = (page - 1) * limit;
+
+    const where: any = {};
+    if (query.category) where.category = query.category;
+    if (query.classification) where.classification = query.classification;
+    if (query.verificationStatus) where.verificationStatus = query.verificationStatus;
+    if (query.isAvailable !== undefined) where.isAvailable = query.isAvailable;
+    if (query.unitId) where.unitId = query.unitId;
+
+    if (query.search) {
+      where.OR = [
+        { name: { contains: query.search, mode: 'insensitive' } },
+        { phone: { contains: query.search } },
+        { staffId: { contains: query.search, mode: 'insensitive' } },
+        { city: { contains: query.search, mode: 'insensitive' } },
+      ];
+    }
+
+    const [total, items] = await Promise.all([
+      (this.prisma as any).staffProfile.count({ where }),
+      (this.prisma as any).staffProfile.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    return {
+      items,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  async getStaffProfileById(id: string, user: any) {
+    const profile = await (this.prisma as any).staffProfile.findUnique({
+      where: { id },
+    });
+    if (!profile) {
+      throw new NotFoundException(`Staff profile ${id} not found`);
+    }
+    return profile;
+  }
+
+  async createStaffProfile(dto: CreateStaffProfileDto, user: any) {
+    const existing = await (this.prisma as any).staffProfile.findFirst({
+      where: { phone: dto.phone.trim() },
+    });
+    if (existing) {
+      throw new BadRequestException(`A staff profile with phone ${dto.phone} already exists (${existing.staffId})`);
+    }
+
+    const currentYear = new Date().getFullYear();
+    const count = await (this.prisma as any).staffProfile.count();
+    const staffId = `STF-${currentYear}-${String(count + 1).padStart(4, '0')}`;
+
+    const profile = await (this.prisma as any).staffProfile.create({
+      data: {
+        staffId,
+        name: dto.name.trim(),
+        phone: dto.phone.trim(),
+        email: dto.email?.trim() || null,
+        gender: dto.gender || null,
+        category: dto.category,
+        classification: dto.classification || 'NORMAL',
+        verificationStatus: 'PENDING',
+        qualifications: dto.qualifications || null,
+        experienceYears: dto.experienceYears ? Number(dto.experienceYears) : null,
+        city: dto.city || null,
+        location: dto.location || null,
+        preferredShift: dto.preferredShift || 'ANY',
+        dailyRate: dto.dailyRate ? Number(dto.dailyRate) : null,
+        monthlySalary: dto.monthlySalary ? Number(dto.monthlySalary) : null,
+        source: dto.source || 'WALK_IN',
+        emergencyContact: dto.emergencyContact || null,
+        idProofType: dto.idProofType || null,
+        idProofNumber: dto.idProofNumber || null,
+        policeVerificationDone: dto.policeVerificationDone || false,
+        medicalFitnessDone: dto.medicalFitnessDone || false,
+        documents: dto.documents || [],
+        unitId: this.safeUuid(dto.unitId),
+        createdById: this.safeUuid(user?.userId || user?.id),
+      },
+    });
+
+    this.logger.log(`Created StaffProfile ${staffId} for ${dto.name}`);
+    return profile;
+  }
+
+  async updateStaffProfile(id: string, dto: UpdateStaffProfileDto, user: any) {
+    const existing = await (this.prisma as any).staffProfile.findUnique({
+      where: { id },
+    });
+    if (!existing) {
+      throw new NotFoundException(`Staff profile ${id} not found`);
+    }
+
+    const updated = await (this.prisma as any).staffProfile.update({
+      where: { id },
+      data: {
+        ...(dto.name ? { name: dto.name.trim() } : {}),
+        ...(dto.phone ? { phone: dto.phone.trim() } : {}),
+        ...(dto.email !== undefined ? { email: dto.email } : {}),
+        ...(dto.category ? { category: dto.category } : {}),
+        ...(dto.classification ? { classification: dto.classification } : {}),
+        ...(dto.verificationStatus ? { verificationStatus: dto.verificationStatus } : {}),
+        ...(dto.qualifications !== undefined ? { qualifications: dto.qualifications } : {}),
+        ...(dto.experienceYears !== undefined ? { experienceYears: Number(dto.experienceYears) } : {}),
+        ...(dto.city !== undefined ? { city: dto.city } : {}),
+        ...(dto.location !== undefined ? { location: dto.location } : {}),
+        ...(dto.preferredShift !== undefined ? { preferredShift: dto.preferredShift } : {}),
+        ...(dto.dailyRate !== undefined ? { dailyRate: Number(dto.dailyRate) } : {}),
+        ...(dto.monthlySalary !== undefined ? { monthlySalary: Number(dto.monthlySalary) } : {}),
+        ...(dto.isAvailable !== undefined ? { isAvailable: dto.isAvailable } : {}),
+        ...(dto.currentAssignmentId !== undefined ? { currentAssignmentId: dto.currentAssignmentId } : {}),
+        ...(dto.alternateAssignmentId !== undefined ? { alternateAssignmentId: dto.alternateAssignmentId } : {}),
+        ...(dto.policeVerificationDone !== undefined ? { policeVerificationDone: dto.policeVerificationDone } : {}),
+        ...(dto.medicalFitnessDone !== undefined ? { medicalFitnessDone: dto.medicalFitnessDone } : {}),
+        ...(dto.documents ? { documents: dto.documents } : {}),
+        ...(dto.threeDayFollowupDone !== undefined ? { threeDayFollowupDone: dto.threeDayFollowupDone } : {}),
+        ...(dto.threeDayFollowupNotes !== undefined ? { threeDayFollowupNotes: dto.threeDayFollowupNotes } : {}),
+      },
+    });
+
+    return updated;
+  }
+
+  async secondHrConfirm(id: string, user: any) {
+    const profile = await (this.prisma as any).staffProfile.findUnique({ where: { id } });
+    if (!profile) throw new NotFoundException(`Staff profile ${id} not found`);
+
+    const updated = await (this.prisma as any).staffProfile.update({
+      where: { id },
+      data: {
+        verificationStatus: 'SECOND_HR_CONFIRMED',
+        secondHrVerifiedBy: user?.name || user?.email || 'HR Manager',
+        secondHrVerifiedAt: new Date(),
+        tlmHandoverAt: new Date(),
+      },
+    });
+
+    this.logger.log(`Second-HR confirmation completed for staff ${profile.staffId} by ${user?.email}`);
+    return updated;
+  }
+
+  async recordStaffThreeDayFollowup(id: string, followupData: { notes: string; successful: boolean }, user: any) {
+    const profile = await (this.prisma as any).staffProfile.findUnique({ where: { id } });
+    if (!profile) throw new NotFoundException(`Staff profile ${id} not found`);
+
+    const updated = await (this.prisma as any).staffProfile.update({
+      where: { id },
+      data: {
+        threeDayFollowupDone: true,
+        threeDayFollowupDate: new Date(),
+        threeDayFollowupNotes: followupData.notes,
+      },
+    });
+
+    return updated;
+  }
+
+  async getStaffStockByCategory(unitId?: string) {
+    const where: any = { isAvailable: true };
+    if (unitId) where.unitId = unitId;
+
+    const stock = await (this.prisma as any).staffProfile.groupBy({
+      by: ['category', 'classification'],
+      where,
+      _count: { id: true },
+    });
+
+    return stock.map((s: any) => ({
+      category: s.category,
+      classification: s.classification,
+      availableCount: s._count.id,
+    }));
+  }
+
+  // ==========================================
+  // PHASE 16: WANTED STAFF REQUIREMENTS
+  // ==========================================
+
+  async getStaffRequirements(status?: string, unitId?: string) {
+    const where: any = {};
+    if (status) where.status = status;
+    if (unitId) where.unitId = unitId;
+
+    return (this.prisma as any).staffRequirement.findMany({
+      where,
+      orderBy: [{ urgency: 'asc' }, { requiredByDate: 'asc' }],
+    });
+  }
+
+  async createStaffRequirement(dto: CreateStaffRequirementDto, user: any) {
+    const currentYear = new Date().getFullYear();
+    const count = await (this.prisma as any).staffRequirement.count();
+    const requirementCode = `REQ-${currentYear}-${String(count + 1).padStart(4, '0')}`;
+
+    return (this.prisma as any).staffRequirement.create({
+      data: {
+        requirementCode,
+        category: dto.category,
+        qualificationRequired: dto.qualificationRequired || null,
+        location: dto.location || null,
+        unitId: this.safeUuid(dto.unitId),
+        openPositions: dto.openPositions ? Number(dto.openPositions) : 1,
+        fulfilledPositions: 0,
+        urgency: dto.urgency || 'NORMAL',
+        requiredByDate: new Date(dto.requiredByDate),
+        status: 'OPEN',
+        notes: dto.notes || null,
+        createdById: this.safeUuid(user?.userId || user?.id),
+      },
+    });
+  }
+
+  async updateStaffRequirement(id: string, dto: UpdateStaffRequirementDto, user: any) {
+    return (this.prisma as any).staffRequirement.update({
+      where: { id },
+      data: {
+        ...(dto.fulfilledPositions !== undefined ? { fulfilledPositions: Number(dto.fulfilledPositions) } : {}),
+        ...(dto.status ? { status: dto.status } : {}),
+        ...(dto.notes ? { notes: dto.notes } : {}),
+      },
+    });
+  }
+
+  // ==========================================
+  // PHASE 16: SALES PIPELINE WORKFLOW & TARGETS
+  // ==========================================
+
+  async transitionSalesStage(dto: TransitionSalesStageDto, user: any) {
+    const lead = await this.prisma.lead.findUnique({
+      where: { id: dto.leadId },
+    });
+    if (!lead) throw new NotFoundException(`Lead ${dto.leadId} not found`);
+
+    const stageRecord = await (this.prisma as any).salesPipelineStage.create({
+      data: {
+        leadId: dto.leadId,
+        stage: dto.stage,
+        previousStage: dto.previousStage || (lead as any).serviceInterest || null,
+        actorId: this.safeUuid(user?.userId || user?.id) || lead.id,
+        actorName: user?.name || user?.email || 'Sales Specialist',
+        notes: dto.notes || null,
+        tariffAmount: dto.tariffAmount ? Number(dto.tariffAmount) : null,
+        officeServiceCharge: dto.officeServiceCharge ? Number(dto.officeServiceCharge) : null,
+        paymentStatus: dto.paymentStatus || null,
+        matchedStaffId: dto.matchedStaffId || null,
+        alternateStaffId: dto.alternateStaffId || null,
+        nextActionDate: dto.nextActionDate ? new Date(dto.nextActionDate) : null,
+        metadata: dto.metadata || null,
+      },
+    });
+
+    let newLeadStatus = lead.status;
+    if (dto.stage === 'QUALIFIED') newLeadStatus = 'IN_PROGRESS' as any;
+    if (dto.stage === 'BUSINESS_CLOSED') newLeadStatus = 'POSITIVE' as any;
+    if (dto.stage === 'CLOSED_WON') newLeadStatus = 'CONVERTED' as any;
+
+    await this.prisma.lead.update({
+      where: { id: dto.leadId },
+      data: { status: newLeadStatus },
+    });
+
+    this.logger.log(`Sales lead ${dto.leadId} transitioned to ${dto.stage} by ${user?.email}`);
+    return stageRecord;
+  }
+
+  async getSalesPipelineHistory(leadId: string) {
+    return (this.prisma as any).salesPipelineStage.findMany({
+      where: { leadId },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async getSalesTargetStatus(agentId: string) {
+    const monthlyTarget = 500000;
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const stages = await (this.prisma as any).salesPipelineStage.findMany({
+      where: {
+        stage: { in: ['BUSINESS_CLOSED', 'CLOSED_WON', 'PAYMENT_COLLECTED'] },
+        actorId: agentId,
+        createdAt: { gte: startOfMonth },
+      },
+      select: { tariffAmount: true, officeServiceCharge: true },
+    });
+
+    const closedRevenue = stages.reduce((acc: number, s: any) => acc + (Number(s.tariffAmount) || 0), 0);
+    const officeCharges = stages.reduce((acc: number, s: any) => acc + (Number(s.officeServiceCharge) || 0), 0);
+    const achievementPercent = Math.min(Math.round((closedRevenue / monthlyTarget) * 100), 100);
+
+    return {
+      monthlyTarget,
+      closedRevenue,
+      officeCharges,
+      achievementPercent,
+      isTargetMet: closedRevenue >= monthlyTarget,
+      pendingToTarget: Math.max(monthlyTarget - closedRevenue, 0),
+    };
+  }
+
+  // ==========================================
+  // PHASE 16: CCR COMPLAINTS & CUSTOMER CARE
+  // ==========================================
+
+  async createCcrComplaint(dto: CreateCcrComplaintDto, user: any) {
+    const customer = await this.prisma.customer.findUnique({
+      where: { id: dto.customerId },
+    });
+    if (!customer) throw new NotFoundException(`Customer ${dto.customerId} not found`);
+
+    const ticket = await this.prisma.ticket.create({
+      data: {
+        customerId: dto.customerId,
+        category: dto.category || 'COMPLAINT',
+        priority: dto.priority || 'HIGH',
+        status: 'OPEN',
+        severity: dto.severity || 'NORMAL',
+        source: dto.source || 'PHONE',
+        affectedStaffId: dto.affectedStaffId || null,
+        investigationNotes: dto.investigationNotes || null,
+        agentId: this.safeUuid(dto.agentId || user?.agentId || user?.id),
+      } as any,
+    });
+
+    this.logger.log(`Created CCR Complaint Ticket ${ticket.id} for customer ${dto.customerId}`);
+    return ticket;
+  }
+
+  async updateCcrComplaint(id: string, dto: UpdateCcrComplaintDto, user: any) {
+    const existing = await this.prisma.ticket.findUnique({ where: { id } });
+    if (!existing) throw new NotFoundException(`Ticket ${id} not found`);
+
+    if (dto.status === 'CLOSED' && !dto.resolution) {
+      throw new BadRequestException('A formal resolution summary is required to close a complaint ticket');
+    }
+
+    const dataToUpdate: any = {
+      ...(dto.status ? { status: dto.status } : {}),
+      ...(dto.resolution ? { resolution: dto.resolution } : {}),
+      ...(dto.severity ? { severity: dto.severity } : {}),
+      ...(dto.replacementStaffId ? { replacementStaffId: dto.replacementStaffId } : {}),
+      ...(dto.investigationNotes ? { investigationNotes: dto.investigationNotes } : {}),
+      ...(dto.managerApprovalStatus ? { managerApprovalStatus: dto.managerApprovalStatus } : {}),
+      ...(dto.threeDayFollowupDate ? { threeDayFollowupDate: new Date(dto.threeDayFollowupDate) } : {}),
+      ...(dto.threeDayFollowupNotes ? { threeDayFollowupNotes: dto.threeDayFollowupNotes } : {}),
+      ...(dto.tenDayFollowupDate ? { tenDayFollowupDate: new Date(dto.tenDayFollowupDate) } : {}),
+      ...(dto.tenDayFollowupNotes ? { tenDayFollowupNotes: dto.tenDayFollowupNotes } : {}),
+      ...(dto.customerSatisfactionScore !== undefined ? { customerSatisfactionScore: Number(dto.customerSatisfactionScore) } : {}),
+      ...(dto.testimonialNotes ? { testimonialNotes: dto.testimonialNotes } : {}),
+      ...(dto.referralNotes ? { referralNotes: dto.referralNotes } : {}),
+      ...(dto.status === 'CLOSED' ? { closedById: this.safeUuid(user?.userId || user?.id), closedAt: new Date() } : {}),
+    };
+
+    return this.prisma.ticket.update({
+      where: { id },
+      data: dataToUpdate,
+    });
+  }
+
+  // ==========================================
+  // PHASE 16: SOP DAILY REPORTS (PERSISTED METRICS)
+  // ==========================================
+
+  async submitDailyReport(dto: SubmitSopDailyReportDto, user: any) {
+    const reportDate = new Date(dto.reportDate);
+    const reporterId = this.safeUuid(user?.userId || user?.id) || user?.id;
+    const reporterName = user?.name || user?.email || 'Operations Officer';
+
+    const report = await (this.prisma as any).sopDailyReport.upsert({
+      where: {
+        department_reportDate_reporterId: {
+          department: dto.department,
+          reportDate,
+          reporterId,
+        },
+      },
+      update: {
+        metrics: dto.metrics,
+        status: 'SUBMITTED',
+        unitId: this.safeUuid(dto.unitId),
+      },
+      create: {
+        department: dto.department,
+        reportDate,
+        reporterId,
+        reporterName,
+        metrics: dto.metrics,
+        status: 'SUBMITTED',
+        unitId: this.safeUuid(dto.unitId),
+      },
+    });
+
+    this.logger.log(`Submitted SOP Daily Report for ${dto.department} on ${dto.reportDate} by ${reporterName}`);
+    return report;
+  }
+
+  async getDailyReports(department?: SopDepartment, dateStr?: string) {
+    const where: any = {};
+    if (department) where.department = department;
+    if (dateStr) where.reportDate = new Date(dateStr);
+
+    return (this.prisma as any).sopDailyReport.findMany({
+      where,
+      orderBy: { reportDate: 'desc' },
+      take: 50,
+    });
+  }
 }
+

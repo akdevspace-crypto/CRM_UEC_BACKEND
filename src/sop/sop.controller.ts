@@ -23,6 +23,15 @@ import {
   CreateSopDocumentDto,
   SopHandoffDto,
   SopQueryDto,
+  CreateStaffProfileDto,
+  UpdateStaffProfileDto,
+  StaffQueryDto,
+  CreateStaffRequirementDto,
+  UpdateStaffRequirementDto,
+  TransitionSalesStageDto,
+  CreateCcrComplaintDto,
+  UpdateCcrComplaintDto,
+  SubmitSopDailyReportDto,
 } from './dto/sop.dto';
 
 @Controller('api/v1/sop')
@@ -208,4 +217,144 @@ export class SopController {
   async seedTemplates(@Req() req: any) {
     return this.sopService.seedDefaultTemplates(this.extractUser(req));
   }
+
+  // ==========================================
+  // PHASE 16: HR STAFF MANAGEMENT ENDPOINTS
+  // ==========================================
+
+  @Get('staff')
+  async getStaffProfiles(@Query() query: StaffQueryDto, @Req() req: any) {
+    return this.sopService.getStaffProfiles(query, this.extractUser(req));
+  }
+
+  @Get('staff/stock')
+  async getStaffStock(@Query('unitId') unitId: string) {
+    return this.sopService.getStaffStockByCategory(unitId);
+  }
+
+  @Get('staff/:id')
+  async getStaffProfileById(@Param('id') id: string, @Req() req: any) {
+    return this.sopService.getStaffProfileById(id, this.extractUser(req));
+  }
+
+  @Post('staff')
+  async createStaffProfile(@Body() dto: CreateStaffProfileDto, @Req() req: any) {
+    return this.sopService.createStaffProfile(dto, this.extractUser(req));
+  }
+
+  @Patch('staff/:id')
+  async updateStaffProfile(
+    @Param('id') id: string,
+    @Body() dto: UpdateStaffProfileDto,
+    @Req() req: any,
+  ) {
+    return this.sopService.updateStaffProfile(id, dto, this.extractUser(req));
+  }
+
+  @Post('staff/:id/second-hr-confirm')
+  async secondHrConfirm(@Param('id') id: string, @Req() req: any) {
+    return this.sopService.secondHrConfirm(id, this.extractUser(req));
+  }
+
+  @Post('staff/:id/three-day-followup')
+  async recordStaffThreeDayFollowup(
+    @Param('id') id: string,
+    @Body() body: { notes: string; successful: boolean },
+    @Req() req: any,
+  ) {
+    return this.sopService.recordStaffThreeDayFollowup(id, body, this.extractUser(req));
+  }
+
+  // ==========================================
+  // PHASE 16: WANTED STAFF REQUIREMENTS
+  // ==========================================
+
+  @Get('requirements')
+  async getStaffRequirements(
+    @Query('status') status: string,
+    @Query('unitId') unitId: string,
+  ) {
+    return this.sopService.getStaffRequirements(status, unitId);
+  }
+
+  @Post('requirements')
+  async createStaffRequirement(
+    @Body() dto: CreateStaffRequirementDto,
+    @Req() req: any,
+  ) {
+    return this.sopService.createStaffRequirement(dto, this.extractUser(req));
+  }
+
+  @Patch('requirements/:id')
+  async updateStaffRequirement(
+    @Param('id') id: string,
+    @Body() dto: UpdateStaffRequirementDto,
+    @Req() req: any,
+  ) {
+    return this.sopService.updateStaffRequirement(id, dto, this.extractUser(req));
+  }
+
+  // ==========================================
+  // PHASE 16: SALES PIPELINE & TARGETS
+  // ==========================================
+
+  @Post('sales/transition')
+  async transitionSalesStage(
+    @Body() dto: TransitionSalesStageDto,
+    @Req() req: any,
+  ) {
+    return this.sopService.transitionSalesStage(dto, this.extractUser(req));
+  }
+
+  @Get('sales/pipeline/:leadId')
+  async getSalesPipelineHistory(@Param('leadId') leadId: string) {
+    return this.sopService.getSalesPipelineHistory(leadId);
+  }
+
+  @Get('sales/targets/:agentId')
+  async getSalesTargetStatus(@Param('agentId') agentId: string) {
+    return this.sopService.getSalesTargetStatus(agentId);
+  }
+
+  // ==========================================
+  // PHASE 16: CCR COMPLAINT MANAGEMENT
+  // ==========================================
+
+  @Post('ccr/complaints')
+  async createCcrComplaint(
+    @Body() dto: CreateCcrComplaintDto,
+    @Req() req: any,
+  ) {
+    return this.sopService.createCcrComplaint(dto, this.extractUser(req));
+  }
+
+  @Patch('ccr/complaints/:id')
+  async updateCcrComplaint(
+    @Param('id') id: string,
+    @Body() dto: UpdateCcrComplaintDto,
+    @Req() req: any,
+  ) {
+    return this.sopService.updateCcrComplaint(id, dto, this.extractUser(req));
+  }
+
+  // ==========================================
+  // PHASE 16: SOP DAILY REPORTS
+  // ==========================================
+
+  @Post('daily-reports')
+  async submitDailyReport(
+    @Body() dto: SubmitSopDailyReportDto,
+    @Req() req: any,
+  ) {
+    return this.sopService.submitDailyReport(dto, this.extractUser(req));
+  }
+
+  @Get('daily-reports')
+  async getDailyReports(
+    @Query('department') department: any,
+    @Query('date') date: string,
+  ) {
+    return this.sopService.getDailyReports(department, date);
+  }
 }
+

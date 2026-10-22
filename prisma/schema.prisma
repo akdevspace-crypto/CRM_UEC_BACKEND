@@ -353,6 +353,23 @@ model Ticket {
   status      String
   resolution  String?
   sopExecutions SopExecution[]
+
+  // Phase 16 CCR Complaint Fields
+  severity                  String?   @default("NORMAL") // 'EMERGENCY', 'ABOVE_NORMAL', 'NORMAL'
+  source                    String?   // 'PHONE', 'WHATSAPP', 'EMAIL', 'FAMILY_VISIT'
+  affectedStaffId           String?
+  replacementStaffId        String?
+  investigationNotes        String?
+  managerApprovalStatus     String?   @default("NOT_REQUIRED") // 'PENDING', 'APPROVED', 'REJECTED'
+  threeDayFollowupDate      DateTime?
+  threeDayFollowupNotes     String?
+  tenDayFollowupDate        DateTime?
+  tenDayFollowupNotes       String?
+  customerSatisfactionScore Int?      // 1-5
+  testimonialNotes          String?
+  referralNotes             String?
+  closedById                String?   @db.Uuid
+  closedAt                  DateTime?
   
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -397,6 +414,15 @@ model QueueItem {
   priority    Priority
   department  String
   status      String   // 'WAITING', 'ASSIGNED', 'ESCALATED'
+
+  // Phase 16 Queue Engine Metrics & Tracking
+  callSessionId      String?   @db.Uuid
+  enteredAt          DateTime  @default(now())
+  assignedAt         DateTime?
+  assignmentAttempts Int       @default(0)
+  assignedAgentId    String?   @db.Uuid
+  waitDuration       Int?
+  outcome            String?   // 'ANSWERED', 'ABANDONED', 'OVERFLOW', 'MISSED'
   
   createdAt   DateTime @default(now())
 }
@@ -756,6 +782,17 @@ model Queue {
   department   Department @relation(fields: [departmentId], references: [id])
   name         String
   routingType  String   // 'FIFO', 'ROUND_ROBIN', 'SKILL_BASED'
+
+  // Phase 16 Queue Configuration
+  isActive                Boolean   @default(true)
+  priority                Int       @default(1)
+  skillsRequired          String[]  @default([])
+  serviceCategories       String[]  @default([])
+  businessHours           Json?
+  maxWaitSeconds          Int       @default(300)
+  agentRingTimeoutSeconds Int       @default(25)
+  overflowQueueId         String?   @db.Uuid
+  assignmentStrategy      String    @default("LONGEST_IDLE")
   
   assignments  QueueAssignment[]
   
@@ -851,6 +888,7 @@ model Lead {
   callSessions      CallSession[]
   conversationsLinked Conversation[] @relation("ConversationLead")
   activities        LeadActivity[]
+  salesPipelineStages SalesPipelineStage[]
 
   // Omnichannel Enquiry Intelligence & Call Intake
   foundation                  String?
@@ -1532,4 +1570,122 @@ model LeadMergeAudit {
   @@index([mergedLeadId])
   @@index([createdAt])
 }
+
+// ==========================================
+// PHASE 16: SOP WORKFLOW & ENFORCEMENT MODELS
+// ==========================================
+
+model StaffProfile {
+  id                    String    @id @default(uuid()) @db.Uuid
+  staffId               String    @unique
+  name                  String
+  phone                 String
+  email                 String?
+  gender                String?
+  category              String    // 'CAREGIVER', 'NURSE', 'ICU_NURSE', 'PHYSIOTHERAPIST', 'DEMENTIA_CARE', 'BEDRIDDEN_CARE'
+  classification        String    @default("NORMAL") // 'GOOD', 'NORMAL', 'BAD', 'REJECTED'
+  verificationStatus    String    @default("PENDING") // 'PENDING', 'DOCUMENTS_VERIFIED', 'SECOND_HR_CONFIRMED', 'VERIFIED', 'REJECTED'
+  qualifications        String?
+  experienceYears       Float?
+  city                  String?
+  location              String?
+  preferredShift        String?   // 'DAY', 'NIGHT', '24_HOURS', 'ANY'
+  dailyRate             Decimal?  @db.Decimal(10, 2)
+  monthlySalary         Decimal?  @db.Decimal(10, 2)
+  source                String?   // 'REFERRAL', 'AGENCY', 'WALK_IN', 'ONLINE'
+  emergencyContact      String?
+  idProofType           String?
+  idProofNumber         String?
+  policeVerificationDone Boolean  @default(false)
+  medicalFitnessDone    Boolean   @default(false)
+  documents             Json?
+  isAvailable           Boolean   @default(true)
+  currentAssignmentId   String?
+  alternateAssignmentId String?
+  secondHrVerifiedBy    String?
+  secondHrVerifiedAt    DateTime?
+  tlmHandoverAt         DateTime?
+  joiningDate           DateTime?
+  threeDayFollowupDone  Boolean   @default(false)
+  threeDayFollowupDate  DateTime?
+  threeDayFollowupNotes String?
+  unitId                String?   @db.Uuid
+  createdById           String?   @db.Uuid
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([phone])
+  @@index([category])
+  @@index([classification])
+  @@index([verificationStatus])
+  @@index([isAvailable])
+  @@index([unitId])
+}
+
+model StaffRequirement {
+  id                    String    @id @default(uuid()) @db.Uuid
+  requirementCode       String    @unique
+  category              String
+  qualificationRequired String?
+  location              String?
+  unitId                String?   @db.Uuid
+  openPositions         Int       @default(1)
+  fulfilledPositions    Int       @default(0)
+  urgency               String    @default("NORMAL") // 'CRITICAL', 'HIGH', 'NORMAL'
+  requiredByDate        DateTime
+  status                String    @default("OPEN") // 'OPEN', 'PARTIALLY_FULFILLED', 'FULFILLED', 'CANCELLED'
+  notes                 String?
+  createdById           String?   @db.Uuid
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([category])
+  @@index([status])
+  @@index([urgency])
+  @@index([requiredByDate])
+}
+
+model SopDailyReport {
+  id            String        @id @default(uuid()) @db.Uuid
+  department    SopDepartment
+  reportDate    DateTime      @db.Date
+  reporterId    String        @db.Uuid
+  reporterName  String
+  unitId        String?       @db.Uuid
+  metrics       Json
+  status        String        @default("SUBMITTED") // 'DRAFT', 'SUBMITTED', 'APPROVED'
+  approvedById  String?       @db.Uuid
+  approvedAt    DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@unique([department, reportDate, reporterId])
+  @@index([department])
+  @@index([reportDate])
+}
+
+model SalesPipelineStage {
+  id                  String    @id @default(uuid()) @db.Uuid
+  leadId              String    @db.Uuid
+  lead                Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  stage               String
+  previousStage       String?
+  actorId             String    @db.Uuid
+  actorName           String
+  notes               String?
+  tariffAmount        Decimal?  @db.Decimal(12, 2)
+  officeServiceCharge Decimal?  @db.Decimal(12, 2)
+  paymentStatus       String?
+  matchedStaffId      String?
+  alternateStaffId    String?
+  nextActionDate      DateTime?
+  metadata            Json?
+  createdAt           DateTime  @default(now())
+
+  @@index([leadId])
+  @@index([stage])
+  @@index([actorId])
+  @@index([nextActionDate])
+}
+
 

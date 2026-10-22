@@ -400,6 +400,16 @@ export class TelephonyService {
         this.triggerPostCallPipeline(latestSession, null).catch(console.error);
       }
 
+      // Phase 16: Release agent reservation lock and reset active call capacity
+      if (session.calleeUserId) {
+        await this.queueService.releaseAgentReservation(session.calleeUserId, callSid).catch(() => {});
+      }
+      for (const p of session.participants || []) {
+        if (p.agentId) {
+          await this.queueService.releaseAgentReservation(p.agentId, callSid).catch(() => {});
+        }
+      }
+
       this.logger.log(`[CALL-LIFECYCLE] ` + JSON.stringify({
         event: 'session_marked_ended',
         sessionID: callSid,
@@ -1763,26 +1773,42 @@ export class TelephonyService {
 
       const customerContext = await this.lookupCustomerContext(event.fromNumber);
 
+      // Phase 16: Queue Classification & Emergency Priority Check
+      const isEmergency = Boolean(
+        (customerContext?.customer as any)?.servicePlans?.some((p: any) => p.planType === 'EMERGENCY' || p.planType === 'AMBULANCE') ||
+        (customerContext?.customer as any)?.isEmergency
+      );
+
       let assignedAgent = null;
       for (let i = 0; i < 5; i++) {
-        const potentialAgent = await this.queueService.allocateAgent();
-        if (!potentialAgent) break; // No agents available at all
+        const potentialAgent = await this.queueService.allocateAgent({
+          department: isEmergency ? 'EMERGENCY' : undefined,
+          isEmergency,
+          callSid: event.providerCallId,
+          ringTimeoutSeconds: isEmergency ? 15 : 25,
+          strategy: 'LONGEST_IDLE',
+        });
+        if (!potentialAgent) break; // No agents available in pool
 
+        let isSocketConnected = false;
         if (potentialAgent.socketId) {
           const directSocket = this.telephonyGateway.server?.sockets?.sockets?.get(potentialAgent.socketId);
           if (directSocket?.connected) {
-            assignedAgent = potentialAgent;
-            break;
-          }
-          const sockets = await this.telephonyGateway.server.in(potentialAgent.socketId).fetchSockets();
-          if (sockets.length > 0) {
-            assignedAgent = potentialAgent;
-            break; // Found an active, connected agent
+            isSocketConnected = true;
+          } else {
+            const sockets = await this.telephonyGateway.server.in(potentialAgent.socketId).fetchSockets();
+            if (sockets.length > 0) isSocketConnected = true;
           }
         }
 
-        // Stale socket detected: agent is in DB as AVAILABLE but has no actual WebSocket connection
-        this.logger.warn(`Allocated agent ${potentialAgent.name} but socket ${potentialAgent.socketId} is dead. Marking offline.`);
+        if (isSocketConnected) {
+          assignedAgent = potentialAgent;
+          break; // Found an active, connected agent
+        }
+
+        // Stale socket detected: release reservation lock and mark offline
+        this.logger.warn(`Allocated agent ${potentialAgent.name} but socket ${potentialAgent.socketId} is dead. Releasing reservation and marking offline.`);
+        await this.queueService.releaseAgentReservation(potentialAgent.id, event.providerCallId);
         await this.prisma.agent.update({
           where: { id: potentialAgent.id },
           data: { status: 'OFFLINE', activeCalls: 0, socketId: null }
@@ -1790,7 +1816,7 @@ export class TelephonyService {
       }
 
       if (!assignedAgent) {
-        // Fallback: Check if any agent is marked AVAILABLE or logged in
+        // Fallback: Check if any agent is marked AVAILABLE
         const fallbackAgent = await this.prisma.agent.findFirst({
           where: { status: 'AVAILABLE', isDeleted: false },
           orderBy: { activeCalls: 'asc' },
@@ -1804,7 +1830,13 @@ export class TelephonyService {
       this.logger.log(`[INBOUND-TRACE] AGENT_SELECTION | callId=${event.providerCallId} assignedAgentId=${assignedAgent?.id}`);
 
       if (!assignedAgent) {
-        this.logger.warn(`No agents available for call ${event.providerCallId}`);
+        this.logger.warn(`No agents available for call ${event.providerCallId}. Enqueueing to waiting pool.`);
+        await this.queueService.enqueueCallItem(
+          event.providerCallId,
+          customerContext?.customer?.id,
+          isEmergency ? 'EMERGENCY' : 'GENERAL',
+          isEmergency ? 'EMERGENCY' : 'NORMAL'
+        );
         return false;
       }
 
