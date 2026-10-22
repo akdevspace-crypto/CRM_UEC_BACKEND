@@ -80,6 +80,41 @@ export class TelephonyController {
     return await this.telephonyService.getTransferAudits(req.query, (req as any).user);
   }
 
+  @Post('calls/:id/send-message')
+  async sendMessageFromCall(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Req() req: Request,
+  ) {
+    return await this.telephonyService.sendMessageFromCall(id, body, (req as any).user);
+  }
+
+  @Get('customer-history/:identifier')
+  async getCustomerHistoryIntelligence(
+    @Param('identifier') identifier: string,
+    @Req() req: Request,
+  ) {
+    return await this.telephonyService.getCustomerHistoryIntelligence(identifier, (req as any).user);
+  }
+
+  @Post('leads/:leadId/cross-unit-transfer/preview')
+  async previewCrossUnitLeadTransfer(
+    @Param('leadId') leadId: string,
+    @Body('destinationUnitId') destinationUnitId: string,
+    @Req() req: Request,
+  ) {
+    return await this.telephonyService.previewCrossUnitLeadTransfer(leadId, destinationUnitId, (req as any).user);
+  }
+
+  @Post('leads/:leadId/cross-unit-transfer')
+  async executeCrossUnitLeadTransfer(
+    @Param('leadId') leadId: string,
+    @Body() body: any,
+    @Req() req: Request,
+  ) {
+    return await this.telephonyService.executeCrossUnitLeadTransfer(leadId, body, (req as any).user);
+  }
+
   @Get('my-ringing-call')
   async getMyRingingCall(@Req() req: Request) {
     const user = (req as any).user;

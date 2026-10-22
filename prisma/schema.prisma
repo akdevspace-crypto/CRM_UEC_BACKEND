@@ -227,6 +227,8 @@ model Agent {
   sopAssignedExecutions SopExecution[] @relation("SopAssignedAgent")
   initiatedTransfers  CallTransferAudit[] @relation("InitiatedTransfers")
   receivedTransfers   CallTransferAudit[] @relation("ReceivedTransfers")
+  leadTransferAssignments LeadTransferAudit[] @relation("LeadTransferAssignedAgent")
+  leadActivities      LeadActivity[]
 }
 
 model Customer {
@@ -307,6 +309,7 @@ model Conversation {
   missingInfo                 String[]           @default([])
   intakeMetadata              Json?
   originLeads                 Lead[]             @relation("OmnichannelOrigin")
+  activities                  LeadActivity[]
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -662,6 +665,7 @@ model CallSession {
   liveNotes      Json?
   intakeForm     Json?
   transferAudits CallTransferAudit[]
+  activities     LeadActivity[]
 
   @@index([status])
   @@index([startedAt])
@@ -846,6 +850,7 @@ model Lead {
   sopExecutions     SopExecution[]
   callSessions      CallSession[]
   conversationsLinked Conversation[] @relation("ConversationLead")
+  activities        LeadActivity[]
 
   // Omnichannel Enquiry Intelligence & Call Intake
   foundation                  String?
@@ -1072,8 +1077,13 @@ model LeadTransferAudit {
   sourceUnit      BusinessUnit? @relation("TransferSourceUnit", fields: [sourceUnitId], references: [id], onDelete: SetNull)
   destUnitId      String        @db.Uuid
   destUnit        BusinessUnit  @relation("TransferDestUnit", fields: [destUnitId], references: [id], onDelete: Cascade)
+  assignedAgentId String?       @db.Uuid
+  assignedAgent   Agent?        @relation("LeadTransferAssignedAgent", fields: [assignedAgentId], references: [id], onDelete: SetNull)
   transferredById String?       @db.Uuid
   transferredBy   User?         @relation(fields: [transferredById], references: [id], onDelete: SetNull)
+  status          String        @default("COMPLETED") // COMPLETED, PENDING, REJECTED
+  sourceDepartment String?
+  destDepartment  String?
   reason          String?
   preserveHistory Boolean       @default(true)
   metadata        Json?
@@ -1083,6 +1093,35 @@ model LeadTransferAudit {
   @@index([sourceUnitId])
   @@index([destUnitId])
   @@index([transferredById])
+  @@index([assignedAgentId])
+  @@index([createdAt])
+}
+
+model LeadActivity {
+  id                String        @id @default(uuid()) @db.Uuid
+  leadId            String        @db.Uuid
+  lead              Lead          @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  callSessionId     String?       @db.Uuid
+  callSession       CallSession?  @relation(fields: [callSessionId], references: [id], onDelete: SetNull)
+  conversationId    String?       @db.Uuid
+  conversation      Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  agentId           String?       @db.Uuid
+  agent             Agent?        @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  type              String        // 'COMMUNICATION', 'NOTE', 'CALL', 'TRANSFER', 'STATUS_CHANGE', 'FOLLOWUP'
+  channel           String?       // 'WHATSAPP', 'INSTAGRAM', 'EMAIL', 'VOICE', 'SYSTEM'
+  direction         String?       // 'INBOUND', 'OUTBOUND'
+  title             String
+  content           String?
+  providerMessageId String?
+  status            String?       // 'SENT', 'DELIVERED', 'READ', 'FAILED', 'PENDING'
+  metadata          Json?
+  createdAt         DateTime      @default(now())
+
+  @@index([leadId])
+  @@index([callSessionId])
+  @@index([conversationId])
+  @@index([agentId])
+  @@index([type])
   @@index([createdAt])
 }
 
