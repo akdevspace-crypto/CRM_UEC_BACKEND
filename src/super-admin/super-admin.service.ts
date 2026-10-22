@@ -557,4 +557,255 @@ export class SuperAdminService {
       orderBy: { createdAt: 'desc' },
     });
   }
+
+  /**
+   * Phase 1 & 2: Cross-Unit Lead Transfer
+   */
+  async searchLeadsForTransfer(query?: string, sourceUnitId?: string, limit = 20) {
+    const where: any = {};
+    if (sourceUnitId) {
+      where.unitId = sourceUnitId === 'UNASSIGNED' ? null : sourceUnitId;
+    }
+    if (query && query.trim().length > 0) {
+      where.OR = [
+        { customerName: { contains: query.trim(), mode: 'insensitive' } },
+        { phoneNumber: { contains: query.trim() } },
+        { email: { contains: query.trim(), mode: 'insensitive' } },
+      ];
+    }
+
+    return this.prisma.lead.findMany({
+      where,
+      take: Math.min(limit, 50),
+      orderBy: { createdAt: 'desc' },
+      include: {
+        unit: { select: { id: true, code: true, name: true } },
+        assignedAgent: {
+          select: {
+            id: true,
+            user: { select: { email: true } },
+          },
+        },
+        _count: {
+          select: { followups: true, conversionLogs: true, transferAudits: true },
+        },
+      },
+    });
+  }
+
+  async previewLeadTransfer(dto: { leadId: string; sourceUnitId?: string; destUnitId?: string; destinationUnitId?: string }) {
+    const destUnitId = dto.destUnitId || dto.destinationUnitId;
+    if (!dto.leadId) {
+      throw new BadRequestException('leadId is required');
+    }
+    if (!destUnitId) {
+      throw new BadRequestException('destUnitId or destinationUnitId is required');
+    }
+
+    const destUnit = await this.prisma.businessUnit.findUnique({
+      where: { id: destUnitId },
+    });
+    if (!destUnit) {
+      throw new NotFoundException('Destination business unit not found');
+    }
+    if (destUnit.status !== 'ACTIVE') {
+      throw new BadRequestException('Destination business unit is not active');
+    }
+
+    const lead = await this.prisma.lead.findUnique({
+      where: { id: dto.leadId },
+      include: {
+        unit: true,
+        followups: true,
+        conversionLogs: true,
+      },
+    });
+    if (!lead) {
+      throw new NotFoundException('Lead not found');
+    }
+
+    if (dto.sourceUnitId && dto.sourceUnitId === destUnitId) {
+      throw new BadRequestException('Source and destination business units cannot be the same');
+    }
+    if (lead.unitId && lead.unitId === destUnitId) {
+      throw new BadRequestException('Source and destination business units cannot be the same (Lead already assigned to destination unit)');
+    }
+    if (dto.sourceUnitId && dto.sourceUnitId !== 'UNASSIGNED' && lead.unitId && lead.unitId !== dto.sourceUnitId) {
+      throw new BadRequestException('Lead does not belong to the specified source unit');
+    }
+
+    // Duplicate detection in destination unit
+    const duplicate = await this.prisma.lead.findFirst({
+      where: {
+        unitId: destUnitId,
+        id: { not: lead.id },
+        OR: [
+          { phoneNumber: lead.phoneNumber },
+          ...(lead.email ? [{ email: lead.email }] : []),
+        ],
+      },
+    });
+
+    const destinationInfo = { id: destUnit.id, code: destUnit.code, name: destUnit.name };
+    const sourceInfo = lead.unit ? { id: lead.unit.id, code: lead.unit.code, name: lead.unit.name } : null;
+
+    return {
+      canTransfer: !duplicate,
+      duplicateFound: !!duplicate,
+      duplicateWarning: !!duplicate,
+      duplicateDetails: duplicate
+        ? {
+            id: duplicate.id,
+            customerName: duplicate.customerName,
+            phoneNumber: duplicate.phoneNumber,
+            email: duplicate.email,
+            status: duplicate.status,
+          }
+        : null,
+      lead: {
+        id: lead.id,
+        customerName: lead.customerName,
+        phoneNumber: lead.phoneNumber,
+        email: lead.email,
+        status: lead.status,
+        currentUnit: sourceInfo,
+      },
+      sourceUnit: sourceInfo,
+      destUnit: destinationInfo,
+      destinationUnit: destinationInfo,
+      associatedRecords: {
+        appointmentsCount: lead.followups?.length || 0,
+        followupsCount: lead.followups?.length || 0,
+        conversionsCount: lead.conversionLogs?.length || 0,
+      },
+      historicalAttribution: {
+        preserveHistory: true,
+        historicalFollowupsCount: lead.followups.length,
+        historicalConversionsCount: lead.conversionLogs.length,
+        policyNote: 'Lead historical relationships, tasks, calls, and conversions are preserved with historical unit attribution.',
+      },
+    };
+  }
+
+  async transferLead(
+    dto: {
+      leadId: string;
+      sourceUnitId?: string;
+      destUnitId?: string;
+      destinationUnitId?: string;
+      reason?: string;
+      preserveHistory?: boolean;
+      forceDuplicate?: boolean;
+    },
+    actorEmail: string,
+    actorUserId?: string,
+  ) {
+    const destUnitId = dto.destUnitId || dto.destinationUnitId;
+    if (!destUnitId) {
+      throw new BadRequestException('destUnitId or destinationUnitId is required');
+    }
+
+    const preview = await this.previewLeadTransfer({ ...dto, destUnitId });
+    if (preview.duplicateFound && !dto.forceDuplicate) {
+      throw new ConflictException({
+        message: 'A duplicate lead with the same phone or email exists in the destination unit',
+        duplicateDetails: preview.duplicateDetails,
+      });
+    }
+
+    let userId: string | null = null;
+    if (actorUserId) {
+      const userExists = await this.prisma.user.findUnique({ where: { id: actorUserId } });
+      if (userExists) {
+        userId = userExists.id;
+      } else {
+        const agent = await this.prisma.agent.findUnique({ where: { id: actorUserId } });
+        if (agent) userId = agent.userId;
+      }
+    }
+    if (!userId && actorEmail) {
+      const userByEmail = await this.prisma.user.findFirst({
+        where: { email: { equals: actorEmail, mode: 'insensitive' } },
+      });
+      if (userByEmail) userId = userByEmail.id;
+    }
+    if (!userId) {
+      const fallbackUser = await this.prisma.user.findFirst({
+        where: { role: 'SUPER_ADMIN' },
+      });
+      if (fallbackUser) userId = fallbackUser.id;
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const updatedLead = await tx.lead.update({
+        where: { id: dto.leadId },
+        data: {
+          unitId: destUnitId,
+          assignedAgentId: null, // Reset unit agent assignment upon cross-unit transfer
+        },
+      });
+
+      const audit = await tx.leadTransferAudit.create({
+        data: {
+          leadId: dto.leadId,
+          sourceUnitId: preview.sourceUnit?.id || null,
+          destUnitId: destUnitId,
+          transferredById: userId!,
+          reason: dto.reason || 'Authorized Super Admin cross-unit transfer',
+          preserveHistory: dto.preserveHistory !== false,
+          metadata: {
+            actorEmail,
+            sourceUnitCode: preview.sourceUnit?.code || 'UNASSIGNED',
+            destUnitCode: preview.destUnit.code,
+            timestamp: new Date().toISOString(),
+          },
+        },
+      });
+
+      await tx.adminAuditLog.create({
+        data: {
+          actorEmail,
+          action: 'LEAD_CROSS_UNIT_TRANSFER',
+          resource: 'LEAD',
+          resourceId: dto.leadId,
+          outcome: 'SUCCESS',
+          details: {
+            leadId: dto.leadId,
+            sourceUnit: preview.sourceUnit?.code || 'UNASSIGNED',
+            destUnit: preview.destUnit.code,
+            reason: dto.reason,
+            auditId: audit.id,
+          },
+        },
+      });
+
+      return {
+        success: true,
+        leadId: updatedLead.id,
+        customerName: updatedLead.customerName,
+        sourceUnitId: preview.sourceUnit?.id || null,
+        destUnitId: dto.destUnitId,
+        auditId: audit.id,
+        transferredAt: audit.createdAt,
+      };
+    });
+  }
+
+  async getTransferAudits(leadId?: string, limit = 50) {
+    const where: any = {};
+    if (leadId) where.leadId = leadId;
+
+    return this.prisma.leadTransferAudit.findMany({
+      where,
+      take: Math.min(limit, 100),
+      orderBy: { createdAt: 'desc' },
+      include: {
+        lead: { select: { id: true, customerName: true, phoneNumber: true } },
+        sourceUnit: { select: { id: true, code: true, name: true } },
+        destUnit: { select: { id: true, code: true, name: true } },
+        transferredBy: { select: { email: true, role: true } },
+      },
+    });
+  }
 }
+

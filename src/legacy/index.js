@@ -2087,8 +2087,12 @@ app.post('/api/v1/calls/:sid/transfer', requireAuth, async (req, res) => {
   try {
     console.log(`[Telephony] Transferring call ${sid} to agent ${targetAgentId || targetQueue}`);
 
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const isUuid = UUID_REGEX.test(sid);
     const session = await prisma.callSession.findFirst({
-      where: { OR: [{ id: sid }, { reason: sid }] },
+      where: isUuid
+        ? { OR: [{ id: sid }, { reason: sid }, { livekitRoom: sid }] }
+        : { OR: [{ reason: sid }, { livekitRoom: sid }] },
       include: { participants: true }
     });
 
@@ -2169,22 +2173,44 @@ app.post('/api/v1/calls/:sid/transfer', requireAuth, async (req, res) => {
 // FEEDBACK API
 // ==========================================
 app.post('/api/v1/feedback', requireAuth, async (req, res) => {
-  const { callSid, csatScore, tags, notes, feedbackText, customerId: reqCustomerId } = req.body;
+  const {
+    callSid,
+    csatScore = 3,
+    tags,
+    notes,
+    feedbackText,
+    customerId: reqCustomerId,
+    outcome = 'COMPLETED',
+    followupDate,
+    leadId: reqLeadId
+  } = req.body;
   const agentId = req.user?.agentId || req.user?.userId;
 
   if (!callSid) {
     return res.status(400).json({ success: false, error: 'callSid is required' });
   }
-  if (typeof csatScore !== 'number' || csatScore < 1 || csatScore > 5) {
+
+  const numericCsat = Number(csatScore);
+  if (isNaN(numericCsat) || numericCsat < 1 || numericCsat > 5) {
     return res.status(400).json({ success: false, error: 'csatScore must be a number between 1 and 5' });
   }
 
-  try {
-    console.log(`Feedback received for call ${callSid} by Agent ${agentId}: CSAT ${csatScore}, Tags: ${Array.isArray(tags) ? tags.join(',') : ''}`);
+  const VALID_OUTCOMES = ['COMPLETED', 'UNANSWERED', 'BUSY', 'FAILED', 'CANCELLED'];
+  const normalizedOutcome = VALID_OUTCOMES.includes(String(outcome).toUpperCase())
+    ? String(outcome).toUpperCase()
+    : 'COMPLETED';
 
-    let customerId = reqCustomerId || null;
+  try {
+    console.log(`Feedback received for call ${callSid} by Agent ${agentId}: Outcome ${normalizedOutcome}, CSAT ${numericCsat}, Tags: ${Array.isArray(tags) ? tags.join(',') : ''}`);
+
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const isCallSidUuid = UUID_REGEX.test(callSid);
+
+    let customerId = (reqCustomerId && UUID_REGEX.test(reqCustomerId)) ? reqCustomerId : null;
     let resolvedSession = await prisma.callSession.findFirst({
-      where: { OR: [{ id: callSid }, { reason: callSid }] }
+      where: isCallSidUuid
+        ? { OR: [{ id: callSid }, { reason: callSid }, { livekitRoom: callSid }] }
+        : { OR: [{ reason: callSid }, { livekitRoom: callSid }] }
     });
 
     if (resolvedSession && !customerId) {
@@ -2193,7 +2219,9 @@ app.post('/api/v1/feedback', requireAuth, async (req, res) => {
 
     if (!customerId) {
       const callLog = await prisma.callLog.findFirst({
-        where: { OR: [{ id: callSid }, { vobizCallSid: callSid }] }
+        where: isCallSidUuid
+          ? { OR: [{ id: callSid }, { vobizCallSid: callSid }] }
+          : { vobizCallSid: callSid }
       });
       if (callLog) {
         customerId = callLog.customerId;
@@ -2204,6 +2232,31 @@ app.post('/api/v1/feedback', requireAuth, async (req, res) => {
       return res.status(404).json({ success: false, error: 'Call session or customer not found for feedback submission' });
     }
 
+    // Lead matching logic
+    let matchedLead = null;
+    if (reqLeadId && UUID_REGEX.test(reqLeadId)) {
+      matchedLead = await prisma.lead.findUnique({ where: { id: reqLeadId } });
+    }
+
+    // If not found by explicit leadId, attempt match by phone
+    if (!matchedLead && resolvedSession) {
+      const candidatePhone = resolvedSession.callerNumber || (resolvedSession.metadata && resolvedSession.metadata.to);
+      if (candidatePhone) {
+        const cleanPhone = String(candidatePhone).replace(/[^\d]/g, '');
+        const last10 = cleanPhone.slice(-10);
+        if (last10.length === 10) {
+          matchedLead = await prisma.lead.findFirst({
+            where: {
+              OR: [
+                { phoneNumber: { contains: last10 } },
+                { phoneNumber: candidatePhone }
+              ]
+            }
+          });
+        }
+      }
+    }
+
     let createdNote = null;
     if (customerId) {
       const customerExists = await prisma.customer.findUnique({ where: { id: customerId } });
@@ -2211,11 +2264,45 @@ app.post('/api/v1/feedback', requireAuth, async (req, res) => {
         const noteContent = feedbackText || notes || 'None';
         createdNote = await prisma.customerNote.create({
           data: {
-            content: `Post-Call Feedback: CSAT: ${csatScore}/5. Notes: ${noteContent}. Tags: ${Array.isArray(tags) ? tags.join(', ') : ''}`,
+            content: `Post-Call Disposition [${normalizedOutcome}]: CSAT: ${numericCsat}/5. Notes: ${noteContent}. Tags: ${Array.isArray(tags) ? tags.join(', ') : ''}`,
             customerId,
-            createdBy: agentId || null
+            createdBy: (agentId && UUID_REGEX.test(agentId)) ? agentId : null
           }
         });
+      }
+    }
+
+    // Update Lead timeline and schedule followup if requested
+    let createdFollowup = null;
+    if (matchedLead) {
+      const noteContent = feedbackText || notes || '';
+      const outcomeNote = `\n[Call Disposition: ${normalizedOutcome} | ${new Date().toLocaleDateString()}]: CSAT ${numericCsat}/5, Tags: ${(Array.isArray(tags) ? tags : []).join(', ')}. ${noteContent}`;
+      const newNotes = matchedLead.notes ? (matchedLead.notes + outcomeNote).substring(0, 3000) : outcomeNote.substring(0, 3000);
+
+      await prisma.lead.update({
+        where: { id: matchedLead.id },
+        data: {
+          notes: newNotes,
+          updatedAt: new Date()
+        }
+      });
+
+      if (followupDate && agentId && UUID_REGEX.test(agentId)) {
+        try {
+          createdFollowup = await prisma.leadFollowup.create({
+            data: {
+              leadId: matchedLead.id,
+              assignedAgentId: agentId,
+              followupDate: new Date(followupDate),
+              meetingType: 'CALLBACK',
+              purpose: notes || `Post-call callback (${normalizedOutcome})`,
+              notes: `Disposition: ${normalizedOutcome}, CSAT: ${numericCsat}`,
+              status: 'PENDING'
+            }
+          });
+        } catch (fErr) {
+          console.warn('[Feedback] Could not create LeadFollowup:', fErr.message);
+        }
       }
     }
 
@@ -2224,11 +2311,14 @@ app.post('/api/v1/feedback', requireAuth, async (req, res) => {
         ? resolvedSession.transferHistory
         : {};
       th.feedback = {
-        score: csatScore,
-        csatScore,
+        outcome: normalizedOutcome,
+        score: numericCsat,
+        csatScore: numericCsat,
         text: feedbackText || notes || '',
         notes: notes || feedbackText || '',
         tags: Array.isArray(tags) ? tags : [],
+        leadId: matchedLead?.id || null,
+        followupId: createdFollowup?.id || null,
         submittedAt: new Date().toISOString(),
         submittedBy: agentId || req.user?.id
       };
@@ -2241,8 +2331,11 @@ app.post('/api/v1/feedback', requireAuth, async (req, res) => {
     res.json({
       success: true,
       callSid,
-      csatScore,
-      noteId: createdNote?.id || null
+      outcome: normalizedOutcome,
+      csatScore: numericCsat,
+      noteId: createdNote?.id || null,
+      matchedLeadId: matchedLead?.id || null,
+      followupId: createdFollowup?.id || null
     });
   } catch (err) {
     console.error('[Feedback API Error]:', err);

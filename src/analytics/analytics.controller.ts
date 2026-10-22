@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Param, Logger, Req, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query, Logger, Req, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AnalyticsService } from './analytics.service';
 
@@ -145,10 +145,18 @@ export class AnalyticsController {
     const user = req?.user;
     const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
 
-    const session = await this.prisma.callSession.findUnique({
-      where: { id: callId },
-      include: { participants: true },
-    });
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const isUuid = UUID_REGEX.test(callId);
+
+    const session = isUuid
+      ? await this.prisma.callSession.findUnique({
+          where: { id: callId },
+          include: { participants: true },
+        })
+      : await this.prisma.callSession.findFirst({
+          where: { OR: [{ reason: callId }, { livekitRoom: callId }] },
+          include: { participants: true },
+        });
 
     if (!session) {
       throw new NotFoundException('Call session not found');
@@ -166,9 +174,128 @@ export class AnalyticsController {
       }
     }
 
-    this.logger.log(`[AI-AUDIT] Explicit reprocess requested for callId=${callId} by user=${user?.userId || user?.sub}`);
-    const result = await this.analyticsService.generateCallSummary(callId);
+    this.logger.log(`[AI-AUDIT] Explicit reprocess requested for callId=${session.id} by user=${user?.userId || user?.sub}`);
+    const result = await this.analyticsService.generateCallSummary(session.id);
     return { success: true, result };
+  }
+
+  @Post('repair-pending')
+  async repairPendingSummaries(@Query('limit') limit?: string, @Req() req?: any) {
+    const user = req?.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER'].includes(user.role);
+    if (!isElevated) {
+      throw new ForbiddenException('Forbidden: Only elevated administrators can run summary repair');
+    }
+    const batchSize = limit ? parseInt(limit, 10) : 3;
+    const result = await this.analyticsService.repairPendingSummaries(batchSize);
+    return { success: true, ...result };
+  }
+
+  @Get('ai-usage')
+  async getAiUsageMetrics(
+    @Query('period') period?: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+    @Req() req?: any,
+  ) {
+    const where: any = {};
+
+    let fromDate: Date | null = null;
+    let toDate: Date = new Date();
+
+    if (startDate) {
+      fromDate = new Date(startDate);
+    } else if (period === 'today') {
+      fromDate = new Date();
+      fromDate.setHours(0, 0, 0, 0);
+    } else if (period === '7d') {
+      fromDate = new Date(Date.now() - 7 * 24 * 3600 * 1000);
+    } else if (period === '30d') {
+      fromDate = new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    }
+
+    if (endDate) {
+      toDate = new Date(endDate);
+    }
+
+    if (fromDate) {
+      where.createdAt = {
+        gte: fromDate,
+        lte: toDate,
+      };
+    }
+
+    const records = await (this.prisma as any).aiUsageRecord.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 1000,
+    }).catch(() => []);
+
+    let totalPromptTokens = 0;
+    let totalCandidateTokens = 0;
+    let totalTokens = 0;
+    let totalAudioSeconds = 0;
+    let totalEstimatedCost = 0;
+
+    const byModel: Record<string, { requests: number; promptTokens: number; candidateTokens: number; totalTokens: number; estimatedCost: number }> = {};
+    const byFeature: Record<string, { requests: number; promptTokens: number; candidateTokens: number; totalTokens: number; estimatedCost: number }> = {};
+
+    for (const r of records) {
+      totalPromptTokens += r.promptTokens || 0;
+      totalCandidateTokens += r.candidateTokens || 0;
+      totalTokens += r.totalTokens || 0;
+      totalAudioSeconds += r.audioSeconds || 0;
+      totalEstimatedCost += r.estimatedCost || 0;
+
+      const m = r.model || 'unknown';
+      if (!byModel[m]) byModel[m] = { requests: 0, promptTokens: 0, candidateTokens: 0, totalTokens: 0, estimatedCost: 0 };
+      byModel[m].requests++;
+      byModel[m].promptTokens += r.promptTokens || 0;
+      byModel[m].candidateTokens += r.candidateTokens || 0;
+      byModel[m].totalTokens += r.totalTokens || 0;
+      byModel[m].estimatedCost += r.estimatedCost || 0;
+
+      const f = r.feature || 'general';
+      if (!byFeature[f]) byFeature[f] = { requests: 0, promptTokens: 0, candidateTokens: 0, totalTokens: 0, estimatedCost: 0 };
+      byFeature[f].requests++;
+      byFeature[f].promptTokens += r.promptTokens || 0;
+      byFeature[f].candidateTokens += r.candidateTokens || 0;
+      byFeature[f].totalTokens += r.totalTokens || 0;
+      byFeature[f].estimatedCost += r.estimatedCost || 0;
+    }
+
+    const pricingConfig = {
+      version: '2026-v1',
+      provider: 'Google Gemini',
+      models: {
+        'gemini-3.5-flash': { inputPer1M: 0.075, outputPer1M: 0.30 },
+        'gemini-3.8-flash': { inputPer1M: 0.075, outputPer1M: 0.30 },
+      },
+      note: 'Costs estimated from provider-reported prompt & candidate tokens using published pricing schedules.'
+    };
+
+    return {
+      success: true,
+      period: period || 'all',
+      range: {
+        from: fromDate?.toISOString() || null,
+        to: toDate.toISOString(),
+      },
+      summary: {
+        totalRequests: records.length,
+        totalPromptTokens,
+        totalCandidateTokens,
+        totalTokens,
+        totalAudioSeconds,
+        totalAudioMinutes: (totalAudioSeconds / 60).toFixed(1),
+        estimatedCostUsd: Number(totalEstimatedCost.toFixed(6)),
+        costType: 'ESTIMATED',
+        authoritativeLiveCredits: null,
+      },
+      byModel,
+      byFeature,
+      pricingConfig,
+    };
   }
 
   private static inFlightRawMetrics: Promise<any> | null = null;

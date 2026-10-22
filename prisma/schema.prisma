@@ -123,6 +123,7 @@ model User {
   uploadedLeads Lead[] @relation("UploadedLeads")
   leadUploads   LeadUploadHistory[] @relation("LeadUploads")
   unitMemberships UnitMembership[]
+  leadTransfers   LeadTransferAudit[]
 }
 
 model Agent {
@@ -589,6 +590,7 @@ model CallSession {
   recordings     CallRecording[]
   analytics      CallAnalytics?
   appointments   Appointment[]
+  aiUsageRecords AiUsageRecord[]
 
   @@index([status])
   @@index([startedAt])
@@ -761,14 +763,19 @@ model Lead {
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
 
+  unitId            String?     @db.Uuid
+  unit              BusinessUnit? @relation(fields: [unitId], references: [id], onDelete: SetNull)
+
   followups         LeadFollowup[]
   conversionLogs    LeadConversionLog[]
   notifications     LeadNotification[]
   appointments      Appointment[]
   submissions       WebsiteLeadSubmission[]
+  transferAudits    LeadTransferAudit[]
 
   @@index([status])
   @@index([assignedAgentId])
+  @@index([unitId])
   @@index([createdAt])
 }
 
@@ -876,6 +883,10 @@ model BusinessUnit {
 
   memberships     UnitMembership[]
   integrations    IntegrationConfiguration[]
+  leads           Lead[]
+  transfersFrom   LeadTransferAudit[] @relation("TransferSourceUnit")
+  transfersTo     LeadTransferAudit[] @relation("TransferDestUnit")
+  aiUsageRecords  AiUsageRecord[]
 
   @@index([status])
   @@index([code])
@@ -933,5 +944,52 @@ model AdminAuditLog {
   @@index([actorEmail])
   @@index([action])
   @@index([resource])
+  @@index([createdAt])
+}
+
+model LeadTransferAudit {
+  id              String        @id @default(uuid()) @db.Uuid
+  leadId          String        @db.Uuid
+  lead            Lead          @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  sourceUnitId    String?       @db.Uuid
+  sourceUnit      BusinessUnit? @relation("TransferSourceUnit", fields: [sourceUnitId], references: [id], onDelete: SetNull)
+  destUnitId      String        @db.Uuid
+  destUnit        BusinessUnit  @relation("TransferDestUnit", fields: [destUnitId], references: [id], onDelete: Cascade)
+  transferredById String?       @db.Uuid
+  transferredBy   User?         @relation(fields: [transferredById], references: [id], onDelete: SetNull)
+  reason          String?
+  preserveHistory Boolean       @default(true)
+  metadata        Json?
+  createdAt       DateTime      @default(now())
+
+  @@index([leadId])
+  @@index([sourceUnitId])
+  @@index([destUnitId])
+  @@index([transferredById])
+  @@index([createdAt])
+}
+
+model AiUsageRecord {
+  id              String        @id @default(uuid()) @db.Uuid
+  callSessionId   String?       @db.Uuid
+  callSession     CallSession?  @relation(fields: [callSessionId], references: [id], onDelete: SetNull)
+  unitId          String?       @db.Uuid
+  unit            BusinessUnit? @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  provider        String        @default("gemini")
+  model           String
+  feature         String        // 'call_summary', 'transcription', 'sentiment'
+  promptTokens    Int           @default(0)
+  candidateTokens Int           @default(0)
+  totalTokens     Int           @default(0)
+  audioSeconds    Int?          @default(0)
+  estimatedCost   Float         @default(0)
+  measuredCost    Float?
+  metadata        Json?
+  createdAt       DateTime      @default(now())
+
+  @@index([callSessionId])
+  @@index([unitId])
+  @@index([feature])
+  @@index([model])
   @@index([createdAt])
 }

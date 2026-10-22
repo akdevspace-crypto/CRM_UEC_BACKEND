@@ -140,14 +140,17 @@ export class TelephonyController {
   @Get('calls/:callId/playback-url')
   async getCallPlaybackUrl(@Param('callId') callId: string, @Req() req: any, @Res() res: Response) {
     const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    if (!UUID_REGEX.test(callId)) {
-      return res.status(404).json({ success: false, error: 'Invalid call ID' });
-    }
+    const isUuid = UUID_REGEX.test(callId);
 
-    const sessionData = await this.prisma.callSession.findUnique({
-      where: { id: callId },
-      include: { participants: true },
-    });
+    const sessionData = isUuid
+      ? await this.prisma.callSession.findUnique({
+          where: { id: callId },
+          include: { participants: true },
+        })
+      : await this.prisma.callSession.findFirst({
+          where: { OR: [{ reason: callId }, { livekitRoom: callId }] },
+          include: { participants: true },
+        });
 
     if (!sessionData) {
       return res.status(404).json({ success: false, error: 'Call session not found' });
@@ -208,14 +211,17 @@ export class TelephonyController {
   @Get('calls/:callId/recording')
   async getCallRecording(@Param('callId') callId: string, @Req() req: any, @Res() res: Response) {
     const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    if (!UUID_REGEX.test(callId)) {
-      return res.status(404).send('Recording not ready or call not found');
-    }
+    const isUuid = UUID_REGEX.test(callId);
 
-    const sessionData = await this.prisma.callSession.findUnique({
-      where: { id: callId },
-      include: { participants: true },
-    });
+    const sessionData = isUuid
+      ? await this.prisma.callSession.findUnique({
+          where: { id: callId },
+          include: { participants: true },
+        })
+      : await this.prisma.callSession.findFirst({
+          where: { OR: [{ reason: callId }, { livekitRoom: callId }] },
+          include: { participants: true },
+        });
 
     if (!sessionData) {
       return res.status(404).send('Recording not ready or call not found');
@@ -226,7 +232,7 @@ export class TelephonyController {
     const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
 
     // If a call-scoped token is used, strictly enforce call matching
-    if (user?.callId && user.callId !== callId) {
+    if (user?.callId && user.callId !== sessionData.id && user.callId !== sessionData.reason && user.callId !== sessionData.livekitRoom) {
       this.logger.warn(`[SECURITY] Cross-call token mismatch attempt: token callId=${user.callId} vs requested=${callId}`);
       return res.status(403).json({ error: 'Forbidden: Playback token is invalid for this call' });
     }

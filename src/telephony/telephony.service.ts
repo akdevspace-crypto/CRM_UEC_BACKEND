@@ -245,10 +245,11 @@ export class TelephonyService {
   }
 
   async startLivekitRecording(callSid: string, roomName: string) {
+    let callSession: any = null;
     try {
       this.logger.log(`[CALL-RECORDING] provider=livekit_egress callId=${callSid} roomName=${roomName}`);
       const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(callSid);
-      const callSession = await this.prisma.callSession.findFirst({
+      callSession = await this.prisma.callSession.findFirst({
         where: {
           OR: [
             { livekitRoom: roomName },
@@ -303,6 +304,10 @@ export class TelephonyService {
       this.logger.log(`[CALL-RECORDING] event=EGRESS_STARTED callId=${callSid} roomName=${roomName} egressId=${egressId}`);
     } catch (e: any) {
       this.logger.error(`[CALL-RECORDING] START failed: ${e.message}`);
+      await this.prisma.callSession.update({
+        where: { id: callSession.id },
+        data: { recordingStatus: 'FAILED' }
+      }).catch(() => {});
     }
   }
 
@@ -377,7 +382,18 @@ export class TelephonyService {
           this.processEgress(latestSession.livekitEgressId, latestSession.id, latestSession.livekitRoom || callSid).catch(console.error);
         } catch (e: any) {
           this.logger.error(`[CALL-RECORDING] Failed to stop egress: ${e.message}`);
+          this.triggerPostCallPipeline(latestSession, null).catch(console.error);
         }
+      } else if (finalStatus === 'ENDED' && finalDuration > 0) {
+        // No egress was started or start failed, but call finished:
+        if (!latestSession.recordingStatus || latestSession.recordingStatus === 'PENDING') {
+          await this.prisma.callSession.update({
+            where: { id: latestSession.id },
+            data: { recordingStatus: 'NOT_AVAILABLE' }
+          }).catch(() => {});
+        }
+        this.logger.log(`[CALL-RECORDING] No active egress for callId=${latestSession.id}. Triggering AI pipeline directly.`);
+        this.triggerPostCallPipeline(latestSession, null).catch(console.error);
       }
 
       this.logger.log(`[CALL-LIFECYCLE] ` + JSON.stringify({
@@ -416,7 +432,12 @@ export class TelephonyService {
   }
 
   async getCallSessionRecordingUrl(callId: string): Promise<string | null> {
-    const session = await this.prisma.callSession.findUnique({ where: { id: callId } });
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const isUuid = UUID_REGEX.test(callId);
+    const session = isUuid
+      ? await this.prisma.callSession.findUnique({ where: { id: callId } })
+      : await this.prisma.callSession.findFirst({ where: { OR: [{ reason: callId }, { livekitRoom: callId }] } });
+
     if (!session) {
       this.logger.log(`[CALL-RECORDING] event=PLAYBACK_LOOKUP callId=${callId} found=false`);
       return null;
@@ -995,7 +1016,7 @@ export class TelephonyService {
     };
   }
 
-  private async triggerPostCallPipeline(session: any, recordingUrl: string) {
+  public async triggerPostCallPipeline(session: any, recordingUrl: string | null = null) {
     this.logger.log(`Starting post-call AI pipeline for session ${session.id}`);
 
     // Trigger real AI summary using the Call Session ID

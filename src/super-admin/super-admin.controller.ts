@@ -129,4 +129,43 @@ export class SuperAdminController {
     const take = limit ? parseInt(limit, 10) : 50;
     return this.superAdminService.getAuditLogs(take);
   }
+
+  /**
+   * Phase 1 & 2: Cross-Unit Lead Transfer Endpoints
+   */
+  @Get('leads/search')
+  @Roles('SUPER_ADMIN')
+  async searchLeadsForTransfer(
+    @Query('query') query?: string,
+    @Query('sourceUnitId') sourceUnitId?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const take = limit ? parseInt(limit, 10) : 20;
+    return this.superAdminService.searchLeadsForTransfer(query, sourceUnitId, take);
+  }
+
+  @Post('leads/transfer/preview')
+  @Roles('SUPER_ADMIN')
+  async previewLeadTransfer(@Body() body: any) {
+    return this.superAdminService.previewLeadTransfer(body);
+  }
+
+  @Post('leads/transfer')
+  @Roles('SUPER_ADMIN')
+  async transferLead(@Body() body: any, @Req() req: any) {
+    const actorEmail = req.user?.email || 'super_admin@eldercare.com';
+    const actorUserId = req.user?.userId || req.user?.id || req.user?.sub;
+    return this.superAdminService.transferLead(body, actorEmail, actorUserId);
+  }
+
+  @Get('leads/transfers')
+  @Roles('SUPER_ADMIN')
+  async getTransferAudits(
+    @Query('leadId') leadId?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const take = limit ? parseInt(limit, 10) : 50;
+    return this.superAdminService.getTransferAudits(leadId, take);
+  }
 }
+
