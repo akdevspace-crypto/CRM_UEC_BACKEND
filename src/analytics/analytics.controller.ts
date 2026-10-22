@@ -614,8 +614,20 @@ export class AnalyticsController {
   async getAgentDashboardData(@Req() req: any) {
     const user = req?.user;
     const now = new Date();
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
-    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    const parts = formatter.formatToParts(now);
+    const year = parseInt(parts.find((p) => p.type === 'year')!.value, 10);
+    const month = parseInt(parts.find((p) => p.type === 'month')!.value, 10) - 1;
+    const day = parseInt(parts.find((p) => p.type === 'day')!.value, 10);
+
+    const istOffsetMs = (5 * 60 + 30) * 60 * 1000;
+    const startOfToday = new Date(Date.UTC(year, month, day, 0, 0, 0, 0) - istOffsetMs);
+    const endOfToday = new Date(Date.UTC(year, month, day, 23, 59, 59, 999) - istOffsetMs);
 
     let agent: any = null;
     if (user?.agentId) {
