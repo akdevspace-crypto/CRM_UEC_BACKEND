@@ -137,6 +137,74 @@ export class TelephonyController {
     return `${protocol}://${host}`;
   }
 
+  @Get('calls/:callId/playback-url')
+  async getCallPlaybackUrl(@Param('callId') callId: string, @Req() req: any, @Res() res: Response) {
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!UUID_REGEX.test(callId)) {
+      return res.status(404).json({ success: false, error: 'Invalid call ID' });
+    }
+
+    const sessionData = await this.prisma.callSession.findUnique({
+      where: { id: callId },
+      include: { participants: true },
+    });
+
+    if (!sessionData) {
+      return res.status(404).json({ success: false, error: 'Call session not found' });
+    }
+
+    const user = req.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+    if (!isElevated) {
+      const isCaller = sessionData.callerUserId === user?.userId || sessionData.callerUserId === user?.id || sessionData.callerUserId === user?.sub;
+      const isCallee = sessionData.calleeUserId === user?.userId || sessionData.calleeUserId === user?.id || sessionData.calleeUserId === user?.sub;
+      const isParticipant = sessionData.participants?.some(
+        (p: any) => p.agentId === user?.agentId || p.agentId === user?.userId || p.agentId === user?.id || p.agentId === user?.sub
+      );
+
+      if (!isCaller && !isCallee && !isParticipant) {
+        return res.status(403).json({ success: false, error: 'Forbidden: You do not have permission to access this call recording' });
+      }
+    }
+
+    const recordingStatus = sessionData.recordingStatus || (sessionData.recordingUrl ? 'READY' : 'NOT_AVAILABLE');
+    if (recordingStatus !== 'READY') {
+      return res.json({
+        success: false,
+        callId: sessionData.id,
+        recordingStatus,
+        recordingUrl: null,
+        duration: sessionData.recordingDuration || sessionData.duration || 0,
+        message: `Recording status is ${recordingStatus}`,
+      });
+    }
+
+    const jwt = require('jsonwebtoken');
+    const jwtSecret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
+    const token = jwt.sign(
+      {
+        sub: user?.userId || user?.id || user?.sub || 'anonymous',
+        userId: user?.userId || user?.id || user?.sub || 'anonymous',
+        role: user?.role || 'AGENT',
+        callId: sessionData.id,
+      },
+      jwtSecret,
+      { expiresIn: '2h' }
+    );
+
+    const baseUrl = this.getBaseUrl(req);
+    const recordingUrl = `${baseUrl}/telephony/calls/${sessionData.id}/recording?token=${token}`;
+
+    return res.json({
+      success: true,
+      callId: sessionData.id,
+      recordingStatus: 'READY',
+      recordingUrl,
+      duration: sessionData.recordingDuration || sessionData.duration || 0,
+      expiresIn: 7200,
+    });
+  }
+
   @Get('calls/:callId/recording')
   async getCallRecording(@Param('callId') callId: string, @Req() req: any, @Res() res: Response) {
     const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -156,14 +224,22 @@ export class TelephonyController {
     // Role and Resource-level Authorization (Phase 6)
     const user = req.user;
     const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+
+    // If a call-scoped token is used, strictly enforce call matching
+    if (user?.callId && user.callId !== callId) {
+      this.logger.warn(`[SECURITY] Cross-call token mismatch attempt: token callId=${user.callId} vs requested=${callId}`);
+      return res.status(403).json({ error: 'Forbidden: Playback token is invalid for this call' });
+    }
+
     if (!isElevated) {
+      const isCallScopedToken = user?.callId && user.callId === callId;
       const isCaller = sessionData.callerUserId === user?.userId || sessionData.callerUserId === user?.id || sessionData.callerUserId === user?.sub;
       const isCallee = sessionData.calleeUserId === user?.userId || sessionData.calleeUserId === user?.id || sessionData.calleeUserId === user?.sub;
       const isParticipant = sessionData.participants?.some(
         (p: any) => p.agentId === user?.agentId || p.agentId === user?.userId || p.agentId === user?.id || p.agentId === user?.sub
       );
 
-      if (!isCaller && !isCallee && !isParticipant) {
+      if (!isCallScopedToken && !isCaller && !isCallee && !isParticipant) {
         this.logger.warn(`[SECURITY] Unauthorized recording playback attempt for callId=${callId} by user=${user?.userId || user?.sub}`);
         return res.status(403).json({ error: 'Forbidden: You do not have permission to access this call recording' });
       }
@@ -183,12 +259,22 @@ export class TelephonyController {
 
       const audioRes = await fetch(session, { headers: fetchHeaders });
       if (!audioRes.ok && audioRes.status !== 206) {
+        if (audioRes.status === 416) {
+          res.status(416);
+          const cr = audioRes.headers.get('content-range');
+          if (cr) res.setHeader('Content-Range', cr);
+          return res.send('Requested Range Not Satisfiable');
+        }
         this.logger.error(`[CALL-RECORDING] Upstream storage fetch failed with status=${audioRes.status}`);
         return res.status(502).json({ error: 'Failed to retrieve media from storage' });
       }
 
       res.status(audioRes.status);
-      res.setHeader('Content-Type', 'audio/mp4');
+      const upstreamContentType = audioRes.headers.get('content-type');
+      const finalContentType = (upstreamContentType && !upstreamContentType.includes('mp4'))
+        ? upstreamContentType
+        : (sessionData.recordingMimeType || 'audio/mp4');
+      res.setHeader('Content-Type', finalContentType);
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       res.setHeader('Access-Control-Allow-Origin', '*');

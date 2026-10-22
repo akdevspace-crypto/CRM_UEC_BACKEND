@@ -427,7 +427,7 @@ export class TelephonyService {
     if (session.recordingStatus !== 'READY') return null;
 
     if (session.recordingStoragePath) {
-      const supabaseUrl = process.env.SUPABASE_URL || 'https://aws-1-ap-southeast-1.pooler.supabase.com';
+      const supabaseUrl = process.env.SUPABASE_URL || 'https://ftrwxsubjepdxssfuzls.supabase.co';
       const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || 'dummy_key';
       const { createClient } = require('@supabase/supabase-js');
       const supabase = createClient(supabaseUrl, supabaseKey);

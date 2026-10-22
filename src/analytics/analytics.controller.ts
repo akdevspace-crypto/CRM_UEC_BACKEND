@@ -66,31 +66,78 @@ export class AnalyticsController {
       }
     });
 
-    return analytics.map((a: any) => ({
-      id: a.id,
-      callSession: {
-        customer: {
-          name: a.callSession?.customer?.name,
-          phone: a.callSession?.customer?.phone
+    const jwt = require('jsonwebtoken');
+    const jwtSecret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
+
+    const forwardedHost = req?.headers?.['x-forwarded-host'];
+    const host = Array.isArray(forwardedHost) ? forwardedHost[0] : (forwardedHost || (req?.get ? req.get('host') : null) || 'crm-uec-backend.onrender.com');
+    const protocol = req?.headers?.['x-forwarded-proto'] || req?.protocol || 'https';
+    const baseUrl = process.env.BACKEND_PUBLIC_URL || `${protocol}://${host}`;
+
+    return analytics.map((a: any) => {
+      const callSession = a.callSession;
+      const callId = callSession?.id || a.callSessionId;
+      const recordingStatus = callSession?.recordingStatus || (callSession?.recordingUrl ? 'READY' : 'NOT_AVAILABLE');
+      const recordingDuration = callSession?.recordingDuration || callSession?.duration || a.duration || 0;
+
+      let tokenQuery = '';
+      if (callId && user && (user.userId || user.id || user.sub)) {
+        try {
+          const token = jwt.sign(
+            {
+              sub: user.userId || user.id || user.sub,
+              userId: user.userId || user.id || user.sub,
+              role: user.role,
+              callId: callId,
+            },
+            jwtSecret,
+            { expiresIn: '2h' }
+          );
+          tokenQuery = `?token=${token}`;
+        } catch (_) {}
+      }
+
+      const recordingUrl = (recordingStatus === 'READY' && callId)
+        ? `${baseUrl}/telephony/calls/${callId}/recording${tokenQuery}`
+        : (callSession?.recordingUrl || null);
+
+      return {
+        id: a.id,
+        callSessionId: callId,
+        callId: callId,
+        callSession: {
+          id: callId,
+          customer: {
+            name: callSession?.customer?.name,
+            phone: callSession?.customer?.phone,
+          },
+          participants: [
+            {
+              agent: {
+                name: callSession?.caller?.agentProfile?.name || callSession?.callee?.agentProfile?.name || 'Agent',
+              },
+            },
+          ],
+          duration: callSession?.duration || 0,
+          recordingStatus,
+          recordingUrl,
+          recordingDuration,
         },
-        participants: [
-          {
-            agent: {
-              name: a.callSession?.caller?.agentProfile?.name || a.callSession?.callee?.agentProfile?.name || 'Agent'
-            }
-          }
-        ],
-        duration: a.callSession?.duration
-      },
-      summary: a.summary,
-      sentimentScore: a.sentimentScore,
-      sentiment: a.sentimentScore ? (a.sentimentScore > 7 ? 'Positive' : a.sentimentScore < 4 ? 'Negative' : 'Neutral') : 'Neutral',
-      customerIntent: 'General Inquiry',
-      detectedLanguage: 'English',
-      createdAt: a.createdAt,
-      actionItems: [],
-      followUpRecommendation: 'Review call details to determine next steps.'
-    }));
+        recordingStatus,
+        recordingUrl,
+        recordingDuration,
+        summary: a.summary,
+        sentimentScore: a.sentimentScore || 5,
+        sentiment: a.sentiment || (a.sentimentScore ? (a.sentimentScore > 7 ? 'Positive' : a.sentimentScore < 4 ? 'Negative' : 'Neutral') : 'Neutral'),
+        customerIntent: a.callOutcome || 'General Inquiry',
+        detectedLanguage: a.language || 'English',
+        originalTranscript: a.transcript || null,
+        englishTranslation: a.transcript || null,
+        createdAt: a.createdAt,
+        actionItems: [],
+        followUpRecommendation: 'Review call details to determine next steps.',
+      };
+    });
   }
 
   @Post('calls/:callId/reprocess')
