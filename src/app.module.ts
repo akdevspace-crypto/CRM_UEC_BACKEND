@@ -25,6 +25,7 @@ import { WebsiteLeadsModule } from './webhooks/leads/website-leads.module';
 import { SuperAdminModule } from './super-admin/super-admin.module';
 import { SopModule } from './sop/sop.module';
 import { EnquiryModule } from './enquiry/enquiry.module';
+import { DeduplicationModule } from './deduplication/deduplication.module';
 
 const getRedisConnectionOptions = () => {
   const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
@@ -75,6 +76,7 @@ const getRedisConnectionOptions = () => {
     SuperAdminModule,
     SopModule,
     EnquiryModule,
+    DeduplicationModule,
   ],
   controllers: [AppController],
   providers: [

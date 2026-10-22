@@ -1,4 +1,4 @@
-import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
+import { Injectable, Logger, Inject, forwardRef, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
@@ -506,14 +506,62 @@ export class TelephonyService {
     return { queuedCalls, missedCalls, activeCalls };
   }
 
-  async getCallHistory(user?: any) {
-    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
-    const whereClause: any = { status: { in: ['ENDED', 'MISSED', 'REJECTED'] } };
+  // Helper to get date boundaries for groupings
+  private getDateBoundaries() {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
 
+    const startOfYesterday = new Date(startOfToday.getTime() - 24 * 3600 * 1000);
+    const endOfYesterday = new Date(startOfToday.getTime() - 1);
+
+    const dayOfWeek = now.getDay();
+    const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+    const startOfThisWeek = new Date(startOfToday.getTime() - daysSinceMonday * 24 * 3600 * 1000);
+    const endOfEarlierThisWeek = new Date(startOfYesterday.getTime() - 1);
+
+    const startOfPreviousWeeks = new Date(startOfThisWeek.getTime() - 21 * 24 * 3600 * 1000);
+    const endOfPreviousWeeks = new Date(startOfThisWeek.getTime() - 1);
+
+    return {
+      now,
+      startOfToday,
+      endOfToday,
+      startOfYesterday,
+      endOfYesterday,
+      startOfThisWeek,
+      endOfEarlierThisWeek,
+      startOfPreviousWeeks,
+      endOfPreviousWeeks,
+    };
+  }
+
+  private getGroupKeyForDate(date: Date, boundaries: any): 'today' | 'yesterday' | 'earlierThisWeek' | 'previousWeeks' | 'older' {
+    const time = date.getTime();
+    if (time >= boundaries.startOfToday.getTime()) return 'today';
+    if (time >= boundaries.startOfYesterday.getTime()) return 'yesterday';
+    if (time >= boundaries.startOfThisWeek.getTime()) return 'earlierThisWeek';
+    if (time >= boundaries.startOfPreviousWeeks.getTime()) return 'previousWeeks';
+    return 'older';
+  }
+
+  async getComprehensiveCallHistory(query: any = {}, user?: any) {
+    const boundaries = this.getDateBoundaries();
+    const page = Math.max(parseInt(query.page || '1', 10), 1);
+    const limit = Math.min(Math.max(parseInt(query.limit || '20', 10), 1), 100);
+    const skip = (page - 1) * limit;
+    const group = query.group || 'all';
+
+    const isSuperAdmin = user?.role === 'SUPER_ADMIN';
+    const isElevated = isSuperAdmin || ['ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user?.role);
+
+    const where: any = {};
+
+    // 1. Role Scope / Super Admin Cross-Unit Access
     if (!isElevated && user) {
-      whereClause.OR = [
-        { callerUserId: user.userId },
-        { calleeUserId: user.userId },
+      where.OR = [
+        { callerUserId: user.userId || user.id },
+        { calleeUserId: user.userId || user.id },
         {
           participants: {
             some: {
@@ -525,29 +573,153 @@ export class TelephonyService {
           }
         }
       ];
+    } else if (user && user.unitId && !isSuperAdmin) {
+      where.OR = [
+        { customer: { isNot: null } },
+        { lead: { unitId: user.unitId } }
+      ];
     }
 
-    const records = await this.prisma.callSession.findMany({
-      where: whereClause,
-      orderBy: { startedAt: 'desc' },
-      take: 50,
-      include: {
-        customer: { select: { name: true, phone: true } },
-        conversation: { select: { aiSummary: true } }
-      },
-    });
+    // 2. Date / Group Filter
+    if (query.startDate || query.endDate) {
+      where.createdAt = {};
+      if (query.startDate) where.createdAt.gte = new Date(query.startDate);
+      if (query.endDate) where.createdAt.lte = new Date(query.endDate);
+    } else if (group !== 'all') {
+      if (group === 'today') {
+        where.createdAt = { gte: boundaries.startOfToday, lte: boundaries.endOfToday };
+      } else if (group === 'yesterday') {
+        where.createdAt = { gte: boundaries.startOfYesterday, lte: boundaries.endOfYesterday };
+      } else if (group === 'earlierThisWeek' || group === 'earlier_this_week') {
+        where.createdAt = { gte: boundaries.startOfThisWeek, lte: boundaries.endOfEarlierThisWeek };
+      } else if (group === 'previousWeeks' || group === 'previous_weeks') {
+        where.createdAt = { gte: boundaries.startOfPreviousWeeks, lte: boundaries.endOfPreviousWeeks };
+      } else if (group === 'older') {
+        where.createdAt = { lt: boundaries.startOfPreviousWeeks };
+      }
+    }
+
+    // 3. Search Filter
+    if (query.search && query.search.trim()) {
+      const s = query.search.trim();
+      where.AND = where.AND || [];
+      where.AND.push({
+        OR: [
+          { reason: { contains: s, mode: 'insensitive' } },
+          { livekitRoom: { contains: s, mode: 'insensitive' } },
+          { customer: { name: { contains: s, mode: 'insensitive' } } },
+          { customer: { phone: { contains: s } } },
+          { lead: { customerName: { contains: s, mode: 'insensitive' } } },
+          { lead: { phoneNumber: { contains: s } } },
+        ]
+      });
+    }
+
+    // 4. Specific Filters
+    if (query.agentId) {
+      where.participants = {
+        some: {
+          agentId: query.agentId,
+          role: 'AGENT'
+        }
+      };
+    }
+
+    if (query.direction) {
+      const dir = query.direction.toUpperCase();
+      if (dir === 'OUTBOUND') {
+        where.reason = { startsWith: 'call_outbound_' };
+      } else if (dir === 'INBOUND') {
+        where.NOT = { reason: { startsWith: 'call_outbound_' } };
+      }
+    }
+
+    if (query.status) {
+      where.status = query.status;
+    }
+
+    if (query.durationMin != null || query.durationMax != null) {
+      where.duration = {};
+      if (query.durationMin != null) where.duration.gte = parseInt(query.durationMin, 10);
+      if (query.durationMax != null) where.duration.lte = parseInt(query.durationMax, 10);
+    }
+
+    if (query.leadId) {
+      where.leadId = query.leadId;
+    }
+
+    if (query.recordingAvailable === 'true') {
+      where.recordingStatus = 'READY';
+    } else if (query.recordingAvailable === 'false') {
+      where.recordingStatus = { not: 'READY' };
+    }
+
+    if (query.transferStatus === 'TRANSFERRED') {
+      where.transferAudits = { some: {} };
+    } else if (query.transferStatus === 'NOT_TRANSFERRED') {
+      where.transferAudits = { none: {} };
+    }
+
+    // 5. Query DB with pagination and relations
+    const [total, records, todayCount, yesterdayCount, earlierCount, prevWeeksCount, olderCount] = await Promise.all([
+      this.prisma.callSession.count({ where }),
+      this.prisma.callSession.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+        include: {
+          customer: { select: { id: true, name: true, phone: true } },
+          lead: {
+            select: {
+              id: true,
+              customerName: true,
+              phoneNumber: true,
+              priority: true,
+              status: true,
+              foundation: true,
+              primaryService: true,
+              isAmbulanceEmergency: true,
+            }
+          },
+          caller: { select: { id: true, email: true, agentProfile: { select: { id: true, name: true, department: true } } } },
+          callee: { select: { id: true, email: true, agentProfile: { select: { id: true, name: true, department: true } } } },
+          participants: {
+            orderBy: { joinedAt: 'asc' },
+          },
+          transferAudits: {
+            orderBy: { createdAt: 'desc' },
+            include: {
+              initiatingAgent: { select: { id: true, name: true, department: true } },
+              destinationAgent: { select: { id: true, name: true, department: true } },
+            }
+          },
+          analytics: true,
+          conversation: {
+            select: {
+              aiSummary: true
+            }
+          }
+        }
+      }),
+      this.prisma.callSession.count({ where: { ...where, createdAt: { gte: boundaries.startOfToday, lte: boundaries.endOfToday } } }),
+      this.prisma.callSession.count({ where: { ...where, createdAt: { gte: boundaries.startOfYesterday, lte: boundaries.endOfYesterday } } }),
+      this.prisma.callSession.count({ where: { ...where, createdAt: { gte: boundaries.startOfThisWeek, lte: boundaries.endOfEarlierThisWeek } } }),
+      this.prisma.callSession.count({ where: { ...where, createdAt: { gte: boundaries.startOfPreviousWeeks, lte: boundaries.endOfPreviousWeeks } } }),
+      this.prisma.callSession.count({ where: { ...where, createdAt: { lt: boundaries.startOfPreviousWeeks } } }),
+    ]);
 
     const jwt = require('jsonwebtoken');
     const jwtSecret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
     const baseUrl = process.env.BASE_URL || 'https://crm-uec-backend.onrender.com';
 
-    return records.map(r => {
-      // Find summary if conversation has one attached
+    const calls = await Promise.all(records.map(async (r) => {
       const summaryObj = r.conversation?.aiSummary;
-      const aiSummary = summaryObj ? Array.isArray(summaryObj) ? summaryObj[0] : summaryObj : null;
+      const aiSummary = summaryObj ? (Array.isArray(summaryObj) ? summaryObj[0] : summaryObj) : null;
+      const analytics = r.analytics;
 
       let tokenQuery = '';
-      if (user && (user.userId || user.id || user.sub)) {
+      if (r.recordingStatus === 'READY' && user && (user.userId || user.id || user.sub)) {
         try {
           const token = jwt.sign(
             {
@@ -563,21 +735,672 @@ export class TelephonyService {
         } catch (_) {}
       }
 
+      const firstAgentPart = r.participants.find(p => p.role === 'AGENT');
+      let handlingAgentName = 'Unassigned';
+      let handlingAgentId = firstAgentPart?.agentId || null;
+      let department = 'General';
+
+      if (firstAgentPart?.agentId) {
+        const ag = await this.prisma.agent.findUnique({
+          where: { id: firstAgentPart.agentId },
+          select: { name: true, department: true }
+        });
+        if (ag) {
+          handlingAgentName = ag.name;
+          department = ag.department || 'General';
+        }
+      } else if (r.caller?.agentProfile) {
+        handlingAgentName = r.caller.agentProfile.name;
+        handlingAgentId = r.caller.agentProfile.id;
+        department = r.caller.agentProfile.department || 'General';
+      }
+
+      const isOutbound = r.reason?.startsWith('call_outbound_') || (r.transferHistory as any)?.direction === 'outbound';
+      const callDate = r.startedAt || r.createdAt;
+      const groupKey = this.getGroupKeyForDate(callDate, boundaries);
+
+      const totalDuration = r.duration || 0;
+      const connectedDuration = r.endedAt && r.startedAt
+        ? Math.max(Math.round((r.endedAt.getTime() - r.startedAt.getTime()) / 1000), 0)
+        : totalDuration;
+
+      const intakeData = (r.intakeForm as any) || {};
+
       return {
         id: r.id,
-        callSid: r.reason,
-        customerName: r.customer?.name || r.customer?.phone || 'Unknown',
-        duration: r.duration || 0,
-        direction: r.reason?.startsWith('call_outbound_') ? 'OUTBOUND' : 'INBOUND',
-        timestamp: r.startedAt ? r.startedAt.toISOString() : r.createdAt.toISOString(),
-        recordingUrl: r.recordingStatus === 'READY' ? `${baseUrl}/telephony/calls/${r.id}/recording${tokenQuery}` : (r.recordingUrl || null),
-        recordingStatus: r.recordingStatus || 'NOT_AVAILABLE',
-        aiProcessingStatus: r.aiProcessingStatus || 'PENDING',
+        callSid: r.reason || r.id,
+        providerCallId: (r.transferHistory as any)?.providerCallUUID || r.reason || r.id,
+        livekitRoom: r.livekitRoom,
+        callerName: r.customer?.name || r.lead?.customerName || (isOutbound ? 'Agent' : 'Unknown Caller'),
+        callerPhone: r.customer?.phone || r.lead?.phoneNumber || (r.transferHistory as any)?.phone || 'Unknown',
+        leadId: r.lead?.id || r.leadId || null,
+        leadName: r.lead?.customerName || null,
+        direction: isOutbound ? 'OUTBOUND' : 'INBOUND',
+        startedAt: r.startedAt ? r.startedAt.toISOString() : r.createdAt.toISOString(),
+        endedAt: r.endedAt ? r.endedAt.toISOString() : null,
+        duration: totalDuration,
+        connectedDuration,
         status: r.status,
-        summary: aiSummary?.summary || null,
-        sentiment: aiSummary?.sentiment || null,
+        handlingAgent: { id: handlingAgentId, name: handlingAgentName },
+        originalAgent: r.caller?.agentProfile || { id: handlingAgentId, name: handlingAgentName },
+        department,
+        isTransferred: (r.transferAudits?.length || 0) > 0,
+        transferCount: r.transferAudits?.length || 0,
+        transfers: r.transferAudits,
+        recordingStatus: r.recordingStatus || 'NOT_AVAILABLE',
+        recordingUrl: r.recordingStatus === 'READY' ? `${baseUrl}/telephony/calls/${r.id}/recording${tokenQuery}` : null,
+        recordingDuration: r.recordingDuration || totalDuration,
+        disposition: intakeData.callOutcome || analytics?.callOutcome || (r.status === 'MISSED' ? 'Missed Call' : 'Completed'),
+        priority: r.lead?.isAmbulanceEmergency ? 'EMERGENCY' : (r.lead?.priority || 'NORMAL'),
+        summary: analytics?.summary || aiSummary?.summaryText || (r.liveNotes as any)?.notes || null,
+        sentiment: analytics?.sentiment || aiSummary?.sentimentScore || null,
+        groupKey,
       };
+    }));
+
+    return {
+      calls,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit) || 1,
+      },
+      groupCounts: {
+        today: todayCount,
+        yesterday: yesterdayCount,
+        earlierThisWeek: earlierCount,
+        previousWeeks: prevWeeksCount,
+        older: olderCount,
+      },
+      summary: {
+        totalCalls: total,
+        connectedCalls: calls.filter(c => c.status === 'CONNECTED' || c.status === 'ENDED').length,
+        missedCalls: calls.filter(c => c.status === 'MISSED').length,
+      }
+    };
+  }
+
+  async getCallRecordDetail(callId: string, user?: any) {
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const isUuid = UUID_REGEX.test(callId);
+
+    const session = isUuid
+      ? await this.prisma.callSession.findUnique({
+          where: { id: callId },
+          include: {
+            customer: true,
+            lead: {
+              include: {
+                followups: { orderBy: { followupDate: 'desc' }, take: 3 },
+                assignedAgent: true,
+              }
+            },
+            caller: { include: { agentProfile: true } },
+            callee: { include: { agentProfile: true } },
+            participants: true,
+            transferAudits: {
+              include: {
+                initiatingAgent: true,
+                destinationAgent: true,
+              },
+              orderBy: { createdAt: 'asc' }
+            },
+            analytics: true,
+            conversation: { include: { aiSummary: true } },
+            appointments: true,
+          }
+        })
+      : await this.prisma.callSession.findFirst({
+          where: { OR: [{ reason: callId }, { livekitRoom: callId }] },
+          include: {
+            customer: true,
+            lead: {
+              include: {
+                followups: { orderBy: { followupDate: 'desc' }, take: 3 },
+                assignedAgent: true,
+              }
+            },
+            caller: { include: { agentProfile: true } },
+            callee: { include: { agentProfile: true } },
+            participants: true,
+            transferAudits: {
+              include: {
+                initiatingAgent: true,
+                destinationAgent: true,
+              },
+              orderBy: { createdAt: 'asc' }
+            },
+            analytics: true,
+            conversation: { include: { aiSummary: true } },
+            appointments: true,
+          }
+        });
+
+    if (!session) {
+      throw new NotFoundException(`Call record not found for ID: ${callId}`);
+    }
+
+    const isSuperAdmin = user?.role === 'SUPER_ADMIN';
+    const isElevated = isSuperAdmin || ['ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user?.role);
+    if (!isElevated && user) {
+      const isCaller = session.callerUserId === user.userId || session.callerUserId === user.id;
+      const isCallee = session.calleeUserId === user.userId || session.calleeUserId === user.id;
+      const isParticipant = session.participants?.some(p => p.agentId === user.agentId || p.agentId === user.id);
+      if (!isCaller && !isCallee && !isParticipant) {
+        throw new ForbiddenException('Forbidden: You do not have permission to view this call record');
+      }
+    }
+
+    const jwt = require('jsonwebtoken');
+    const jwtSecret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
+    const baseUrl = process.env.BASE_URL || 'https://crm-uec-backend.onrender.com';
+    let tokenQuery = '';
+    if (session.recordingStatus === 'READY' && user && (user.userId || user.id || user.sub)) {
+      try {
+        const token = jwt.sign(
+          {
+            sub: user.userId || user.id || user.sub,
+            userId: user.userId || user.id || user.sub,
+            role: user.role,
+            callId: session.id,
+          },
+          jwtSecret,
+          { expiresIn: '2h' }
+        );
+        tokenQuery = `?token=${token}`;
+      } catch (_) {}
+    }
+
+    const intake = (session.intakeForm as any) || {};
+    const liveNotes = (session.liveNotes as any) || {};
+    const isOutbound = session.reason?.startsWith('call_outbound_') || (session.transferHistory as any)?.direction === 'outbound';
+
+    const timelineEvents: Array<{
+      id: string;
+      title: string;
+      type: string;
+      timestamp: string;
+      description: string;
+      actor?: string;
+    }> = [];
+
+    timelineEvents.push({
+      id: 'event-initiated',
+      title: 'Call Initiated',
+      type: 'INITIATED',
+      timestamp: (session.startedAt || session.createdAt).toISOString(),
+      description: `${isOutbound ? 'Outbound call started' : 'Inbound call received'} via ${session.livekitRoom ? 'LiveKit SIP' : 'Telephony'}`,
+      actor: isOutbound ? (session.caller?.agentProfile?.name || 'Agent') : (session.customer?.name || 'Customer'),
     });
+
+    timelineEvents.push({
+      id: 'event-ringing',
+      title: 'Call Ringing',
+      type: 'RINGING',
+      timestamp: session.createdAt.toISOString(),
+      description: 'Call dispatched to agents queue',
+      actor: 'System',
+    });
+
+    if (session.participants && session.participants.length > 0) {
+      const firstJoin = session.participants[0];
+      timelineEvents.push({
+        id: 'event-answered',
+        title: 'Call Answered & Connected',
+        type: 'ANSWERED',
+        timestamp: firstJoin.joinedAt.toISOString(),
+        description: 'Agent joined room and audio stream connected',
+        actor: session.caller?.agentProfile?.name || session.callee?.agentProfile?.name || 'Agent',
+      });
+    }
+
+    for (const tr of session.transferAudits) {
+      timelineEvents.push({
+        id: `event-transfer-init-${tr.id}`,
+        title: `Call Transfer Initiated (${tr.transferMode})`,
+        type: 'TRANSFER_INITIATED',
+        timestamp: tr.initiatedAt.toISOString(),
+        description: `Transfer from ${tr.sourceDepartment || 'Agent'} to ${tr.destDepartment || 'Department'}${tr.reason ? `: ${tr.reason}` : ''}`,
+        actor: tr.initiatingAgent?.name || 'Agent',
+      });
+
+      if (tr.completedAt) {
+        timelineEvents.push({
+          id: `event-transfer-comp-${tr.id}`,
+          title: `Transfer ${tr.status}`,
+          type: `TRANSFER_${tr.status}`,
+          timestamp: tr.completedAt.toISOString(),
+          description: tr.status === 'COMPLETED'
+            ? `Successfully transferred to ${tr.destinationAgent?.name || 'Destination Agent'}`
+            : `Transfer failed/cancelled: ${tr.failureReason || 'Not completed'}`,
+          actor: tr.destinationAgent?.name || 'System',
+        });
+      }
+    }
+
+    if (session.endedAt) {
+      timelineEvents.push({
+        id: 'event-ended',
+        title: 'Call Ended',
+        type: 'ENDED',
+        timestamp: session.endedAt.toISOString(),
+        description: `Call duration: ${session.duration || 0} seconds with final status ${session.status}`,
+        actor: 'Telephony',
+      });
+    }
+
+    if (session.recordingStatus && session.recordingStatus !== 'NOT_AVAILABLE') {
+      timelineEvents.push({
+        id: 'event-recording',
+        title: `Recording ${session.recordingStatus}`,
+        type: 'RECORDING',
+        timestamp: (session.recordingCompletedAt || session.endedAt || session.createdAt).toISOString(),
+        description: session.recordingStatus === 'READY'
+          ? `Audio recording stored (${session.recordingDuration || session.duration || 0}s, ${session.recordingMimeType || 'audio/mp4'})`
+          : `Recording state: ${session.recordingStatus}`,
+        actor: 'Egress / LiveKit',
+      });
+    }
+
+    if (session.analytics?.createdAt) {
+      timelineEvents.push({
+        id: 'event-ai-summary',
+        title: 'AI Summary Generated',
+        type: 'AI_SUMMARY',
+        timestamp: session.analytics.createdAt.toISOString(),
+        description: session.analytics.summary
+          ? `Analysis complete: Sentiment=${session.analytics.sentiment || 'Neutral'}`
+          : 'AI processing complete',
+        actor: 'Gemini AI Engine',
+      });
+    }
+
+    if (session.lead?.followups && session.lead.followups.length > 0) {
+      const fu = session.lead.followups[0];
+      timelineEvents.push({
+        id: `event-followup-${fu.id}`,
+        title: 'Follow-up Scheduled',
+        type: 'FOLLOW_UP',
+        timestamp: fu.createdAt.toISOString(),
+        description: `Callback scheduled for ${fu.followupDate.toISOString().split('T')[0]} (${fu.meetingType})`,
+        actor: session.lead.assignedAgent?.name || 'Agent',
+      });
+    }
+
+    timelineEvents.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    return {
+      overview: {
+        id: session.id,
+        providerCallId: (session.transferHistory as any)?.providerCallUUID || session.reason || session.id,
+        livekitRoom: session.livekitRoom,
+        direction: isOutbound ? 'OUTBOUND' : 'INBOUND',
+        status: session.status,
+        duration: session.duration || 0,
+        holdDuration: session.holdDuration || 0,
+        startedAt: session.startedAt?.toISOString() || session.createdAt.toISOString(),
+        endedAt: session.endedAt?.toISOString() || null,
+        caller: {
+          name: session.customer?.name || session.lead?.customerName || (isOutbound ? 'Agent' : 'Unknown'),
+          phone: session.customer?.phone || session.lead?.phoneNumber || 'Unknown',
+        },
+        recipient: {
+          name: isOutbound ? (session.customer?.name || session.lead?.customerName || 'Customer') : (session.caller?.agentProfile?.name || 'Call Center'),
+          phone: isOutbound ? (session.customer?.phone || session.lead?.phoneNumber || 'Unknown') : 'Inbound Line',
+        },
+        lead: session.lead ? {
+          id: session.lead.id,
+          name: session.lead.customerName,
+          phone: session.lead.phoneNumber,
+          priority: session.lead.priority,
+          status: session.lead.status,
+          foundation: session.lead.foundation,
+          primaryService: session.lead.primaryService,
+          isAmbulanceEmergency: session.lead.isAmbulanceEmergency,
+        } : null,
+        handlingAgent: session.caller?.agentProfile || session.callee?.agentProfile || null,
+        transfers: session.transferAudits,
+      },
+      recording: {
+        status: session.recordingStatus || 'NOT_AVAILABLE',
+        url: session.recordingStatus === 'READY' ? `${baseUrl}/telephony/calls/${session.id}/recording${tokenQuery}` : null,
+        duration: session.recordingDuration || session.duration || 0,
+        mimeType: session.recordingMimeType || 'audio/mp4',
+        fileSize: session.recordingFileSize || null,
+        failureReason: session.recordingStatus === 'FAILED' ? 'Audio stream capture or egress failed' : null,
+      },
+      aiSummary: {
+        summaryText: session.analytics?.summary || (session.conversation?.aiSummary as any)?.summaryText || null,
+        sentiment: session.analytics?.sentiment || (session.conversation?.aiSummary as any)?.sentimentScore || 'NEUTRAL',
+        riskLevel: (session.conversation?.aiSummary as any)?.riskLevel || 'LOW',
+        language: session.analytics?.language || 'en-IN',
+        isTranscriptDerived: Boolean(session.analytics?.transcript || session.analytics?.aiHandling),
+        transcript: session.analytics?.transcript || null,
+      },
+      notesAndDisposition: {
+        agentNotes: liveNotes.notes || intake.notes || null,
+        intakeForm: intake,
+        callOutcome: intake.callOutcome || session.analytics?.callOutcome || (session.status === 'MISSED' ? 'MISSED' : 'COMPLETED'),
+        csatScore: intake.csatScore || 5,
+        followupDate: session.lead?.followups?.[0]?.followupDate?.toISOString() || null,
+        callbackStatus: session.lead?.followups?.[0]?.status || 'NONE',
+      },
+      timeline: timelineEvents,
+    };
+  }
+
+  async getDepartmentsAndAgents() {
+    const departments = await this.prisma.department.findMany({
+      include: {
+        agents: {
+          where: { isDeleted: false },
+          select: {
+            id: true,
+            name: true,
+            department: true,
+            status: true,
+            activeCalls: true,
+            extension: true,
+            skills: true,
+          }
+        }
+      }
+    });
+
+    const allActiveAgents = await this.prisma.agent.findMany({
+      where: { isDeleted: false },
+      select: {
+        id: true,
+        name: true,
+        department: true,
+        status: true,
+        activeCalls: true,
+        extension: true,
+        skills: true,
+      }
+    });
+
+    return {
+      departments: departments.map(d => ({
+        id: d.id,
+        name: d.name,
+        description: d.description,
+        agents: d.agents,
+        totalAgents: d.agents.length,
+        availableAgents: d.agents.filter(a => a.status === 'AVAILABLE').length,
+      })),
+      allAgents: allActiveAgents,
+    };
+  }
+
+  async initiateCallTransfer(callSid: string, body: any, user: any) {
+    this.logger.log(`[CALL-TRANSFER] Initiating transfer for callSid=${callSid} by user=${user?.userId || user?.sub}`);
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const isUuid = UUID_REGEX.test(callSid);
+
+    const session = isUuid
+      ? await this.prisma.callSession.findUnique({
+          where: { id: callSid },
+          include: { customer: true, lead: true, participants: true }
+        })
+      : await this.prisma.callSession.findFirst({
+          where: { OR: [{ reason: callSid }, { livekitRoom: callSid }] },
+          include: { customer: true, lead: true, participants: true }
+        });
+
+    if (!session) {
+      throw new NotFoundException(`Call session not found: ${callSid}`);
+    }
+
+    let initiatingAgent = null;
+    if (user?.agentId) {
+      initiatingAgent = await this.prisma.agent.findUnique({ where: { id: user.agentId } });
+    }
+    if (!initiatingAgent && (user?.userId || user?.id || user?.sub)) {
+      initiatingAgent = await this.prisma.agent.findFirst({
+        where: { userId: user.userId || user.id || user.sub }
+      });
+    }
+    const firstAgentParticipant = session.participants.find(p => p.role === 'AGENT' && p.agentId);
+    if (!initiatingAgent && firstAgentParticipant?.agentId) {
+      initiatingAgent = await this.prisma.agent.findUnique({
+        where: { id: firstAgentParticipant.agentId }
+      });
+    }
+
+    if (!initiatingAgent) {
+      throw new BadRequestException('Initiating agent profile could not be resolved');
+    }
+
+    const { destinationDepartment, destinationAgentId, transferMode = 'BLIND', reason } = body;
+
+    let destinationAgent = null;
+    if (destinationAgentId) {
+      destinationAgent = await this.prisma.agent.findUnique({ where: { id: destinationAgentId } });
+    } else if (destinationDepartment) {
+      destinationAgent = await this.prisma.agent.findFirst({
+        where: {
+          department: { contains: destinationDepartment, mode: 'insensitive' },
+          status: 'AVAILABLE',
+          isDeleted: false,
+        }
+      });
+    }
+
+    if (!destinationAgent) {
+      throw new BadRequestException(`No available agent found for department "${destinationDepartment || 'Requested'}"`);
+    }
+
+    const roomName = session.livekitRoom || `room_${session.id}`;
+    let destToken = '';
+    try {
+      destToken = await this.livekitService.generateAgentToken(roomName, destinationAgent.name);
+    } catch (e) {
+      this.logger.warn(`Could not generate LiveKit token for transfer: ${e.message}`);
+    }
+
+    const transferAudit = await this.prisma.callTransferAudit.create({
+      data: {
+        callSessionId: session.id,
+        initiatingAgentId: initiatingAgent.id,
+        destinationAgentId: destinationAgent.id,
+        sourceDepartment: initiatingAgent.department || 'General',
+        destDepartment: destinationDepartment || destinationAgent.department || 'General',
+        transferMode: transferMode === 'ATTENDED' ? 'ATTENDED' : 'BLIND',
+        status: transferMode === 'ATTENDED' ? 'CONSULTING' : 'INITIATED',
+        reason: reason || 'Live Call Transfer',
+        metadata: {
+          roomName,
+          customerPhone: session.customer?.phone || session.lead?.phoneNumber,
+          customerName: session.customer?.name || session.lead?.customerName,
+        }
+      },
+      include: {
+        initiatingAgent: { select: { id: true, name: true, department: true } },
+        destinationAgent: { select: { id: true, name: true, department: true } },
+      }
+    });
+
+    if (destinationAgent.socketId) {
+      this.telephonyGateway.server.to(destinationAgent.socketId).emit('incoming_call', {
+        callSid: session.reason || session.id,
+        roomName,
+        caller: session.customer?.phone || session.lead?.phoneNumber || 'Customer',
+        phone: session.customer?.phone || session.lead?.phoneNumber || 'Customer',
+        customerName: session.customer?.name || session.lead?.customerName || 'Customer',
+        isTransfer: true,
+        transferAuditId: transferAudit.id,
+        transferMode,
+        transferReason: reason,
+        sourceAgent: {
+          id: initiatingAgent.id,
+          name: initiatingAgent.name,
+          department: initiatingAgent.department,
+        },
+        token: destToken,
+      });
+    } else {
+      this.telephonyGateway.server.emit('incoming_call_transfer', {
+        destinationAgentId: destinationAgent.id,
+        destinationDepartment: destinationAgent.department,
+        callSid: session.reason || session.id,
+        roomName,
+        token: destToken,
+        transferAuditId: transferAudit.id,
+      });
+    }
+
+    this.telephonyGateway.server.emit('callTransferInitiated', {
+      callSessionId: session.id,
+      callSid: session.reason || session.id,
+      transferAuditId: transferAudit.id,
+      status: transferAudit.status,
+      destinationAgent: { id: destinationAgent.id, name: destinationAgent.name },
+    });
+
+    return {
+      success: true,
+      transferAudit,
+      roomName,
+      destinationAgent: {
+        id: destinationAgent.id,
+        name: destinationAgent.name,
+        department: destinationAgent.department,
+      }
+    };
+  }
+
+  async completeCallTransfer(callSid: string, body: any, user: any) {
+    this.logger.log(`[CALL-TRANSFER] Completing transfer for callSid=${callSid}`);
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const isUuid = UUID_REGEX.test(callSid);
+
+    const session = isUuid
+      ? await this.prisma.callSession.findUnique({
+          where: { id: callSid },
+          include: { transferAudits: { orderBy: { createdAt: 'desc' }, take: 1 } }
+        })
+      : await this.prisma.callSession.findFirst({
+          where: { OR: [{ reason: callSid }, { livekitRoom: callSid }] },
+          include: { transferAudits: { orderBy: { createdAt: 'desc' }, take: 1 } }
+        });
+
+    if (!session) {
+      throw new NotFoundException(`Call session not found: ${callSid}`);
+    }
+
+    const latestAudit = session.transferAudits[0];
+    if (latestAudit) {
+      await this.prisma.callTransferAudit.update({
+        where: { id: latestAudit.id },
+        data: {
+          status: 'COMPLETED',
+          completedAt: new Date(),
+        }
+      });
+
+      if (latestAudit.destinationAgentId) {
+        await this.prisma.callParticipant.create({
+          data: {
+            callSessionId: session.id,
+            agentId: latestAudit.destinationAgentId,
+            role: 'AGENT',
+            joinedAt: new Date(),
+          }
+        });
+      }
+    }
+
+    await this.prisma.callSession.update({
+      where: { id: session.id },
+      data: {
+        status: 'TRANSFERRED',
+      }
+    });
+
+    this.telephonyGateway.server.emit('callTransferCompleted', {
+      callSessionId: session.id,
+      callSid: session.reason || session.id,
+      transferAuditId: latestAudit?.id,
+    });
+
+    return { success: true, message: 'Transfer completed successfully' };
+  }
+
+  async cancelCallTransfer(callSid: string, body: any, user: any) {
+    this.logger.log(`[CALL-TRANSFER] Cancelling transfer for callSid=${callSid}`);
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const isUuid = UUID_REGEX.test(callSid);
+
+    const session = isUuid
+      ? await this.prisma.callSession.findUnique({
+          where: { id: callSid },
+          include: { transferAudits: { orderBy: { createdAt: 'desc' }, take: 1 } }
+        })
+      : await this.prisma.callSession.findFirst({
+          where: { OR: [{ reason: callSid }, { livekitRoom: callSid }] },
+          include: { transferAudits: { orderBy: { createdAt: 'desc' }, take: 1 } }
+        });
+
+    if (!session) {
+      throw new NotFoundException(`Call session not found: ${callSid}`);
+    }
+
+    const latestAudit = session.transferAudits[0];
+    if (latestAudit && latestAudit.status !== 'COMPLETED') {
+      await this.prisma.callTransferAudit.update({
+        where: { id: latestAudit.id },
+        data: {
+          status: 'CANCELLED',
+          failureReason: body?.reason || 'Cancelled by agent',
+        }
+      });
+    }
+
+    this.telephonyGateway.server.emit('callTransferCancelled', {
+      callSessionId: session.id,
+      callSid: session.reason || session.id,
+      transferAuditId: latestAudit?.id,
+    });
+
+    return { success: true, message: 'Transfer cancelled' };
+  }
+
+  async getTransferAudits(query: any = {}, user?: any) {
+    const where: any = {};
+    if (query.status) where.status = query.status;
+    if (query.department) where.destDepartment = query.department;
+    if (query.agentId) {
+      where.OR = [
+        { initiatingAgentId: query.agentId },
+        { destinationAgentId: query.agentId },
+      ];
+    }
+
+    return await this.prisma.callTransferAudit.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      include: {
+        initiatingAgent: { select: { id: true, name: true, department: true } },
+        destinationAgent: { select: { id: true, name: true, department: true } },
+        callSession: {
+          select: {
+            id: true,
+            status: true,
+            duration: true,
+            customer: { select: { name: true, phone: true } },
+            lead: { select: { customerName: true, phoneNumber: true } },
+          }
+        }
+      }
+    });
+  }
+
+  async getCallHistory(user?: any) {
+    const result = await this.getComprehensiveCallHistory({ limit: 50 }, user);
+    return result.calls;
   }
 
   async getMyRingingCall(agentId: string) {

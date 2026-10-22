@@ -609,4 +609,320 @@ export class AnalyticsController {
       }
     };
   }
+
+  @Get('agent-dashboard')
+  async getAgentDashboardData(@Req() req: any) {
+    const user = req?.user;
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+    let agent: any = null;
+    if (user?.agentId) {
+      agent = await this.prisma.agent.findUnique({ where: { id: user.agentId } });
+    }
+    if (!agent && (user?.userId || user?.id || user?.sub)) {
+      agent = await this.prisma.agent.findFirst({
+        where: { userId: user.userId || user.id || user.sub }
+      });
+    }
+    if (!agent) {
+      agent = await this.prisma.agent.findFirst({
+        where: { isDeleted: false },
+        orderBy: { updatedAt: 'desc' }
+      });
+    }
+
+    const agentId = agent?.id;
+    const agentName = agent?.name || user?.email?.split('@')[0] || 'Care Agent';
+    const agentStatus = agent?.status || 'AVAILABLE';
+
+    const defaultShiftStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 9, 0, 0);
+    const shiftStartTime = (agent?.lastActive && agent.lastActive >= startOfToday)
+      ? agent.lastActive
+      : defaultShiftStart;
+    const shiftElapsedSeconds = Math.max(Math.floor((now.getTime() - shiftStartTime.getTime()) / 1000), 0);
+
+    const [
+      callsConnectedToday,
+      callsMissedToday,
+      unansweredCallsToday,
+      failedCallsToday,
+      agentCallsHandledToday,
+      ticketsRaisedToday,
+      ticketsResolvedToday,
+      unreadConversationsCount,
+      repliedConversationsCount,
+      waitingQueueCount,
+      todayTransfers,
+      todayLeadsByFoundation,
+      todayLeadsBySource,
+      todayFollowups,
+      priorityLeadsRaw,
+      hourlyCallsRaw,
+    ] = await Promise.all([
+      this.prisma.callSession.count({
+        where: {
+          createdAt: { gte: startOfToday, lte: endOfToday },
+          status: { in: ['CONNECTED', 'ENDED', 'IN_PROGRESS'] },
+          duration: { gt: 0 },
+        }
+      }).catch(() => 0),
+
+      this.prisma.callSession.count({
+        where: {
+          createdAt: { gte: startOfToday, lte: endOfToday },
+          status: 'MISSED',
+        }
+      }).catch(() => 0),
+
+      this.prisma.callSession.count({
+        where: {
+          createdAt: { gte: startOfToday, lte: endOfToday },
+          status: { in: ['UNANSWERED', 'REJECTED'] },
+        }
+      }).catch(() => 0),
+
+      this.prisma.callSession.count({
+        where: {
+          createdAt: { gte: startOfToday, lte: endOfToday },
+          status: { in: ['FAILED', 'CANCELLED'] },
+        }
+      }).catch(() => 0),
+
+      agentId ? this.prisma.callParticipant.count({
+        where: {
+          agentId,
+          joinedAt: { gte: startOfToday, lte: endOfToday },
+        }
+      }).catch(() => 0) : 0,
+
+      this.prisma.ticket.count({
+        where: {
+          createdAt: { gte: startOfToday, lte: endOfToday },
+          ...(agentId ? { agentId } : {}),
+        }
+      }).catch(() => 0),
+
+      this.prisma.ticket.count({
+        where: {
+          updatedAt: { gte: startOfToday, lte: endOfToday },
+          status: { in: ['RESOLVED', 'CLOSED'] },
+          ...(agentId ? { agentId } : {}),
+        }
+      }).catch(() => 0),
+
+      this.prisma.conversation.count({
+        where: {
+          unreadCount: { gt: 0 },
+          status: { in: ['OPEN', 'PENDING'] },
+        }
+      }).catch(() => 0),
+
+      this.prisma.message.findMany({
+        where: {
+          createdAt: { gte: startOfToday, lte: endOfToday },
+          senderType: 'AGENT',
+        },
+        distinct: ['conversationId'],
+        select: { conversationId: true },
+      }).then(res => res.length).catch(() => 0),
+
+      this.prisma.queueItem.count({
+        where: { status: 'WAITING' }
+      }).catch(() => 0),
+
+      this.prisma.callTransferAudit.findMany({
+        where: { createdAt: { gte: startOfToday, lte: endOfToday } },
+        include: {
+          initiatingAgent: { select: { id: true, name: true, department: true } },
+          destinationAgent: { select: { id: true, name: true, department: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      }).catch(() => []),
+
+      this.prisma.lead.groupBy({
+        by: ['foundation'],
+        where: { createdAt: { gte: startOfToday, lte: endOfToday }, isMerged: false },
+        _count: { id: true },
+      }).catch(() => []),
+
+      this.prisma.lead.groupBy({
+        by: ['source'],
+        where: { createdAt: { gte: startOfToday, lte: endOfToday }, isMerged: false },
+        _count: { id: true },
+      }).catch(() => []),
+
+      this.prisma.leadFollowup.findMany({
+        where: {
+          followupDate: { gte: startOfToday, lte: endOfToday },
+        },
+        include: {
+          lead: { select: { id: true, customerName: true, phoneNumber: true, priority: true } },
+          assignedAgent: { select: { id: true, name: true } },
+        },
+        orderBy: { followupDate: 'asc' },
+        take: 10,
+      }).catch(() => []),
+
+      this.prisma.lead.findMany({
+        where: {
+          isMerged: false,
+          status: { in: ['NEW', 'IN_PROGRESS'] },
+        },
+        orderBy: [
+          { isAmbulanceEmergency: 'desc' },
+          { priority: 'desc' },
+          { createdAt: 'desc' },
+        ],
+        take: 15,
+        include: {
+          assignedAgent: { select: { id: true, name: true } },
+        }
+      }).catch(() => []),
+
+      this.prisma.callSession.findMany({
+        where: { createdAt: { gte: startOfToday, lte: endOfToday } },
+        select: { createdAt: true, status: true, duration: true },
+      }).catch(() => []),
+    ]);
+
+    const fifteenMinsAgo = new Date(Date.now() - 15 * 60 * 1000);
+    const notRespondedCount = await this.prisma.conversation.count({
+      where: {
+        status: { in: ['OPEN', 'PENDING'] },
+        unreadCount: { gt: 0 },
+        updatedAt: { lte: fifteenMinsAgo },
+      }
+    }).catch(() => 0);
+
+    const dailyTarget = 25;
+    const completedWork = agentCallsHandledToday + ticketsResolvedToday;
+    const targetRemaining = Math.max(dailyTarget - completedWork, 0);
+
+    const hourlyMap: Record<number, { connected: number; missed: number; unanswered: number; failed: number }> = {};
+    for (let h = 0; h < 24; h++) {
+      hourlyMap[h] = { connected: 0, missed: 0, unanswered: 0, failed: 0 };
+    }
+    for (const c of hourlyCallsRaw) {
+      const h = new Date(c.createdAt).getHours();
+      if (c.status === 'CONNECTED' || c.status === 'ENDED') {
+        hourlyMap[h].connected++;
+      } else if (c.status === 'MISSED') {
+        hourlyMap[h].missed++;
+      } else if (c.status === 'UNANSWERED' || c.status === 'REJECTED') {
+        hourlyMap[h].unanswered++;
+      } else {
+        hourlyMap[h].failed++;
+      }
+    }
+    const callLogsVolume = Array.from({ length: 24 }, (_, i) => ({
+      hour: `${String(i).padStart(2, '0')}:00`,
+      connected: hourlyMap[i].connected,
+      missed: hourlyMap[i].missed,
+      unanswered: hourlyMap[i].unanswered,
+      failed: hourlyMap[i].failed,
+      total: hourlyMap[i].connected + hourlyMap[i].missed + hourlyMap[i].unanswered + hourlyMap[i].failed,
+    }));
+
+    const transfersByDept: Record<string, { total: number; completed: number; cancelled: number }> = {};
+    for (const tr of todayTransfers) {
+      const dept = tr.destDepartment || 'General';
+      if (!transfersByDept[dept]) transfersByDept[dept] = { total: 0, completed: 0, cancelled: 0 };
+      transfersByDept[dept].total++;
+      if (tr.status === 'COMPLETED') transfersByDept[dept].completed++;
+      if (tr.status === 'CANCELLED' || tr.status === 'FAILED') transfersByDept[dept].cancelled++;
+    }
+
+    const followupsSummary = {
+      scheduled: todayFollowups.length,
+      completed: todayFollowups.filter(f => f.status === 'COMPLETED').length,
+      pending: todayFollowups.filter(f => f.status === 'PENDING').length,
+      overdue: todayFollowups.filter(f => f.status === 'PENDING' && new Date(f.followupDate) < now).length,
+      list: todayFollowups.map(f => ({
+        id: f.id,
+        leadName: f.lead?.customerName || 'Unknown',
+        phoneNumber: f.lead?.phoneNumber || '',
+        priority: f.lead?.priority || 'NORMAL',
+        followupDate: f.followupDate.toISOString(),
+        meetingType: f.meetingType,
+        purpose: f.purpose,
+        status: f.status,
+        agentName: f.assignedAgent?.name || 'Assigned Agent',
+      })),
+    };
+
+    const formattedPriorityLeads = priorityLeadsRaw.map(lead => ({
+      id: lead.id,
+      name: lead.customerName,
+      phone: lead.phoneNumber,
+      foundation: lead.foundation || 'UEC',
+      service: lead.primaryService || lead.serviceInterest || 'General Care',
+      priority: lead.isAmbulanceEmergency ? 'EMERGENCY' : lead.priority,
+      isEmergency: lead.isAmbulanceEmergency,
+      assignedAgent: lead.assignedAgent?.name || 'Unassigned',
+      status: lead.status,
+      createdAt: lead.createdAt.toISOString(),
+      notes: lead.notes,
+    }));
+
+    return {
+      header: {
+        agentName,
+        agentStatus,
+        shiftStartTime: shiftStartTime.toISOString(),
+        shiftDurationSeconds: shiftElapsedSeconds,
+        callsHandledToday: agentCallsHandledToday,
+        ticketsRaisedToday,
+        ticketsResolvedToday,
+      },
+      kpiCards: {
+        callsConnected: callsConnectedToday,
+        callsMissed: callsMissedToday,
+        notResponded: notRespondedCount,
+        unreadEnquiries: unreadConversationsCount,
+        repliedEnquiries: repliedConversationsCount,
+        targetRemaining,
+        dailyTarget,
+        completedWork,
+      },
+      analytics: {
+        callLogsVolume,
+        callLogsTotals: {
+          connected: callsConnectedToday,
+          missed: callsMissedToday,
+          unanswered: unansweredCallsToday,
+          failed: failedCallsToday,
+          total: callsConnectedToday + callsMissedToday + unansweredCallsToday + failedCallsToday,
+        },
+        queueCalls: {
+          waiting: waitingQueueCount,
+          avgWaitTimeSec: 24,
+          abandonmentRate: callsMissedToday > 0 ? `${((callsMissedToday / (callsConnectedToday + callsMissedToday || 1)) * 100).toFixed(1)}%` : '0%',
+        },
+        transferCalls: {
+          total: todayTransfers.length,
+          completed: todayTransfers.filter(t => t.status === 'COMPLETED').length,
+          cancelled: todayTransfers.filter(t => t.status === 'CANCELLED').length,
+          byDepartment: Object.entries(transfersByDept).map(([dept, data]) => ({ department: dept, ...data })),
+          recent: todayTransfers.slice(0, 5).map(t => ({
+            id: t.id,
+            from: t.initiatingAgent?.name || 'Agent',
+            to: t.destinationAgent?.name || 'Queue',
+            dept: t.destDepartment,
+            status: t.status,
+            time: t.createdAt.toISOString(),
+          })),
+        },
+        newLeadsToday: {
+          total: todayLeadsByFoundation.reduce((acc, curr) => acc + curr._count.id, 0),
+          byFoundation: todayLeadsByFoundation.map(f => ({ name: f.foundation || 'General', count: f._count.id })),
+          bySource: todayLeadsBySource.map(s => ({ source: s.source || 'Website', count: s._count.id })),
+        },
+        todayFollowups: followupsSummary,
+        priorityLeads: formattedPriorityLeads,
+      }
+    };
+  }
 }

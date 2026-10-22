@@ -29,8 +29,55 @@ export class TelephonyController {
   }
 
   @Get('history')
-  async getCallHistory(@Req() req: Request) {
+  async getCallHistoryLegacy(@Req() req: Request) {
     return await this.telephonyService.getCallHistory((req as any).user);
+  }
+
+  @Get('call-history')
+  async getComprehensiveCallHistory(@Req() req: Request) {
+    return await this.telephonyService.getComprehensiveCallHistory(req.query, (req as any).user);
+  }
+
+  @Get('call-history/:id')
+  async getCallRecordDetail(@Param('id') id: string, @Req() req: Request) {
+    return await this.telephonyService.getCallRecordDetail(id, (req as any).user);
+  }
+
+  @Get('departments')
+  async getDepartments() {
+    return await this.telephonyService.getDepartmentsAndAgents();
+  }
+
+  @Post('calls/:callSid/transfer/initiate')
+  async initiateCallTransfer(
+    @Param('callSid') callSid: string,
+    @Body() body: any,
+    @Req() req: Request,
+  ) {
+    return await this.telephonyService.initiateCallTransfer(callSid, body, (req as any).user);
+  }
+
+  @Post('calls/:callSid/transfer/complete')
+  async completeCallTransfer(
+    @Param('callSid') callSid: string,
+    @Body() body: any,
+    @Req() req: Request,
+  ) {
+    return await this.telephonyService.completeCallTransfer(callSid, body, (req as any).user);
+  }
+
+  @Post('calls/:callSid/transfer/cancel')
+  async cancelCallTransfer(
+    @Param('callSid') callSid: string,
+    @Body() body: any,
+    @Req() req: Request,
+  ) {
+    return await this.telephonyService.cancelCallTransfer(callSid, body, (req as any).user);
+  }
+
+  @Get('transfers')
+  async getTransferAudits(@Req() req: Request) {
+    return await this.telephonyService.getTransferAudits(req.query, (req as any).user);
   }
 
   @Get('my-ringing-call')

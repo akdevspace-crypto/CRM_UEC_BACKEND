@@ -56,6 +56,35 @@ enum CallStatus {
   ENDED
   MISSED
   REJECTED
+  CONNECTED
+  UNANSWERED
+  BUSY
+  FAILED
+  CANCELLED
+  TRANSFERRED
+}
+
+enum CallTransferStatus {
+  NOT_STARTED
+  INITIATED
+  CONSULTING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum CallTransferMode {
+  BLIND
+  ATTENDED
+}
+
+enum DuplicateMatchOutcome {
+  NO_DUPLICATE
+  POSSIBLE_DUPLICATE
+  HIGH_CONFIDENCE
+  CONFIRMED_DUPLICATE
+  MERGED
+  REJECTED
 }
 
 enum LeadStatus {
@@ -140,6 +169,8 @@ model User {
   sopExecutionsApproved SopExecution[] @relation("SopApprovedBy")
   sopApprovals          SopApproval[]
   sopAcknowledgements   SopAcknowledgement[]
+  leadDuplicateReviews  LeadDuplicateReview[] @relation("DuplicateReviews")
+  leadMerges            LeadMergeAudit[]      @relation("LeadMerges")
 }
 
 model Agent {
@@ -194,6 +225,8 @@ model Agent {
   agentFollowups      LeadFollowup[] @relation("AgentFollowups")
   agentConversionLogs LeadConversionLog[] @relation("AgentConversionLogs")
   sopAssignedExecutions SopExecution[] @relation("SopAssignedAgent")
+  initiatedTransfers  CallTransferAudit[] @relation("InitiatedTransfers")
+  receivedTransfers   CallTransferAudit[] @relation("ReceivedTransfers")
 }
 
 model Customer {
@@ -628,6 +661,7 @@ model CallSession {
   lead           Lead?         @relation(fields: [leadId], references: [id], onDelete: SetNull)
   liveNotes      Json?
   intakeForm     Json?
+  transferAudits CallTransferAudit[]
 
   @@index([status])
   @@index([startedAt])
@@ -841,12 +875,22 @@ model Lead {
   omnichannelConversation     Conversation?      @relation("OmnichannelOrigin", fields: [omnichannelConversationId], references: [id], onDelete: SetNull)
   liveNotes                   Json?
 
+  // Deduplication & Safe Merge
+  isMerged                    Boolean            @default(false)
+  mergedIntoLeadId            String?            @db.Uuid
+  mergedIntoLead              Lead?              @relation("MergedLeads", fields: [mergedIntoLeadId], references: [id], onDelete: SetNull)
+  mergedFromLeads             Lead[]             @relation("MergedLeads")
+  duplicateReviewsAsPrimary   LeadDuplicateReview[] @relation("PrimaryLeadReviews")
+  duplicateReviewsAsDuplicate LeadDuplicateReview[] @relation("DuplicateLeadReviews")
+  mergesAsPrimary             LeadMergeAudit[]   @relation("PrimaryLeadMerges")
+
   @@index([status])
   @@index([assignedAgentId])
   @@index([unitId])
   @@index([createdAt])
   @@index([foundation])
   @@index([isAmbulanceEmergency])
+  @@index([isMerged])
 }
 
 model LeadFollowup {
@@ -1377,6 +1421,76 @@ model EmergencyOverrideAudit {
 
   @@index([leadId])
   @@index([conversationId])
+  @@index([createdAt])
+}
+
+// ==========================================
+// PHASE 13: CALL TRANSFER & DEDUPLICATION AUDIT MODELS
+// ==========================================
+
+model CallTransferAudit {
+  id                  String             @id @default(uuid()) @db.Uuid
+  callSessionId       String             @db.Uuid
+  callSession         CallSession        @relation(fields: [callSessionId], references: [id], onDelete: Cascade)
+  initiatingAgentId   String             @db.Uuid
+  initiatingAgent     Agent              @relation("InitiatedTransfers", fields: [initiatingAgentId], references: [id])
+  destinationAgentId  String?            @db.Uuid
+  destinationAgent    Agent?             @relation("ReceivedTransfers", fields: [destinationAgentId], references: [id])
+  sourceDepartment    String?
+  destDepartment      String?
+  transferMode        CallTransferMode   @default(BLIND)
+  status              CallTransferStatus @default(INITIATED)
+  reason              String?
+  failureReason       String?
+  initiatedAt         DateTime           @default(now())
+  completedAt         DateTime?
+  metadata            Json?
+
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  @@index([callSessionId])
+  @@index([initiatingAgentId])
+  @@index([destinationAgentId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model LeadDuplicateReview {
+  id                String                @id @default(uuid()) @db.Uuid
+  primaryLeadId     String                @db.Uuid
+  primaryLead       Lead                  @relation("PrimaryLeadReviews", fields: [primaryLeadId], references: [id], onDelete: Cascade)
+  duplicateLeadId   String                @db.Uuid
+  duplicateLead     Lead                  @relation("DuplicateLeadReviews", fields: [duplicateLeadId], references: [id], onDelete: Cascade)
+  matchingFields    String[]              // e.g. ["phoneNumber", "email", "customerName"]
+  confidenceScore   Int                   // 0-100
+  status            DuplicateMatchOutcome @default(POSSIBLE_DUPLICATE)
+  reviewedById      String?               @db.Uuid
+  reviewedBy        User?                 @relation("DuplicateReviews", fields: [reviewedById], references: [id])
+  resolutionNotes   String?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  @@index([primaryLeadId])
+  @@index([duplicateLeadId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model LeadMergeAudit {
+  id                    String      @id @default(uuid()) @db.Uuid
+  primaryLeadId         String      @db.Uuid
+  primaryLead           Lead        @relation("PrimaryLeadMerges", fields: [primaryLeadId], references: [id], onDelete: Cascade)
+  mergedLeadId          String      @db.Uuid
+  mergedLeadSnapshot    Json        // Complete snapshot of merged lead prior to merge for recovery
+  conflictResolutions   Json?       // Details on how conflicting fields were resolved
+  mergedById            String      @db.Uuid
+  mergedBy              User        @relation("LeadMerges", fields: [mergedById], references: [id])
+  reason                String?
+  createdAt             DateTime    @default(now())
+
+  @@index([primaryLeadId])
+  @@index([mergedLeadId])
   @@index([createdAt])
 }
 

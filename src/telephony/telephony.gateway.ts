@@ -249,6 +249,51 @@ export class TelephonyGateway
     // Emit back so frontend immediately cleans up UI
     this.server.emit('callEnded', { callSid: data.callSid });
   }
+
+  @SubscribeMessage('initiateTransfer')
+  async handleInitiateTransfer(
+    @MessageBody() data: any,
+    @ConnectedSocket() client: Socket,
+  ) {
+    this.logger.log(`Transfer initiated via socket: callSid=${data.callSid} destDept=${data.destinationDepartment}`);
+    try {
+      const res = await this.telephonyService.initiateCallTransfer(data.callSid, data, (client as any).user || data.user);
+      client.emit('transfer_initiated_ack', res);
+    } catch (e: any) {
+      this.logger.error(`Failed to initiate transfer via socket: ${e.message}`);
+      client.emit('transfer_error', { message: e.message });
+    }
+  }
+
+  @SubscribeMessage('completeTransfer')
+  async handleCompleteTransfer(
+    @MessageBody() data: any,
+    @ConnectedSocket() client: Socket,
+  ) {
+    this.logger.log(`Transfer completed via socket: callSid=${data.callSid}`);
+    try {
+      const res = await this.telephonyService.completeCallTransfer(data.callSid, data, (client as any).user || data.user);
+      client.emit('transfer_completed_ack', res);
+    } catch (e: any) {
+      this.logger.error(`Failed to complete transfer via socket: ${e.message}`);
+      client.emit('transfer_error', { message: e.message });
+    }
+  }
+
+  @SubscribeMessage('cancelTransfer')
+  async handleCancelTransfer(
+    @MessageBody() data: any,
+    @ConnectedSocket() client: Socket,
+  ) {
+    this.logger.log(`Transfer cancelled via socket: callSid=${data.callSid}`);
+    try {
+      const res = await this.telephonyService.cancelCallTransfer(data.callSid, data, (client as any).user || data.user);
+      client.emit('transfer_cancelled_ack', res);
+    } catch (e: any) {
+      this.logger.error(`Failed to cancel transfer via socket: ${e.message}`);
+      client.emit('transfer_error', { message: e.message });
+    }
+  }
 }
 
 
