@@ -124,6 +124,10 @@ model User {
   leadUploads   LeadUploadHistory[] @relation("LeadUploads")
   unitMemberships UnitMembership[]
   leadTransfers   LeadTransferAudit[]
+  sopExecutionsCreated  SopExecution[] @relation("SopCreatedBy")
+  sopExecutionsApproved SopExecution[] @relation("SopApprovedBy")
+  sopApprovals          SopApproval[]
+  sopAcknowledgements   SopAcknowledgement[]
 }
 
 model Agent {
@@ -177,6 +181,7 @@ model Agent {
   assignedLeads       Lead[] @relation("AssignedLeads")
   agentFollowups      LeadFollowup[] @relation("AgentFollowups")
   agentConversionLogs LeadConversionLog[] @relation("AgentConversionLogs")
+  sopAssignedExecutions SopExecution[] @relation("SopAssignedAgent")
 }
 
 model Customer {
@@ -208,6 +213,7 @@ model Customer {
   appointments     Appointment[]
   crmTasks         CrmTask[]
   platformIdentities PlatformIdentity[]
+  sopExecutions    SopExecution[]
 
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
@@ -285,6 +291,7 @@ model Ticket {
   priority    Priority
   status      String
   resolution  String?
+  sopExecutions SopExecution[]
   
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -591,6 +598,7 @@ model CallSession {
   analytics      CallAnalytics?
   appointments   Appointment[]
   aiUsageRecords AiUsageRecord[]
+  sopExecutions  SopExecution[]
 
   @@index([status])
   @@index([startedAt])
@@ -772,6 +780,7 @@ model Lead {
   appointments      Appointment[]
   submissions       WebsiteLeadSubmission[]
   transferAudits    LeadTransferAudit[]
+  sopExecutions     SopExecution[]
 
   @@index([status])
   @@index([assignedAgentId])
@@ -887,6 +896,9 @@ model BusinessUnit {
   transfersFrom   LeadTransferAudit[] @relation("TransferSourceUnit")
   transfersTo     LeadTransferAudit[] @relation("TransferDestUnit")
   aiUsageRecords  AiUsageRecord[]
+  sopTemplates    SopTemplate[]
+  sopExecutions   SopExecution[]
+  sopDocuments    SopDocument[]
 
   @@index([status])
   @@index([code])
@@ -991,5 +1003,282 @@ model AiUsageRecord {
   @@index([unitId])
   @@index([feature])
   @@index([model])
+  @@index([createdAt])
+}
+
+// ==========================================
+// SOP & DAILY OPERATIONS WORKFLOW ENGINE
+// ==========================================
+
+enum SopDepartment {
+  HR
+  CCR
+  SALES
+  DATA_ENTRY
+  GENERAL
+}
+
+enum SopPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum SopExecutionStatus {
+  DRAFT
+  ASSIGNED
+  IN_PROGRESS
+  PENDING_APPROVAL
+  COMPLETED
+  BLOCKED
+  OVERDUE
+  CANCELLED
+}
+
+enum SopTemplateStatus {
+  DRAFT
+  PUBLISHED
+  RETIRED
+}
+
+enum SopRecurrence {
+  NONE
+  DAILY
+  WEEKLY
+  MONTHLY
+  SHIFT_START
+  SHIFT_END
+  EVENT_TRIGGERED
+}
+
+enum SopApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model SopTemplate {
+  id               String            @id @default(uuid()) @db.Uuid
+  code             String            @unique
+  title            String
+  description      String?
+  department       SopDepartment
+  category         String
+  priority         SopPriority       @default(NORMAL)
+  recurrence       SopRecurrence     @default(NONE)
+  unitId           String?           @db.Uuid
+  unit             BusinessUnit?     @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  requiresApproval Boolean           @default(false)
+  escalationHours  Int?              @default(24)
+  isActive         Boolean           @default(true)
+  isArchived       Boolean           @default(false)
+  createdById      String?           @db.Uuid
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  versions         SopTemplateVersion[]
+  executions       SopExecution[]
+
+  @@index([department])
+  @@index([category])
+  @@index([unitId])
+  @@index([isActive])
+}
+
+model SopTemplateVersion {
+  id               String            @id @default(uuid()) @db.Uuid
+  templateId       String            @db.Uuid
+  template         SopTemplate       @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  versionNumber    Int               @default(1)
+  status           SopTemplateStatus @default(DRAFT)
+  changelog        String?
+  effectiveDate    DateTime?
+  reviewDate       DateTime?
+  publishedById    String?           @db.Uuid
+  publishedAt      DateTime?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  steps            SopStep[]
+  executions       SopExecution[]
+  acknowledgements SopAcknowledgement[]
+
+  @@unique([templateId, versionNumber])
+  @@index([templateId])
+  @@index([status])
+}
+
+model SopStep {
+  id                 String             @id @default(uuid()) @db.Uuid
+  versionId          String             @db.Uuid
+  version            SopTemplateVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  stepOrder          Int
+  title              String
+  description        String?
+  isMandatory        Boolean            @default(true)
+  requiresAttachment Boolean            @default(false)
+  requiresNotes      Boolean            @default(false)
+  estimatedMinutes   Int?
+  roleRequired       String?
+  validationRules    Json?
+  createdAt          DateTime           @default(now())
+
+  checklistResponses SopChecklistResponse[]
+
+  @@index([versionId, stepOrder])
+}
+
+model SopExecution {
+  id                 String             @id @default(uuid()) @db.Uuid
+  templateId         String             @db.Uuid
+  template           SopTemplate        @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  templateVersionId  String             @db.Uuid
+  templateVersion    SopTemplateVersion @relation(fields: [templateVersionId], references: [id], onDelete: Cascade)
+  taskNumber         String             @unique
+  title              String
+  department         SopDepartment
+  category           String
+  priority           SopPriority        @default(NORMAL)
+  status             SopExecutionStatus @default(ASSIGNED)
+  unitId             String?            @db.Uuid
+  unit               BusinessUnit?      @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  assignedAgentId    String?            @db.Uuid
+  assignedAgent      Agent?             @relation("SopAssignedAgent", fields: [assignedAgentId], references: [id], onDelete: SetNull)
+  assignedRole       String?
+  dueDate            DateTime?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  blockedReason      String?
+  notes              String?
+  completionEvidence Json?
+  createdById        String?            @db.Uuid
+  createdByUser      User?              @relation("SopCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  approvedById       String?            @db.Uuid
+  approvedByUser     User?              @relation("SopApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt         DateTime?
+  approvalNotes      String?
+
+  // Linked CRM Context
+  customerId         String?            @db.Uuid
+  customer           Customer?          @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  leadId             String?            @db.Uuid
+  lead               Lead?              @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  ticketId           String?            @db.Uuid
+  ticket             Ticket?            @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  callSessionId      String?            @db.Uuid
+  callSession        CallSession?       @relation(fields: [callSessionId], references: [id], onDelete: SetNull)
+  metadata           Json?
+
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  checklistResponses SopChecklistResponse[]
+  approvals          SopApproval[]
+  workflowEvents     SopWorkflowEvent[]
+
+  @@index([department])
+  @@index([status])
+  @@index([assignedAgentId])
+  @@index([unitId])
+  @@index([dueDate])
+  @@index([createdAt])
+}
+
+model SopChecklistResponse {
+  id                 String             @id @default(uuid()) @db.Uuid
+  executionId        String             @db.Uuid
+  execution          SopExecution       @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  stepId             String             @db.Uuid
+  step               SopStep            @relation(fields: [stepId], references: [id], onDelete: Cascade)
+  isCompleted        Boolean            @default(false)
+  notes              String?
+  attachmentUrl      String?
+  completedById      String?            @db.Uuid
+  completedAt        DateTime?
+
+  @@unique([executionId, stepId])
+  @@index([executionId])
+}
+
+model SopApproval {
+  id                 String             @id @default(uuid()) @db.Uuid
+  executionId        String             @db.Uuid
+  execution          SopExecution       @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  approverId         String             @db.Uuid
+  approver           User               @relation(fields: [approverId], references: [id], onDelete: Cascade)
+  status             SopApprovalStatus  @default(PENDING)
+  comments           String?
+  reviewedAt         DateTime?
+  createdAt          DateTime           @default(now())
+
+  @@index([executionId])
+  @@index([approverId])
+  @@index([status])
+}
+
+model SopAcknowledgement {
+  id                 String              @id @default(uuid()) @db.Uuid
+  templateVersionId  String?             @db.Uuid
+  templateVersion    SopTemplateVersion? @relation(fields: [templateVersionId], references: [id], onDelete: Cascade)
+  documentId         String?             @db.Uuid
+  document           SopDocument?        @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  userId             String              @db.Uuid
+  user               User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  unitId             String?             @db.Uuid
+  acknowledgedAt     DateTime            @default(now())
+  ipAddress          String?
+  userAgent          String?
+
+  @@index([templateVersionId])
+  @@index([documentId])
+  @@index([userId])
+}
+
+model SopDocument {
+  id                      String            @id @default(uuid()) @db.Uuid
+  documentNumber          String            @unique
+  title                   String
+  description             String?
+  department              SopDepartment
+  category                String
+  version                 String            @default("1.0")
+  fileUrl                 String?
+  fileName                String?
+  fileSize                Int?
+  mimeType                String?
+  content                 String?           @db.Text
+  effectiveDate           DateTime?
+  reviewDate              DateTime?
+  requiresAcknowledgement Boolean           @default(true)
+  status                  String            @default("ACTIVE")
+  unitId                  String?           @db.Uuid
+  unit                    BusinessUnit?     @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  createdById             String?           @db.Uuid
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+
+  acknowledgements        SopAcknowledgement[]
+
+  @@index([department])
+  @@index([category])
+  @@index([unitId])
+}
+
+model SopWorkflowEvent {
+  id                 String             @id @default(uuid()) @db.Uuid
+  executionId        String?            @db.Uuid
+  execution          SopExecution?      @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  eventType          String
+  fromDepartment     String?
+  toDepartment       String?
+  actorId            String?
+  actorEmail         String?
+  action             String
+  details            Json?
+  createdAt          DateTime           @default(now())
+
+  @@index([executionId])
+  @@index([eventType])
   @@index([createdAt])
 }
