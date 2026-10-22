@@ -796,6 +796,11 @@ export class TelephonyService {
         if (!potentialAgent) break; // No agents available at all
 
         if (potentialAgent.socketId) {
+          const directSocket = this.telephonyGateway.server?.sockets?.sockets?.get(potentialAgent.socketId);
+          if (directSocket?.connected) {
+            assignedAgent = potentialAgent;
+            break;
+          }
           const sockets = await this.telephonyGateway.server.in(potentialAgent.socketId).fetchSockets();
           if (sockets.length > 0) {
             assignedAgent = potentialAgent;
@@ -807,8 +812,20 @@ export class TelephonyService {
         this.logger.warn(`Allocated agent ${potentialAgent.name} but socket ${potentialAgent.socketId} is dead. Marking offline.`);
         await this.prisma.agent.update({
           where: { id: potentialAgent.id },
-          data: { status: 'OFFLINE', activeCalls: { decrement: 1 }, socketId: null }
+          data: { status: 'OFFLINE', activeCalls: 0, socketId: null }
         });
+      }
+
+      if (!assignedAgent) {
+        // Fallback: Check if any agent is marked AVAILABLE or logged in
+        const fallbackAgent = await this.prisma.agent.findFirst({
+          where: { status: 'AVAILABLE', isDeleted: false },
+          orderBy: { activeCalls: 'asc' },
+        });
+        if (fallbackAgent) {
+          this.logger.log(`[INBOUND-TRACE] Fallback to available agent: ${fallbackAgent.name} (${fallbackAgent.id})`);
+          assignedAgent = fallbackAgent;
+        }
       }
 
       this.logger.log(`[INBOUND-TRACE] AGENT_SELECTION | callId=${event.providerCallId} assignedAgentId=${assignedAgent?.id}`);

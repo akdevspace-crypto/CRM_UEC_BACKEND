@@ -133,6 +133,8 @@ export class TelephonyGateway
               status: 'AVAILABLE',
               socketId: client.id,
               lastActive: new Date(),
+              isDeleted: false,
+              activeCalls: 0,
             },
           });
           this.logger.log(`[INBOUND-SOCKET-AUDIT] agentId=${agent.id} agentName=${agent.name} socketId=${client.id} connected=true authenticated=${Boolean(authenticatedUser)} socketAge=0`);
