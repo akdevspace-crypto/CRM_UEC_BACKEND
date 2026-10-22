@@ -66,13 +66,17 @@ export class TelephonyService {
     agentId?: string,
     direction?: string,
     phone?: string,
+    leadId?: string,
+    conversationId?: string,
   ) {
-    this.logger.log(`Creating CallSession for ${callSid} in room ${roomName}`);
+    this.logger.log(`Creating CallSession for ${callSid} in room ${roomName} leadId=${leadId} convId=${conversationId}`);
     try {
       return await this.prisma.callSession.create({
         data: {
           reason: callSid, // Store Vobiz CallSid here since it's not a valid UUID
-          customerId,
+          customerId: customerId || undefined,
+          leadId: leadId || undefined,
+          conversationId: conversationId || undefined,
           calleeUserId: agentId, // mapped to agent user ID theoretically
           status: 'RINGING',
           startedAt: new Date(),
@@ -989,10 +993,12 @@ export class TelephonyService {
     await this.createCallSession(
       callSid,
       roomName,
-      request.contactId || request.leadId, // Associate customer
+      request.contactId, // Associate customer
       agent?.userId,
       'outbound',
-      request.to
+      request.to,
+      request.leadId,
+      request.conversationId,
     );
 
     let providerResponse;

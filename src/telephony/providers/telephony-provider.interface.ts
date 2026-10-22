@@ -20,6 +20,7 @@ export interface OutboundCallRequest {
   to: string;
   leadId?: string;
   contactId?: string;
+  conversationId?: string;
   agentId: string;
 }
 

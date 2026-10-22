@@ -28,6 +28,7 @@ export class OmnichannelController {
       where: whereClause,
       include: {
         customer: true,
+        lead: true,
       },
       orderBy: { updatedAt: 'desc' },
       take: 50,
@@ -37,13 +38,80 @@ export class OmnichannelController {
       id: c.id,
       customerId: c.customerId,
       customerName: c.customer?.name || 'Unknown',
-      lastMessage: 'Conversation opened', 
+      customerPhone: c.customer?.phone || null,
+      customerEmail: c.customer?.email || null,
+      customerAvatar: (c.customer as any)?.avatarUrl || null,
+      foundation: c.foundation || 'UEC',
+      enquiryCategory: c.enquiryCategory || 'SERVICE_ENQUIRY',
+      primaryService: c.primaryService || null,
+      subServices: c.subServices || [],
+      leadId: c.leadId || null,
+      lead: c.lead || null,
+      classificationConfidence: c.classificationConfidence,
+      isClassificationConfirmed: c.isClassificationConfirmed,
+      missingInfo: c.missingInfo || [],
+      intakeMetadata: c.intakeMetadata || null,
+      lastMessage: 'Conversation active', 
       timestamp: c.updatedAt.toISOString(),
       status: c.status,
       channel: c.channel.toLowerCase(),
       unreadCount: c.unreadCount,
-      priority: c.priority.toLowerCase(),
+      priority: c.priority,
     }));
+  }
+
+  @Get(':id')
+  async getConversationById(@Param('id') id: string, @Req() req: any) {
+    if (!UUID_REGEX.test(id)) {
+      throw new NotFoundException('Conversation not found');
+    }
+
+    const conversation = await this.prisma.conversation.findUnique({
+      where: { id },
+      include: {
+        customer: true,
+        lead: true,
+        callSessions: {
+          orderBy: { startedAt: 'desc' },
+          take: 5,
+        },
+      },
+    });
+
+    if (!conversation) {
+      throw new NotFoundException('Conversation not found');
+    }
+
+    const user = req?.user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR', 'SENIOR_MANAGER', 'DEPARTMENT_MANAGER'].includes(user.role);
+    if (!isElevated && user && conversation.agentId && conversation.agentId !== user.agentId && conversation.agentId !== user.id) {
+      throw new ForbiddenException('Forbidden: Not authorized to access this conversation');
+    }
+
+    return {
+      id: conversation.id,
+      customerId: conversation.customerId,
+      customerName: conversation.customer?.name || 'Unknown',
+      customerPhone: conversation.customer?.phone || null,
+      customerEmail: conversation.customer?.email || null,
+      foundation: conversation.foundation || 'UEC',
+      enquiryCategory: conversation.enquiryCategory || 'SERVICE_ENQUIRY',
+      primaryService: conversation.primaryService || null,
+      subServices: conversation.subServices || [],
+      leadId: conversation.leadId || null,
+      lead: conversation.lead || null,
+      classificationConfidence: conversation.classificationConfidence,
+      isClassificationConfirmed: conversation.isClassificationConfirmed,
+      missingInfo: conversation.missingInfo || [],
+      intakeMetadata: conversation.intakeMetadata || null,
+      status: conversation.status,
+      channel: conversation.channel.toLowerCase(),
+      unreadCount: conversation.unreadCount,
+      priority: conversation.priority,
+      callSessions: conversation.callSessions,
+      createdAt: conversation.createdAt.toISOString(),
+      updatedAt: conversation.updatedAt.toISOString(),
+    };
   }
 
   @Get(':id/messages')

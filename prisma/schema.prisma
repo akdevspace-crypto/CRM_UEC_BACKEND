@@ -38,6 +38,7 @@ enum ChannelType {
 enum Priority {
   LOW
   NORMAL
+  MEDIUM
   HIGH
   EMERGENCY
 }
@@ -70,7 +71,18 @@ enum LeadStatus {
 enum LeadPriority {
   LOW
   NORMAL
+  MEDIUM
   HIGH
+  EMERGENCY
+}
+
+enum EnquiryCategory {
+  SERVICE_ENQUIRY
+  JOB_ENQUIRY
+  VOLUNTEER_ENQUIRY
+  DONOR_ENQUIRY
+  GENERAL_ENQUIRY
+  COMPLAINT_OR_SUPPORT
 }
 
 enum MeetingType {
@@ -249,6 +261,19 @@ model Conversation {
   emailLogs   EmailLog[]
   whatsappLogs WhatsappLog[]
   callSessions CallSession[]
+
+  // Omnichannel Intelligence
+  foundation                  String?
+  enquiryCategory             EnquiryCategory?
+  primaryService              String?
+  subServices                 String[]           @default([])
+  leadId                      String?            @db.Uuid
+  lead                        Lead?              @relation("ConversationLead", fields: [leadId], references: [id], onDelete: SetNull)
+  classificationConfidence    Float?
+  isClassificationConfirmed   Boolean            @default(false)
+  missingInfo                 String[]           @default([])
+  intakeMetadata              Json?
+  originLeads                 Lead[]             @relation("OmnichannelOrigin")
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -599,6 +624,10 @@ model CallSession {
   appointments   Appointment[]
   aiUsageRecords AiUsageRecord[]
   sopExecutions  SopExecution[]
+  leadId         String?       @db.Uuid
+  lead           Lead?         @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  liveNotes      Json?
+  intakeForm     Json?
 
   @@index([status])
   @@index([startedAt])
@@ -781,11 +810,43 @@ model Lead {
   submissions       WebsiteLeadSubmission[]
   transferAudits    LeadTransferAudit[]
   sopExecutions     SopExecution[]
+  callSessions      CallSession[]
+  conversationsLinked Conversation[] @relation("ConversationLead")
+
+  // Omnichannel Enquiry Intelligence & Call Intake
+  foundation                  String?
+  enquiryCategory             EnquiryCategory?
+  primaryService              String?
+  subServices                 String[]           @default([])
+  patientName                 String?
+  patientAge                  Int?
+  patientConditions           String?
+  patientMobility             String?
+  engagementType              String?
+  careDurationCategory        String?
+  careDuration                String?
+  careSchedule                String?
+  serviceAddress              String?
+  cityDistrict                String?
+  postalCode                  String?
+  latitude                    Float?
+  longitude                   Float?
+  pickupLocation              String?
+  destinationLocation         String?
+  isAmbulanceEmergency        Boolean            @default(false)
+  emergencyOverrideReason     String?
+  classificationConfidence    Float?
+  isClassificationConfirmed   Boolean            @default(false)
+  omnichannelConversationId   String?            @db.Uuid
+  omnichannelConversation     Conversation?      @relation("OmnichannelOrigin", fields: [omnichannelConversationId], references: [id], onDelete: SetNull)
+  liveNotes                   Json?
 
   @@index([status])
   @@index([assignedAgentId])
   @@index([unitId])
   @@index([createdAt])
+  @@index([foundation])
+  @@index([isAmbulanceEmergency])
 }
 
 model LeadFollowup {
@@ -1282,3 +1343,40 @@ model SopWorkflowEvent {
   @@index([eventType])
   @@index([createdAt])
 }
+
+model ServiceCatalogItem {
+  id              String   @id @default(uuid()) @db.Uuid
+  foundationKey   String   // 'UEC', 'UHC', 'AMBULANCE', 'A_CARE', 'THATHA_PATTI', 'ZENCURA', etc.
+  foundationName  String
+  category        String   // Category or section
+  name            String   // Service name
+  code            String?  // Canonical code
+  description     String?
+  subServices     String[] @default([])
+  intakeFields    Json?    // Optional custom fields config
+  isEmergency     Boolean  @default(false)
+  isActive        Boolean  @default(true)
+  sortOrder       Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([foundationKey])
+  @@index([isActive])
+}
+
+model EmergencyOverrideAudit {
+  id              String   @id @default(uuid()) @db.Uuid
+  leadId          String?  @db.Uuid
+  conversationId  String?  @db.Uuid
+  previousPriority Priority
+  newPriority     Priority
+  overrideReason  String
+  overriddenById  String   @db.Uuid
+  overriddenByRole String?
+  createdAt       DateTime @default(now())
+
+  @@index([leadId])
+  @@index([conversationId])
+  @@index([createdAt])
+}
+
