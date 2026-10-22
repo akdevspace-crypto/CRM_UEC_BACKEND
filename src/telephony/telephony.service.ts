@@ -2193,160 +2193,206 @@ export class TelephonyService {
   }
 
   async getCustomerHistoryIntelligence(phoneOrLeadId: string, user?: any) {
-    if (!phoneOrLeadId) {
+    if (!phoneOrLeadId || typeof phoneOrLeadId !== 'string') {
       throw new BadRequestException('Identifier (phone number, customer ID, or lead ID) is required');
     }
 
-    const cleanInput = phoneOrLeadId.trim();
-    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    const isUuid = UUID_REGEX.test(cleanInput);
+    try {
+      // 1. Normalize and decode input exactly once
+      let decoded = phoneOrLeadId.trim();
+      try {
+        decoded = decodeURIComponent(decoded);
+      } catch (_) {}
+      decoded = decoded.trim();
 
-    let cleanPhone = cleanInput.replace(/[^\d+]/g, '');
-    if (cleanPhone.startsWith('0')) cleanPhone = cleanPhone.substring(1);
-    if (!cleanPhone.startsWith('+') && cleanPhone.length === 10) cleanPhone = `+91${cleanPhone}`;
+      const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+      const isUuid = UUID_REGEX.test(decoded);
+      const isEmail = decoded.includes('@');
 
-    // Find matches in Lead and Customer
-    let lead: any = null;
-    let customer: any = null;
+      // Canonical phone normalization
+      let cleanPhone = decoded.replace(/[^\d+]/g, '');
+      if (cleanPhone.startsWith('00')) {
+        cleanPhone = '+' + cleanPhone.substring(2);
+      } else if (cleanPhone.startsWith('0') && cleanPhone.length === 11) {
+        cleanPhone = '+91' + cleanPhone.substring(1);
+      } else if (!cleanPhone.startsWith('+') && cleanPhone.length === 10) {
+        cleanPhone = `+91${cleanPhone}`;
+      } else if (!cleanPhone.startsWith('+') && cleanPhone.startsWith('91') && cleanPhone.length === 12) {
+        cleanPhone = `+${cleanPhone}`;
+      }
 
-    if (isUuid) {
-      lead = await this.prisma.lead.findUnique({
-        where: { id: cleanInput },
-        include: { unit: true, assignedAgent: true }
-      });
-      if (!lead) {
-        customer = await this.prisma.customer.findUnique({
-          where: { id: cleanInput }
+      // Generate phone variants for lookup (E.164, national 10-digit, prefixed)
+      const nationalNumber = cleanPhone.replace(/^\+91/, '').replace(/^\+/, '');
+      const phoneVariants = [
+        cleanPhone,
+        nationalNumber,
+        `+91${nationalNumber}`,
+        `91${nationalNumber}`,
+        `0${nationalNumber}`,
+      ].filter((p) => p && p.length >= 7);
+      const uniqueVariants = Array.from(new Set(phoneVariants));
+
+      // Find matches in Lead and Customer
+      let lead: any = null;
+      let customer: any = null;
+
+      if (isUuid) {
+        lead = await this.prisma.lead.findUnique({
+          where: { id: decoded },
+          include: { unit: true, assignedAgent: true }
+        });
+        if (!lead) {
+          customer = await this.prisma.customer.findUnique({
+            where: { id: decoded }
+          });
+        }
+      } else if (isEmail) {
+        lead = await this.prisma.lead.findFirst({
+          where: { email: { equals: decoded, mode: 'insensitive' } },
+          include: { unit: true, assignedAgent: true },
+          orderBy: { updatedAt: 'desc' }
+        });
+        if (!customer) {
+          customer = await this.prisma.customer.findFirst({
+            where: { email: { equals: decoded, mode: 'insensitive' } }
+          });
+        }
+      }
+
+      if (!lead && uniqueVariants.length > 0) {
+        lead = await this.prisma.lead.findFirst({
+          where: {
+            OR: uniqueVariants.map((p) => ({ phoneNumber: p }))
+          },
+          include: { unit: true, assignedAgent: true },
+          orderBy: { updatedAt: 'desc' }
         });
       }
-    }
 
-    if (!lead && cleanPhone) {
-      lead = await this.prisma.lead.findFirst({
-        where: {
-          OR: [
-            { phoneNumber: cleanPhone },
-            { phoneNumber: cleanPhone.replace('+91', '') },
-            { phoneNumber: `+91${cleanPhone.replace('+91', '')}` }
-          ]
-        },
-        include: { unit: true, assignedAgent: true },
-        orderBy: { updatedAt: 'desc' }
-      });
-    }
+      if (!customer && (uniqueVariants.length > 0 || lead?.phoneNumber)) {
+        const variantsToSearch = lead?.phoneNumber
+          ? Array.from(new Set([...uniqueVariants, lead.phoneNumber, lead.phoneNumber.replace('+91', '')]))
+          : uniqueVariants;
 
-    if (!customer && (cleanPhone || lead?.phoneNumber)) {
-      const targetPhone = cleanPhone || lead?.phoneNumber;
-      customer = await this.prisma.customer.findFirst({
-        where: {
-          OR: [
-            { phone: targetPhone },
-            { phone: targetPhone.replace('+91', '') },
-            { phone: `+91${targetPhone.replace('+91', '')}` }
-          ]
-        }
-      });
-    }
-
-    const matchedPhone = cleanPhone || lead?.phoneNumber || customer?.phone;
-    const leadIds: string[] = lead ? [lead.id] : [];
-    const customerIds: string[] = customer ? [customer.id] : [];
-
-    // Query all cross-unit call sessions
-    const callSessions = await this.prisma.callSession.findMany({
-      where: {
-        OR: [
-          ...(leadIds.length > 0 ? [{ leadId: { in: leadIds } }] : []),
-          ...(customerIds.length > 0 ? [{ customerId: { in: customerIds } }] : []),
-          ...(matchedPhone ? [
-            { customer: { phone: { contains: matchedPhone.replace('+91', '') } } },
-            { lead: { phoneNumber: { contains: matchedPhone.replace('+91', '') } } },
-            { reason: { contains: matchedPhone.replace('+91', '') } }
-          ] : [])
-        ]
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-      include: {
-        participants: true,
-        caller: { select: { agentProfile: { select: { name: true, department: true } } } },
-        callee: { select: { agentProfile: { select: { name: true, department: true } } } },
-        lead: { select: { customerName: true, unit: { select: { name: true, code: true } } } },
-        transferAudits: {
-          include: {
-            sourceUnit: { select: { name: true } },
-            destUnit: { select: { name: true } },
-            initiatingAgent: { select: { name: true } },
+        customer = await this.prisma.customer.findFirst({
+          where: {
+            OR: variantsToSearch.map((p) => ({ phone: p }))
           }
-        },
-        analytics: true,
+        });
       }
-    });
 
-    // Query all cross-unit conversations
-    const conversations = await this.prisma.conversation.findMany({
-      where: {
-        OR: [
-          ...(leadIds.length > 0 ? [{ leadId: { in: leadIds } }] : []),
-          ...(customerIds.length > 0 ? [{ customerId: { in: customerIds } }] : []),
-        ]
-      },
-      orderBy: { updatedAt: 'desc' },
-      take: 20,
-      include: {
-        messages: { orderBy: { createdAt: 'desc' }, take: 3 }
+      const matchedPhone = cleanPhone || lead?.phoneNumber || customer?.phone || (nationalNumber ? `+91${nationalNumber}` : decoded);
+      const leadIds: string[] = lead ? [lead.id] : [];
+      const customerIds: string[] = customer ? [customer.id] : [];
+
+      // Build call session lookup conditions safely
+      const callSessionConditions: any[] = [];
+      if (leadIds.length > 0) {
+        callSessionConditions.push({ leadId: { in: leadIds } });
       }
-    });
+      if (customerIds.length > 0) {
+        callSessionConditions.push({ customerId: { in: customerIds } });
+      }
+      if (nationalNumber && nationalNumber.length >= 7) {
+        callSessionConditions.push(
+          { customer: { phone: { contains: nationalNumber } } },
+          { lead: { phoneNumber: { contains: nationalNumber } } },
+          { reason: { contains: nationalNumber } }
+        );
+      }
 
-    // Query all lead activities
-    const activities = leadIds.length > 0
-      ? await this.prisma.leadActivity.findMany({
-          where: { leadId: { in: leadIds } },
-          orderBy: { createdAt: 'desc' },
-          take: 50,
-          include: { agent: { select: { name: true, department: true } } }
-        })
-      : [];
+      // Query cross-unit call sessions (without invalid Prisma relation includes)
+      const callSessions = callSessionConditions.length > 0
+        ? await this.prisma.callSession.findMany({
+            where: { OR: callSessionConditions },
+            orderBy: { createdAt: 'desc' },
+            take: 50,
+            include: {
+              participants: true,
+              caller: { select: { agentProfile: { select: { name: true, department: true } } } },
+              callee: { select: { agentProfile: { select: { name: true, department: true } } } },
+              lead: { select: { customerName: true, unit: { select: { name: true, code: true } } } },
+              transferAudits: {
+                orderBy: { createdAt: 'desc' },
+                include: {
+                  initiatingAgent: { select: { id: true, name: true, department: true } },
+                  destinationAgent: { select: { id: true, name: true, department: true } },
+                }
+              },
+              analytics: true,
+            }
+          })
+        : [];
 
-    // Query all followups
-    const followups = leadIds.length > 0
-      ? await this.prisma.leadFollowup.findMany({
-          where: { leadId: { in: leadIds } },
-          orderBy: { followupDate: 'desc' },
-          take: 20,
-          include: { assignedAgent: { select: { name: true, department: true } } }
-        })
-      : [];
+      // Query all cross-unit conversations
+      const convConditions: any[] = [];
+      if (leadIds.length > 0) convConditions.push({ leadId: { in: leadIds } });
+      if (customerIds.length > 0) convConditions.push({ customerId: { in: customerIds } });
 
-    // Query all lead transfer audits
-    const transferAudits = leadIds.length > 0
-      ? await this.prisma.leadTransferAudit.findMany({
-          where: { leadId: { in: leadIds } },
-          orderBy: { createdAt: 'desc' },
-          include: {
-            sourceUnit: true,
-            destUnit: true,
-            transferredBy: { select: { email: true } },
-            assignedAgent: { select: { name: true } },
-          }
-        })
-      : [];
+      const conversations = convConditions.length > 0
+        ? await this.prisma.conversation.findMany({
+            where: { OR: convConditions },
+            orderBy: { updatedAt: 'desc' },
+            take: 20,
+            include: {
+              messages: { orderBy: { createdAt: 'desc' }, take: 3 }
+            }
+          })
+        : [];
 
-    // Identify unique Business Units Contacted across history
-    const unitsContactedSet = new Set<string>();
-    if (lead?.unit?.name) unitsContactedSet.add(lead.unit.name);
-    if (lead?.foundation) unitsContactedSet.add(lead.foundation);
-    transferAudits.forEach(t => {
-      if (t.sourceUnit?.name) unitsContactedSet.add(t.sourceUnit.name);
-      if (t.destUnit?.name) unitsContactedSet.add(t.destUnit.name);
-    });
-    callSessions.forEach(c => {
-      if (c.lead?.unit?.name) unitsContactedSet.add(c.lead.unit.name);
-      if ((c.caller?.agentProfile as any)?.department) unitsContactedSet.add((c.caller?.agentProfile as any).department);
-    });
-    conversations.forEach(c => {
-      if (c.foundation) unitsContactedSet.add(c.foundation);
-    });
+      // Query all lead activities
+      const activities = leadIds.length > 0
+        ? await this.prisma.leadActivity.findMany({
+            where: { leadId: { in: leadIds } },
+            orderBy: { createdAt: 'desc' },
+            take: 50,
+            include: { agent: { select: { name: true, department: true } } }
+          })
+        : [];
+
+      // Query all followups
+      const followups = leadIds.length > 0
+        ? await this.prisma.leadFollowup.findMany({
+            where: { leadId: { in: leadIds } },
+            orderBy: { followupDate: 'desc' },
+            take: 20,
+            include: { assignedAgent: { select: { name: true, department: true } } }
+          })
+        : [];
+
+      // Query all lead transfer audits
+      const transferAudits = leadIds.length > 0
+        ? await this.prisma.leadTransferAudit.findMany({
+            where: { leadId: { in: leadIds } },
+            orderBy: { createdAt: 'desc' },
+            include: {
+              sourceUnit: true,
+              destUnit: true,
+              transferredBy: { select: { email: true } },
+              assignedAgent: { select: { name: true } },
+            }
+          })
+        : [];
+
+      // Identify unique Business Units Contacted across history
+      const unitsContactedSet = new Set<string>();
+      if (lead?.unit?.name) unitsContactedSet.add(lead.unit.name);
+      if (lead?.foundation) unitsContactedSet.add(lead.foundation);
+      transferAudits.forEach((t) => {
+        if (t.sourceUnit?.name) unitsContactedSet.add(t.sourceUnit.name);
+        if (t.destUnit?.name) unitsContactedSet.add(t.destUnit.name);
+      });
+      callSessions.forEach((c) => {
+        if (c.lead?.unit?.name) unitsContactedSet.add(c.lead.unit.name);
+        if ((c.caller?.agentProfile as any)?.department) unitsContactedSet.add((c.caller?.agentProfile as any).department);
+        c.transferAudits?.forEach((cta: any) => {
+          if (cta.sourceDepartment) unitsContactedSet.add(cta.sourceDepartment);
+          if (cta.destDepartment) unitsContactedSet.add(cta.destDepartment);
+        });
+      });
+      conversations.forEach((c) => {
+        if (c.foundation) unitsContactedSet.add(c.foundation);
+      });
 
     // Identify unique Services Requested across history
     const servicesRequestedSet = new Set<string>();
@@ -2445,32 +2491,62 @@ export class TelephonyService {
 
     timeline.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
-    return {
-      resolvedCustomer: {
-        id: customer?.id || null,
-        leadId: lead?.id || null,
-        name: lead?.customerName || customer?.name || 'Unknown Contact',
-        phone: matchedPhone || 'No Phone',
-        email: lead?.email || customer?.email || null,
-        currentUnit: lead?.unit?.name || 'Unassigned',
-        currentUnitId: lead?.unit?.id || null,
-        currentAgent: lead?.assignedAgent?.name || 'Unassigned',
-        currentStatus: lead?.status || 'NEW',
-        priority: isEmergency ? 'EMERGENCY' : (lead?.priority || 'NORMAL'),
-        notes: lead?.notes || null,
-      },
-      businessUnitsContacted: Array.from(unitsContactedSet),
-      requestedServices: Array.from(servicesRequestedSet),
-      timeline,
-      isEmergency,
-      stats: {
-        totalCalls: callSessions.length,
-        totalRecordings: callSessions.filter(c => c.recordingStatus === 'READY').length,
-        totalConversations: conversations.length,
-        totalFollowups: followups.length,
-        totalTransfers: transferAudits.length,
-      }
-    };
+      return {
+        resolvedCustomer: {
+          id: customer?.id || null,
+          leadId: lead?.id || null,
+          name: lead?.customerName || customer?.name || 'Unknown Contact',
+          phone: matchedPhone || 'No Phone',
+          email: lead?.email || customer?.email || null,
+          currentUnit: lead?.unit?.name || 'Unassigned',
+          currentUnitId: lead?.unit?.id || null,
+          currentAgent: lead?.assignedAgent?.name || 'Unassigned',
+          currentStatus: lead?.status || 'NEW',
+          priority: isEmergency ? 'EMERGENCY' : (lead?.priority || 'NORMAL'),
+          notes: lead?.notes || null,
+        },
+        businessUnitsContacted: Array.from(unitsContactedSet),
+        requestedServices: Array.from(servicesRequestedSet),
+        timeline,
+        isEmergency,
+        stats: {
+          totalCalls: callSessions.length,
+          totalRecordings: callSessions.filter(c => c.recordingStatus === 'READY').length,
+          totalConversations: conversations.length,
+          totalFollowups: followups.length,
+          totalTransfers: transferAudits.length,
+        }
+      };
+    } catch (err: any) {
+      this.logger.error(`[CUSTOMER-HISTORY] Error resolving history for identifier="${phoneOrLeadId}": ${err.message}`, err.stack);
+      if (err instanceof BadRequestException) throw err;
+      return {
+        resolvedCustomer: {
+          id: null,
+          leadId: null,
+          name: 'Unknown Contact',
+          phone: phoneOrLeadId,
+          email: null,
+          currentUnit: 'Unassigned',
+          currentUnitId: null,
+          currentAgent: 'Unassigned',
+          currentStatus: 'NEW',
+          priority: 'NORMAL',
+          notes: null,
+        },
+        businessUnitsContacted: [],
+        requestedServices: [],
+        timeline: [],
+        isEmergency: false,
+        stats: {
+          totalCalls: 0,
+          totalRecordings: 0,
+          totalConversations: 0,
+          totalFollowups: 0,
+          totalTransfers: 0,
+        }
+      };
+    }
   }
 
   async previewCrossUnitLeadTransfer(leadId: string, destUnitId: string, user?: any) {

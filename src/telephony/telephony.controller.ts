@@ -1,4 +1,4 @@
-import { Controller, All, Post, Req, Res, Body, Logger, Header, Get, Inject, HttpException, Param } from '@nestjs/common';
+import { Controller, All, Post, Req, Res, Body, Logger, Header, Get, Inject, HttpException, Param, UnauthorizedException, BadRequestException } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { LivekitService } from './livekit.service';
 import { TelephonyService } from './telephony.service';
@@ -94,7 +94,14 @@ export class TelephonyController {
     @Param('identifier') identifier: string,
     @Req() req: Request,
   ) {
-    return await this.telephonyService.getCustomerHistoryIntelligence(identifier, (req as any).user);
+    const user = (req as any).user;
+    if (!user) {
+      throw new UnauthorizedException('Authentication required to access customer history');
+    }
+    if (!identifier || identifier.trim() === '') {
+      throw new BadRequestException('Identifier (phone number, customer ID, or lead ID) is required');
+    }
+    return await this.telephonyService.getCustomerHistoryIntelligence(identifier.trim(), user);
   }
 
   @Post('leads/:leadId/cross-unit-transfer/preview')
@@ -213,10 +220,16 @@ export class TelephonyController {
   }
 
   private getBaseUrl(req: Request) {
+    if (process.env.BASE_URL && process.env.BASE_URL.startsWith('http')) {
+      return process.env.BASE_URL.replace(/\/$/, '');
+    }
     const forwardedHost = req.headers['x-forwarded-host'];
     const host = Array.isArray(forwardedHost) ? forwardedHost[0] : (forwardedHost || req.get('host'));
-    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-    return `${protocol}://${host}`;
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+    if (host && !host.includes('localhost') && !host.includes('127.0.0.1')) {
+      return `${protocol}://${host}`;
+    }
+    return 'https://crm-uec-backend.onrender.com';
   }
 
   @Get('calls/:callId/playback-url')

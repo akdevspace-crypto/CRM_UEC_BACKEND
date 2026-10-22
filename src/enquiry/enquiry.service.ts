@@ -70,24 +70,32 @@ export class EnquiryService {
     for (const f of INITIAL_FOUNDATIONS) {
       let sort = 10;
       for (const s of f.services) {
-        await this.prisma.serviceCatalogItem.create({
-          data: {
+        const existing = await this.prisma.serviceCatalogItem.findFirst({
+          where: {
             foundationKey: f.key,
-            foundationName: f.name,
-            category: f.category,
-            name: s.name,
             code: s.code,
-            description: s.description || null,
-            subServices: s.subServices || [],
-            isEmergency: !!s.isEmergency,
-            sortOrder: sort,
-            isActive: true,
           },
         });
+        if (!existing) {
+          await this.prisma.serviceCatalogItem.create({
+            data: {
+              foundationKey: f.key,
+              foundationName: f.name,
+              category: f.category,
+              name: s.name,
+              code: s.code,
+              description: s.description || null,
+              subServices: s.subServices || [],
+              isEmergency: !!s.isEmergency,
+              sortOrder: sort,
+              isActive: true,
+            },
+          });
+        }
         sort += 10;
       }
     }
-    this.logger.log('Successfully seeded default service catalog');
+    this.logger.log('Successfully validated and seeded default service catalog');
   }
 
   async createCatalogItem(dto: CreateCatalogItemDto, user: any) {
@@ -602,6 +610,7 @@ export class EnquiryService {
         where: { id: targetLeadId },
         data: {
           ...(dto.foundation ? { foundation: dto.foundation } : {}),
+          ...(dto.serviceCategory ? { serviceInterest: dto.serviceCategory } : {}),
           ...(dto.enquiryCategory ? { enquiryCategory: dto.enquiryCategory } : {}),
           ...(dto.primaryService ? { primaryService: dto.primaryService } : {}),
           ...(dto.subServices ? { subServices: dto.subServices } : {}),

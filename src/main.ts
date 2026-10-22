@@ -16,6 +16,9 @@ async function bootstrap() {
   try {
     const app = await NestFactory.create(AppModule, { rawBody: true });
 
+    // Enable trust proxy for correct client IP and HTTPS protocol forwarding behind Render reverse proxy
+    app.getHttpAdapter().getInstance().set('trust proxy', 1);
+
     // Enterprise Security Headers (DEF-17)
     app.use(
       helmet({

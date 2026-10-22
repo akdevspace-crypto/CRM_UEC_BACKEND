@@ -125,6 +125,10 @@ export class CreateLeadFromEnquiryDto {
   foundation?: string;
 
   @IsOptional()
+  @IsString()
+  serviceCategory?: string;
+
+  @IsOptional()
   @IsEnum(EnquiryCategory)
   enquiryCategory?: EnquiryCategory;
 
@@ -221,6 +225,10 @@ export class SaveCallIntakeDto {
   @IsOptional()
   @IsString()
   foundation?: string;
+
+  @IsOptional()
+  @IsString()
+  serviceCategory?: string;
 
   @IsOptional()
   @IsEnum(EnquiryCategory)
