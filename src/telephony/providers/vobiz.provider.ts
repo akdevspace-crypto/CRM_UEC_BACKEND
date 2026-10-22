@@ -82,7 +82,7 @@ export class VobizProvider implements TelephonyProvider {
   }
 
   generateBridgeResponse(roomName: string, baseUrl: string): string {
-    const livekitSipDomain = process.env.LIVEKIT_SIP_HOST || '4c0ct02u07s.sip.livekit.cloud';
+    const livekitSipDomain = process.env.LIVEKIT_SIP_HOST || process.env.LIVEKIT_SIP_URI?.replace(/^sip:/, '') || '23jy3gv6xcs.sip.livekit.cloud';
     return `
 <Response>
     <Dial action="${baseUrl}/telephony/vobiz/status">

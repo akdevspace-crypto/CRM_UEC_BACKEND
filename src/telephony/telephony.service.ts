@@ -883,6 +883,7 @@ export class TelephonyService {
         roomName,
         assignedAgent.name || 'Agent',
       );
+      const livekitWsUrl = process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_API_URL;
 
       this.logger.log(`[INBOUND-E2E] STEP=BEFORE_GATEWAY_DISPATCH | callId=${event.providerCallId} providerCallId=${event.providerCallId} direction=${event.direction} agentId=${assignedAgent.id} agentName=${assignedAgent.name} roomName=${roomName} tokenPresent=${!!token}`);
 
@@ -902,6 +903,8 @@ export class TelephonyService {
             name: assignedAgent.name,
           },
           token,
+          serverUrl: livekitWsUrl,
+          wsUrl: livekitWsUrl,
         },
       );
 
@@ -1007,10 +1010,13 @@ export class TelephonyService {
       });
     }, 2000);
 
+    const livekitWsUrl = process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_API_URL;
     return {
       success: true,
       roomName,
       token,
+      serverUrl: livekitWsUrl,
+      wsUrl: livekitWsUrl,
       provider: providerType,
       providerResponse
     };
