@@ -935,10 +935,10 @@ export class TelephonyService {
       // Contact and omnichannel eligibility
       const phone = r.customer?.phone || r.lead?.phoneNumber || (r.transferHistory as any)?.phone;
       const email = r.customer?.email || r.lead?.email;
-      const instagram = (r.customer as any)?.instagramUsername;
+      const instagram = (r.customer as any)?.instagramUsername || (r.customer as any)?.platformUserId;
 
       const availableChannels: any[] = [];
-      if (phone) {
+      if (phone && !phone.startsWith('ig_')) {
         availableChannels.push({ channel: 'WHATSAPP', label: 'WhatsApp', destination: phone, isValid: true });
       }
       if (email) {
@@ -982,6 +982,8 @@ export class TelephonyService {
           name: r.customer?.name || r.lead?.customerName || 'Unknown',
           phone,
           email,
+          platformUserId: (r.customer as any)?.platformUserId || null,
+          instagramUsername: (r.customer as any)?.instagramUsername || null,
         },
         conversationId: r.conversationId || null,
         isTransferred: (r.transferAudits?.length || 0) > 0 || !!th.transfers?.length,
@@ -2308,6 +2310,288 @@ export class TelephonyService {
   // PHASE 14 — OMNICHANNEL MESSAGING FROM CALL LOGS & CUSTOMER INTELLIGENCE
   // =========================================================================
 
+  /**
+   * Dispatches an outbound message to the external provider (WhatsApp, Instagram, or Email)
+   * Validates credentials, recipient formats, captures provider message IDs,
+   * and returns verified delivery or provider rejection details.
+   */
+  async dispatchExternalMessage(
+    channel: string,
+    recipient: string,
+    content: string,
+    options?: { subject?: string }
+  ): Promise<{
+    success: boolean;
+    provider: string;
+    providerMessageId?: string;
+    status: 'SENT' | 'FAILED';
+    deliveryStatus: string;
+    error?: string;
+    code?: string;
+    details?: any;
+  }> {
+    const channelUpper = (channel || 'WHATSAPP').toUpperCase();
+
+    // 1. WHATSAPP (Meta Cloud API with Twilio fallback)
+    if (channelUpper === 'WHATSAPP') {
+      const cleanPhone = String(recipient || '').replace(/^whatsapp:/i, '').replace(/[^0-9+]/g, '').trim();
+      if (!cleanPhone || cleanPhone.replace(/[^0-9]/g, '').length < 8) {
+        return {
+          success: false,
+          provider: 'WHATSAPP',
+          status: 'FAILED',
+          deliveryStatus: 'REJECTED_INVALID_RECIPIENT',
+          error: 'Recipient must be a valid phone number with country code for WhatsApp (minimum 8 digits)',
+          code: 'INVALID_RECIPIENT_FORMAT',
+        };
+      }
+
+      // 1a. Try Meta WhatsApp Cloud API if configured
+      const metaToken = process.env.WHATSAPP_TOKEN;
+      const metaPhoneId = process.env.WHATSAPP_PHONE_ID;
+      let lastError: any = null;
+
+      if (metaToken && metaPhoneId) {
+        try {
+          const url = `https://graph.facebook.com/v22.0/${metaPhoneId}/messages`;
+          const toFormatted = cleanPhone.replace(/^\+/, '');
+          const res = await (fetch as any)(url, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${metaToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              messaging_product: 'whatsapp',
+              recipient_type: 'individual',
+              to: toFormatted,
+              type: 'text',
+              text: { body: content },
+            }),
+          });
+          const data = await res.json();
+          if (res.ok && data?.messages?.[0]?.id) {
+            this.logger.log(`[WhatsApp Provider] Delivered via Meta Cloud API. MID: ${data.messages[0].id}`);
+            return {
+              success: true,
+              provider: 'META_WHATSAPP',
+              providerMessageId: data.messages[0].id,
+              status: 'SENT',
+              deliveryStatus: 'ACCEPTED_BY_PROVIDER',
+            };
+          }
+          lastError = data?.error || new Error('Meta WhatsApp Cloud API rejected request');
+          this.logger.warn(`[WhatsApp Provider] Meta Cloud API failed: ${lastError.message || JSON.stringify(lastError)}. Falling back to Twilio...`);
+        } catch (metaErr: any) {
+          lastError = metaErr;
+          this.logger.warn(`[WhatsApp Provider] Meta Cloud API exception: ${metaErr.message}. Falling back to Twilio...`);
+        }
+      }
+
+      // 1b. Fallback to Twilio WhatsApp (verified active account)
+      const twilioSid = process.env.TWILIO_ACCOUNT_SID;
+      const twilioToken = process.env.TWILIO_AUTH_TOKEN;
+      const twilioFrom = process.env.TWILIO_WHATSAPP_NUMBER || 'whatsapp:+14155238886';
+
+      if (twilioSid && twilioToken) {
+        try {
+          const twilio = require('twilio');
+          const twilioClient = twilio(twilioSid, twilioToken);
+          const formattedTo = cleanPhone.startsWith('whatsapp:') ? cleanPhone : `whatsapp:${cleanPhone.startsWith('+') ? cleanPhone : '+' + cleanPhone}`;
+          const twilioRes = await twilioClient.messages.create({
+            from: twilioFrom,
+            to: formattedTo,
+            body: content,
+          });
+
+          this.logger.log(`[WhatsApp Provider] Delivered via Twilio WhatsApp. SID: ${twilioRes.sid}`);
+          return {
+            success: true,
+            provider: 'TWILIO_WHATSAPP',
+            providerMessageId: twilioRes.sid,
+            status: 'SENT',
+            deliveryStatus: 'ACCEPTED_BY_PROVIDER',
+          };
+        } catch (twilioErr: any) {
+          this.logger.error(`[WhatsApp Provider] Twilio WhatsApp failed: ${twilioErr.message}`);
+          return {
+            success: false,
+            provider: 'TWILIO_WHATSAPP',
+            status: 'FAILED',
+            deliveryStatus: 'REJECTED_BY_PROVIDER',
+            error: `WhatsApp Delivery Failed: ${twilioErr.message}`,
+            code: String(twilioErr.code || 'TWILIO_DELIVERY_FAILED'),
+            details: twilioErr,
+          };
+        }
+      }
+
+      return {
+        success: false,
+        provider: 'WHATSAPP',
+        status: 'FAILED',
+        deliveryStatus: 'PROVIDER_NOT_CONFIGURED',
+        error: lastError ? `Meta error: ${lastError.message}. No active Twilio credentials configured.` : 'No WhatsApp provider configured (missing Meta and Twilio credentials).',
+        code: 'PROVIDER_NOT_CONFIGURED',
+      };
+    }
+
+    // 2. INSTAGRAM (Meta Graph API / Messenger API for Instagram)
+    if (channelUpper === 'INSTAGRAM') {
+      const cleanIgId = String(recipient || '').replace(/^ig_/, '').trim();
+      
+      // Validate that recipient is an Instagram Scoped User ID, not a raw phone number
+      if (cleanIgId.startsWith('+') || (/^\d{8,12}$/.test(cleanIgId) && !cleanIgId.startsWith('17841') && !cleanIgId.startsWith('1506'))) {
+        return {
+          success: false,
+          provider: 'META_INSTAGRAM',
+          status: 'FAILED',
+          deliveryStatus: 'REJECTED_INVALID_RECIPIENT',
+          error: 'Instagram delivery requires a valid Meta Instagram Scoped ID (IGSID). Instagram Direct Message API does not accept phone numbers.',
+          code: 'INVALID_RECIPIENT_TYPE',
+        };
+      }
+
+      const metaToken = process.env.META_PAGE_ACCESS_TOKEN || process.env.META_ACCESS_TOKEN || process.env.ACCESS_TOKEN;
+      if (!metaToken) {
+        return {
+          success: false,
+          provider: 'META_INSTAGRAM',
+          status: 'FAILED',
+          deliveryStatus: 'PROVIDER_NOT_CONFIGURED',
+          error: 'Meta Page Access Token is not configured for Instagram delivery',
+          code: 'PROVIDER_NOT_CONFIGURED',
+        };
+      }
+
+      try {
+        const url = 'https://graph.facebook.com/v22.0/me/messages';
+        const res = await (fetch as any)(url, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${metaToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            recipient: { id: cleanIgId },
+            messaging_type: 'RESPONSE',
+            message: { text: content },
+          }),
+        });
+
+        const data = await res.json();
+        if (res.ok && data?.message_id) {
+          this.logger.log(`[Instagram Provider] Delivered via Meta Graph API. MID: ${data.message_id}`);
+          return {
+            success: true,
+            provider: 'META_INSTAGRAM',
+            providerMessageId: data.message_id,
+            status: 'SENT',
+            deliveryStatus: 'ACCEPTED_BY_PROVIDER',
+          };
+        }
+
+        const errMsg = data?.error?.message || 'Meta Graph API rejected message delivery';
+        const errCode = data?.error?.code || 'META_API_ERROR';
+        this.logger.error(`[Instagram Provider] Meta Graph API error (${errCode}): ${errMsg}`);
+        return {
+          success: false,
+          provider: 'META_INSTAGRAM',
+          status: 'FAILED',
+          deliveryStatus: 'REJECTED_BY_PROVIDER',
+          error: `Instagram Delivery Failed (${errCode}): ${errMsg}`,
+          code: String(errCode),
+          details: data?.error,
+        };
+      } catch (igErr: any) {
+        this.logger.error(`[Instagram Provider] Exception during Meta call: ${igErr.message}`);
+        return {
+          success: false,
+          provider: 'META_INSTAGRAM',
+          status: 'FAILED',
+          deliveryStatus: 'REJECTED_NETWORK_ERROR',
+          error: `Instagram Network Error: ${igErr.message}`,
+          code: 'NETWORK_ERROR',
+        };
+      }
+    }
+
+    // 3. EMAIL (Nodemailer SMTP)
+    if (channelUpper === 'EMAIL') {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(recipient.trim())) {
+        return {
+          success: false,
+          provider: 'EMAIL',
+          status: 'FAILED',
+          deliveryStatus: 'REJECTED_INVALID_RECIPIENT',
+          error: 'Invalid recipient email format',
+          code: 'INVALID_EMAIL_FORMAT',
+        };
+      }
+
+      const emailUser = process.env.EMAIL_USER;
+      const emailPass = process.env.EMAIL_PASS;
+      if (!emailUser || !emailPass) {
+        return {
+          success: false,
+          provider: 'EMAIL',
+          status: 'FAILED',
+          deliveryStatus: 'PROVIDER_NOT_CONFIGURED',
+          error: 'Email service credentials not configured (EMAIL_USER/EMAIL_PASS missing)',
+          code: 'PROVIDER_NOT_CONFIGURED',
+        };
+      }
+
+      try {
+        const nodemailer = require('nodemailer');
+        const transporter = nodemailer.createTransport({
+          host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+          port: parseInt(process.env.EMAIL_PORT || '465', 10) || 465,
+          secure: true,
+          auth: { user: emailUser, pass: emailPass },
+        });
+
+        const subject = options?.subject || 'ElderCare Support Update';
+        const info = await transporter.sendMail({
+          from: `"ElderCare CRM" <${emailUser}>`,
+          to: recipient.trim(),
+          subject,
+          text: content,
+          html: `<div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; border: 1px solid #eee; border-radius: 8px; overflow: hidden;"><div style="background-color: #f97316; padding: 20px; text-align: center;"><h2 style="color: white; margin: 0;">ElderCare Support</h2></div><div style="padding: 20px;"><p style="white-space: pre-wrap;">${content}</p></div></div>`,
+        });
+
+        this.logger.log(`[Email Provider] Delivered via SMTP. Message ID: ${info.messageId}`);
+        return {
+          success: true,
+          provider: 'EMAIL',
+          providerMessageId: info.messageId,
+          status: 'SENT',
+          deliveryStatus: 'ACCEPTED_BY_PROVIDER',
+        };
+      } catch (mailErr: any) {
+        this.logger.error(`[Email Provider] SMTP error: ${mailErr.message}`);
+        return {
+          success: false,
+          provider: 'EMAIL',
+          status: 'FAILED',
+          deliveryStatus: 'REJECTED_BY_PROVIDER',
+          error: `Email Delivery Failed: ${mailErr.message}`,
+          code: 'EMAIL_SEND_FAILED',
+        };
+      }
+    }
+
+    return {
+      success: false,
+      provider: channelUpper,
+      status: 'FAILED',
+      deliveryStatus: 'UNSUPPORTED_CHANNEL',
+      error: `Unsupported communication channel: ${channelUpper}`,
+      code: 'UNSUPPORTED_CHANNEL',
+    };
+  }
+
   async sendMessageFromCall(
     callId: string,
     body: {
@@ -2350,8 +2634,25 @@ export class TelephonyService {
     let customer = session?.customer;
     if (!customer) {
       if (channelUpper === 'WHATSAPP' || channelUpper === 'VOICE') {
+        const cleanPhone = body.recipient.replace(/^whatsapp:/i, '').trim();
         customer = await this.prisma.customer.findFirst({
-          where: { phone: body.recipient.trim() }
+          where: {
+            OR: [
+              { phone: cleanPhone },
+              { phone: body.recipient.trim() }
+            ]
+          }
+        });
+      } else if (channelUpper === 'INSTAGRAM') {
+        const cleanIg = body.recipient.replace(/^ig_/, '').trim();
+        customer = await this.prisma.customer.findFirst({
+          where: {
+            OR: [
+              { platformUserId: cleanIg },
+              { phone: cleanIg },
+              { phone: `ig_${cleanIg}` }
+            ]
+          }
         });
       } else if (channelUpper === 'EMAIL') {
         customer = await this.prisma.customer.findFirst({
@@ -2361,11 +2662,15 @@ export class TelephonyService {
     }
 
     if (!customer) {
+      const isIg = channelUpper === 'INSTAGRAM';
+      const cleanIg = isIg ? body.recipient.replace(/^ig_/, '').trim() : null;
       customer = await this.prisma.customer.create({
         data: {
-          name: lead?.customerName || (channelUpper === 'EMAIL' ? body.recipient.split('@')[0] : `Customer ${body.recipient}`),
-          phone: channelUpper === 'WHATSAPP' ? body.recipient.trim() : (lead?.phoneNumber || `+91${Date.now().toString().slice(-10)}`),
+          name: lead?.customerName || (isIg && cleanIg ? `Instagram User (${cleanIg.slice(-4)})` : (channelUpper === 'EMAIL' ? body.recipient.split('@')[0] : `Customer ${body.recipient}`)),
+          phone: isIg && cleanIg ? `ig_${cleanIg}` : (channelUpper === 'WHATSAPP' ? body.recipient.trim().replace(/^whatsapp:/i, '') : (lead?.phoneNumber || `+91${Date.now().toString().slice(-10)}`)),
           email: channelUpper === 'EMAIL' ? body.recipient.trim() : (lead?.email || null),
+          platform: isIg ? 'INSTAGRAM' : (channelUpper === 'WHATSAPP' ? 'WHATSAPP' : null),
+          platformUserId: cleanIg || null,
         }
       });
     }
@@ -2397,9 +2702,78 @@ export class TelephonyService {
       });
     }
 
-    const providerMessageId = `msg_${channelUpper.toLowerCase()}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    // DISPATCH MESSAGE VIA ACTUAL PROVIDER (Meta Cloud API, Twilio WhatsApp, Meta Graph API, or Nodemailer)
+    const dispatchResult = await this.dispatchExternalMessage(
+      channelUpper,
+      body.recipient.trim(),
+      body.message.trim(),
+      { subject: body.subject }
+    );
 
-    // Create Message in Conversation
+    // If Provider Rejected Delivery, persist as FAILED and report exact error
+    if (!dispatchResult.success) {
+      const failedMessage = await this.prisma.message.create({
+        data: {
+          conversationId: conversation.id,
+          content: body.message.trim(),
+          senderType: 'AGENT',
+          status: 'FAILED',
+          isAiSuggested: false,
+        }
+      });
+
+      if (lead) {
+        await this.prisma.leadActivity.create({
+          data: {
+            leadId: lead.id,
+            callSessionId: session?.id || null,
+            conversationId: conversation.id,
+            agentId: user?.agentId || null,
+            type: 'COMMUNICATION',
+            channel: channelUpper,
+            direction: 'OUTBOUND',
+            title: `FAILED Outbound ${channelUpper} to ${body.recipient}`,
+            content: body.message.trim(),
+            status: 'FAILED',
+            metadata: {
+              error: dispatchResult.error,
+              code: dispatchResult.code,
+              provider: dispatchResult.provider,
+              deliveryStatus: dispatchResult.deliveryStatus,
+              failedAt: new Date().toISOString(),
+              senderUserId: user?.id || user?.userId || null,
+            }
+          }
+        });
+      }
+
+      try {
+        this.telephonyGateway.server.emit('omnichannelMessageFailed', {
+          conversationId: conversation.id,
+          messageId: failedMessage.id,
+          channel: channelUpper,
+          recipient: body.recipient,
+          error: dispatchResult.error,
+          code: dispatchResult.code,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (_) {}
+
+      throw new BadRequestException({
+        success: false,
+        message: dispatchResult.error || 'Provider rejected message delivery',
+        code: dispatchResult.code || 'PROVIDER_DELIVERY_FAILED',
+        provider: dispatchResult.provider,
+        deliveryStatus: dispatchResult.deliveryStatus,
+        conversationId: conversation.id,
+        messageId: failedMessage.id,
+        status: 'FAILED',
+      });
+    }
+
+    // Provider accepted delivery: persist as SENT
+    const providerMessageId = dispatchResult.providerMessageId || `msg_${channelUpper.toLowerCase()}_${Date.now()}`;
+
     const messageRecord = await this.prisma.message.create({
       data: {
         conversationId: conversation.id,
@@ -2409,6 +2783,22 @@ export class TelephonyService {
         isAiSuggested: false,
       }
     });
+
+    // Save to WhatsappLog if WhatsApp
+    if (channelUpper === 'WHATSAPP') {
+      try {
+        await this.prisma.whatsappLog.create({
+          data: {
+            conversationId: conversation.id,
+            phone: body.recipient.trim(),
+            message: body.message.trim(),
+            direction: 'OUTBOUND',
+            status: 'SENT',
+            twilioSid: providerMessageId,
+          }
+        });
+      } catch (_) {}
+    }
 
     // Create LeadActivity entry if lead exists
     let leadActivity: any = null;
@@ -2428,6 +2818,8 @@ export class TelephonyService {
           status: 'SENT',
           metadata: {
             subject: body.subject || null,
+            provider: dispatchResult.provider,
+            deliveryStatus: dispatchResult.deliveryStatus,
             senderUserId: user?.id || user?.userId || null,
             senderEmail: user?.email || null,
             deliveredAt: new Date().toISOString(),
@@ -2450,6 +2842,7 @@ export class TelephonyService {
       this.telephonyGateway.server.emit('omnichannelMessageSent', {
         conversationId: conversation.id,
         messageId: messageRecord.id,
+        providerMessageId,
         channel: channelUpper,
         recipient: body.recipient,
         content: body.message,
@@ -2465,6 +2858,7 @@ export class TelephonyService {
       recipient: body.recipient,
       status: 'SENT',
       deliveryStatus: 'ACCEPTED_BY_PROVIDER',
+      provider: dispatchResult.provider,
       conversationId: conversation.id,
       leadActivityId: leadActivity?.id || null,
       timestamp: messageRecord.createdAt.toISOString(),

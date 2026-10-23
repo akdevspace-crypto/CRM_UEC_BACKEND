@@ -663,6 +663,8 @@ export class AnalyticsController {
       agentCallsHandledToday,
       ticketsRaisedToday,
       ticketsResolvedToday,
+      totalTicketsRaised,
+      pendingTickets,
       unreadConversationsCount,
       repliedConversationsCount,
       waitingQueueCount,
@@ -722,6 +724,19 @@ export class AnalyticsController {
           status: { in: ['RESOLVED', 'CLOSED'] },
           ...(agentId ? { agentId } : {}),
         }
+      }).catch(() => 0),
+
+      // Total Tickets Raised by logged-in agent (all time)
+      this.prisma.ticket.count({
+        where: agentId ? { agentId } : {},
+      }).catch(() => 0),
+
+      // Pending / Unresolved Tickets assigned to logged-in agent
+      this.prisma.ticket.count({
+        where: {
+          status: { notIn: ['RESOLVED', 'CLOSED'] },
+          ...(agentId ? { agentId } : {}),
+        },
       }).catch(() => 0),
 
       this.prisma.conversation.count({
@@ -898,6 +913,8 @@ export class AnalyticsController {
         targetRemaining,
         dailyTarget,
         completedWork,
+        totalTicketsRaised,
+        pendingTickets,
       },
       analytics: {
         callLogsVolume,

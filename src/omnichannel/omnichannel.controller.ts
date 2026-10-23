@@ -1,5 +1,6 @@
 import { Controller, Get, Param, Logger, Put, Req, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { resolveBestCustomerName } from './name-resolution.util';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -37,10 +38,10 @@ export class OmnichannelController {
     return conversations.map(c => ({
       id: c.id,
       customerId: c.customerId,
-      customerName: c.customer?.name || 'Unknown',
+      customerName: resolveBestCustomerName(c.customer, c.lead, c.channel),
       customerPhone: c.customer?.phone || null,
       customerEmail: c.customer?.email || null,
-      customerAvatar: (c.customer as any)?.avatarUrl || null,
+      customerAvatar: c.customer?.instagramProfilePic || (c.customer as any)?.avatarUrl || null,
       foundation: c.foundation || 'UEC',
       enquiryCategory: c.enquiryCategory || 'SERVICE_ENQUIRY',
       primaryService: c.primaryService || null,
@@ -91,9 +92,10 @@ export class OmnichannelController {
     return {
       id: conversation.id,
       customerId: conversation.customerId,
-      customerName: conversation.customer?.name || 'Unknown',
+      customerName: resolveBestCustomerName(conversation.customer, conversation.lead, conversation.channel),
       customerPhone: conversation.customer?.phone || null,
       customerEmail: conversation.customer?.email || null,
+      customerAvatar: conversation.customer?.instagramProfilePic || (conversation.customer as any)?.avatarUrl || null,
       foundation: conversation.foundation || 'UEC',
       enquiryCategory: conversation.enquiryCategory || 'SERVICE_ENQUIRY',
       primaryService: conversation.primaryService || null,

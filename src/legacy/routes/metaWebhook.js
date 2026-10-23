@@ -138,7 +138,7 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
             });
 
             if (!customer) {
-              const defaultName = platform === 'INSTAGRAM' ? 'Instagram Contact' : `${platform} User ${senderId.substring(0, 5)}`;
+              const defaultName = platform === 'INSTAGRAM' ? `Instagram User (${senderId.slice(-4)})` : `${platform} User ${senderId.substring(0, 5)}`;
               const syntheticPhone = `ig_${senderId}`;
               
               customer = await prisma.customer.create({

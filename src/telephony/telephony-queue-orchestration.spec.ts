@@ -361,7 +361,7 @@ async function runTelephonyTestSuite() {
   console.log('\n--- 6. HIGH-CONCURRENCY RACE CONDITION SIMULATION ---');
 
   // Configure a tight 3-channel capacity pool
-  await capacityService.updateCapacityConfig('vobiz', { totalChannels: 3, inboundReserved: 0, maxOutbound: 3 });
+  await capacityService.updateCapacityConfig('vobiz', { totalChannels: 3, inboundReserved: 0, maxOutboundChannels: 3 });
 
   // Simulate 10 simultaneous inbound calls executing concurrently via Promise.all
   const concurrentCalls = Array.from({ length: 10 }, (_, i) => `concurrent_call_${i + 1}`);

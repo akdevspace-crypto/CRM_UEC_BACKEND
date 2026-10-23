@@ -15,6 +15,7 @@ const Redis = require('ioredis');
 require('dotenv').config();
 const { setupSignaling } = require('./signaling');
 const { vobizWebhookRouter } = require('./vobiz');
+const { resolveBestCustomerName, isGenericName } = require('./nameResolution');
 
 const redisClient = process.env.REDIS_URL
   ? new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null })
@@ -250,7 +251,7 @@ app.get('/api/v1/conversations', requireAuth, async (req, res) => {
     const formatted = conversations.map(c => ({
       id: c.id,
       customerId: c.customer?.id,
-      customerName: c.channel === 'INSTAGRAM' && c.customer?.instagramUsername ? c.customer.instagramUsername : (c.customer?.name || 'Unknown'),
+      customerName: resolveBestCustomerName(c.customer, null, c.channel),
       customerAvatar: c.customer?.instagramProfilePic || null,
       customerEmail: c.customer?.email || 'unknown@example.com',
       channel: c.channel.toLowerCase(),
@@ -658,30 +659,73 @@ app.post('/webhooks/whatsapp', async (req, res) => {
   }
 
   const fromNumber = req.body.From; // format: 'whatsapp:+1234567890'
+  const cleanPhone = String(fromNumber || '').replace(/^whatsapp:/i, '').trim();
   const bodyText = req.body.Body;
-  const profileName = req.body.ProfileName || 'WhatsApp User';
+  const rawProfileName = (req.body.ProfileName || '').trim();
+  const isProfileGeneric = !rawProfileName || isGenericName(rawProfileName);
 
   const messageData = {
     from: fromNumber,
+    cleanPhone,
     body: bodyText,
-    profile: profileName,
+    profile: rawProfileName || 'WhatsApp User',
     timestamp: new Date(),
   };
   console.log(messageData);
 
   try {
-    // 1. Find or create Customer
-    let customer = await prisma.customer.findFirst({ where: { phone: fromNumber } });
+    // 1. Find existing Customer by clean phone or formatted phone
+    let customer = await prisma.customer.findFirst({
+      where: {
+        OR: [
+          { phone: cleanPhone },
+          { phone: fromNumber }
+        ]
+      }
+    });
+
+    // 2. Find linked Lead by phone number
+    const linkedLead = await prisma.lead.findFirst({
+      where: {
+        OR: [
+          { phoneNumber: cleanPhone },
+          { phoneNumber: fromNumber }
+        ]
+      }
+    });
+
     if (!customer) {
+      const determinedName = (linkedLead && linkedLead.customerName && !isGenericName(linkedLead.customerName))
+        ? linkedLead.customerName
+        : (!isProfileGeneric ? rawProfileName : `Customer ${cleanPhone}`);
+
       customer = await prisma.customer.create({
         data: {
-          name: profileName,
-          phone: fromNumber,
+          name: determinedName,
+          phone: cleanPhone,
+          platform: 'WHATSAPP'
         }
       });
+    } else {
+      // Customer exists. Never overwrite a verified customer name.
+      // If customer has a generic name and a real profileName is supplied, enrich it.
+      const updates = {};
+      if (isGenericName(customer.name) && !isProfileGeneric) {
+        updates.name = rawProfileName;
+      }
+      // Normalize phone format if needed
+      if (customer.phone.startsWith('whatsapp:')) {
+        updates.phone = cleanPhone;
+      }
+      if (Object.keys(updates).length > 0) {
+        customer = await prisma.customer.update({
+          where: { id: customer.id },
+          data: updates
+        });
+      }
     }
 
-    // 2. Find open conversation or create new one
+    // 3. Find open conversation or create new one
     let conversation = await prisma.conversation.findFirst({
       where: { customerId: customer.id, channel: 'WHATSAPP', status: 'OPEN' }
     });
@@ -690,10 +734,16 @@ app.post('/webhooks/whatsapp', async (req, res) => {
       conversation = await prisma.conversation.create({
         data: {
           customerId: customer.id,
+          leadId: linkedLead ? linkedLead.id : null,
           channel: 'WHATSAPP',
           priority: 'NORMAL',
           unreadCount: 0
         }
+      });
+    } else if (!conversation.leadId && linkedLead) {
+      conversation = await prisma.conversation.update({
+        where: { id: conversation.id },
+        data: { leadId: linkedLead.id }
       });
     }
 
