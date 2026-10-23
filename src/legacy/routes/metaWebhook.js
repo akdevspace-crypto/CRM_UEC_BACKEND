@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const prisma = require('../prisma');
 const { enqueueInstagramEnrichment } = require('../queues/instagramEnrichment');
+const { analyzeAndSaveConversation } = require('../ai-gemini');
 const crypto = require('crypto');
 const Redis = require('ioredis');
 
@@ -43,7 +44,7 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
   const body = req.body;
   const io = req.app.get('io');
 
-  // Verify HMAC-SHA256 signature if META_APP_SECRET is set
+  // Verify HMAC-SHA256 signature if META_APP_SECRET is configured
   const appSecret = process.env.META_APP_SECRET;
   if (appSecret) {
     const signature = req.headers['x-hub-signature-256'];
@@ -51,7 +52,12 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
       console.warn('❌ [SECURITY] Missing x-hub-signature-256 header on Meta webhook');
       return res.status(401).json({ error: 'Signature required' });
     }
-    const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(body);
+    const rawBody = Buffer.isBuffer(req.rawBody)
+      ? req.rawBody
+      : typeof req.rawBody === 'string'
+        ? Buffer.from(req.rawBody, 'utf8')
+        : Buffer.from(JSON.stringify(body), 'utf8');
+
     const expectedSignature = 'sha256=' + crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex');
     try {
       const sigBuf = Buffer.from(signature);
@@ -71,7 +77,7 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
   // 1. Separate parsers based on object type
   if (body.object === 'instagram' || body.object === 'page') {
     try {
-      for (const entry of body.entry) {
+      for (const entry of (body.entry || [])) {
         // Some Instagram payloads use 'messaging', others use 'changes'
         let messagingEvents = entry.messaging || [];
         
@@ -87,13 +93,14 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
         for (const webhookEvent of messagingEvents) {
           // Check if this is a message event
           if (webhookEvent.message) {
-            const senderId = webhookEvent.sender.id;
-            const recipientId = webhookEvent.recipient.id;
+            const senderId = webhookEvent.sender ? webhookEvent.sender.id : null;
+            const recipientId = webhookEvent.recipient ? webhookEvent.recipient.id : null;
             const messageObj = webhookEvent.message;
-            const text = messageObj.text || '[Attachment/Media]';
             const messageId = messageObj.mid;
             const timestamp = webhookEvent.timestamp || Date.now();
             
+            if (!senderId) continue;
+
             const platform = body.object === 'instagram' ? 'INSTAGRAM' : 'MESSENGER';
             
             // Ignore echoes (messages sent by our own page/app)
@@ -102,21 +109,51 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
               continue;
             }
 
+            // Extract message text and attachments
+            let text = messageObj.text || '';
+            if (messageObj.attachments && Array.isArray(messageObj.attachments) && messageObj.attachments.length > 0) {
+              const attachList = messageObj.attachments.map(att => {
+                const type = att.type || 'media';
+                const url = att.payload?.url || '';
+                return url ? `[${type.toUpperCase()}: ${url}]` : `[${type.toUpperCase()}]`;
+              }).join('\n');
+              text = text ? `${text}\n${attachList}` : attachList;
+            }
+            if (!text.trim()) {
+              text = '[Attachment/Media]';
+            }
+
             console.log(`[Meta ${platform}] Received message from ${senderId}: ${text}`);
             
-            // Strictly use the Postgres ENUM (INSTAGRAM or MESSENGER)
-            const channelStr = platform;
-            
-            // 2. Resolve Customer
-            let customer = await prisma.customer.findFirst({ where: { phone: senderId } });
+            // 2. Resolve Customer Identity
+            let customer = await prisma.customer.findFirst({
+              where: {
+                OR: [
+                  { platformUserId: senderId },
+                  { platformIdentities: { some: { platform, platformUserId: senderId } } },
+                  { phone: senderId },
+                  { phone: `ig_${senderId}` }
+                ]
+              }
+            });
+
             if (!customer) {
-              const defaultName = platform === 'INSTAGRAM' ? 'Instagram User (Pending Sync)' : `${platform} User ${senderId.substring(0, 5)}`;
+              const defaultName = platform === 'INSTAGRAM' ? 'Instagram Contact' : `${platform} User ${senderId.substring(0, 5)}`;
+              const syntheticPhone = `ig_${senderId}`;
+              
               customer = await prisma.customer.create({
                 data: { 
                   name: defaultName, 
-                  phone: senderId,
+                  phone: syntheticPhone,
                   platform: platform,
-                  platformUserId: senderId
+                  platformUserId: senderId,
+                  platformIdentities: {
+                    create: {
+                      platform: platform,
+                      platformUserId: senderId,
+                      username: null
+                    }
+                  }
                 }
               });
               console.log(`[DB] Created new customer: ${customer.id}`);
@@ -139,14 +176,14 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
 
             // 3. Resolve Conversation
             let conversation = await prisma.conversation.findFirst({
-              where: { customerId: customer.id, channel: channelStr, status: 'OPEN' }
+              where: { customerId: customer.id, channel: platform, status: 'OPEN' }
             });
 
             if (!conversation) {
               conversation = await prisma.conversation.create({
                 data: {
                   customerId: customer.id,
-                  channel: channelStr,
+                  channel: platform,
                   priority: 'NORMAL',
                   unreadCount: 0
                 }
@@ -177,7 +214,7 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
               }
             });
 
-            // 5. Update Conversation Unread Count
+            // 5. Update Conversation Unread Count & Timestamp
             const updatedConv = await prisma.conversation.update({
               where: { id: conversation.id },
               data: { 
@@ -187,7 +224,12 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
               include: { customer: true }
             });
 
-            // 6. Emit Realtime Events
+            // 6. Trigger AI Enquiry Intelligence
+            analyzeAndSaveConversation(conversation.id, io).catch(err => {
+              console.error('[Meta Webhook] AI Enquiry Intelligence error:', err.message);
+            });
+
+            // 7. Emit Realtime Events
             if (io) {
               const socketPayload = { 
                 conversation: updatedConv, 
@@ -199,8 +241,9 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
 
               // Standard generic event (handles UI injection)
               io.emit('new_message', socketPayload);
+              io.emit('conversationUpdated', updatedConv);
               
-              // Platform specific events requested by user
+              // Platform specific events
               if (platform === 'INSTAGRAM') {
                 console.log('📡 => Emitting Socket.io event: new_instagram_message');
                 io.emit('new_instagram_message', socketPayload);
@@ -215,13 +258,13 @@ router.post(['/webhook', '/webhooks/meta'], async (req, res) => {
       res.status(200).send('EVENT_RECEIVED');
     } catch (err) {
       console.error('❌ Failed to process Meta webhook:', err);
-      // Meta expects 200 even on processing errors to stop retrying unless we specifically want a retry
       res.status(200).send('EVENT_RECEIVED');
     }
   } else {
-    // Return a '404 Not Found' if event is not from a page subscription
+    // Return a '404 Not Found' if event is not from a supported subscription
     res.sendStatus(404);
   }
 });
 
 module.exports = router;
+

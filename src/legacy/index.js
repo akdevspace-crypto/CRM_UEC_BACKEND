@@ -369,6 +369,57 @@ app.get('/api/v1/agents', requireAuth, async (req, res) => {
   }
 });
 
+// Dispatch Outgoing Instagram Message via Meta Graph API (Messenger API for Instagram)
+async function dispatchInstagramMessage(customerIgId, messageText, mediaUrl = null) {
+  const token = process.env.META_PAGE_ACCESS_TOKEN || process.env.META_ACCESS_TOKEN || process.env.ACCESS_TOKEN;
+  if (!token) {
+    const err = new Error('Meta Page Access Token is not configured');
+    err.code = 'PROVIDER_NOT_CONFIGURED';
+    throw err;
+  }
+  const cleanId = String(customerIgId).replace(/^ig_/, '');
+  const url = `https://graph.facebook.com/v22.0/me/messages`;
+
+  const payload = {
+    recipient: { id: cleanId },
+    messaging_type: 'RESPONSE'
+  };
+
+  if (mediaUrl) {
+    payload.message = {
+      attachment: {
+        type: 'image',
+        payload: { url: mediaUrl }
+      }
+    };
+  } else {
+    payload.message = { text: messageText };
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await response.json();
+  if (!response.ok || data.error) {
+    const errMsg = data.error?.message || 'Meta Graph API rejected message delivery';
+    const errCode = data.error?.code || 'META_API_ERROR';
+    console.error(`[Meta Send Error] Code ${errCode}: ${errMsg}`);
+    const err = new Error(errMsg);
+    err.code = errCode;
+    err.details = data.error;
+    throw err;
+  }
+
+  console.log(`✅ Meta Instagram Message Delivered. Provider MID: ${data.message_id}`);
+  return data;
+}
+
 // Send new message
 app.post('/api/v1/messages/send', requireAuth, async (req, res) => {
   const { conversationId, content, senderType } = req.body;
@@ -379,6 +430,35 @@ app.post('/api/v1/messages/send', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'content is required' });
   }
   try {
+    const conversation = await prisma.conversation.findUnique({
+      where: { id: conversationId },
+      include: { customer: true }
+    });
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    let providerMessageId = null;
+    const isAgent = (senderType || 'AGENT') === 'AGENT';
+
+    // If Instagram channel and agent sending, dispatch via Meta Graph API
+    if (conversation.channel === 'INSTAGRAM' && isAgent) {
+      const recipientId = conversation.customer?.platformUserId || conversation.customer?.phone;
+      if (recipientId) {
+        try {
+          const igRes = await dispatchInstagramMessage(recipientId, content);
+          providerMessageId = igRes.message_id;
+        } catch (providerErr) {
+          console.error('Meta Instagram Send Failed:', providerErr.message);
+          return res.status(400).json({
+            error: 'Failed to deliver message via Instagram',
+            details: providerErr.message,
+            code: providerErr.code || 'PROVIDER_DELIVERY_FAILED'
+          });
+        }
+      }
+    }
+
     const newMessage = await prisma.message.create({
       data: {
         conversationId,
@@ -390,9 +470,16 @@ app.post('/api/v1/messages/send', requireAuth, async (req, res) => {
 
     // Broadcast to WebSocket clients
     io.emit('new_message', { conversationId, message: newMessage });
+    const updatedConv = await prisma.conversation.update({
+      where: { id: conversationId },
+      data: { updatedAt: new Date() },
+      include: { customer: true }
+    });
+    io.emit('conversationUpdated', updatedConv);
+
     analyzeAndSaveConversation(conversationId, io).catch(console.error);
 
-    res.json(newMessage);
+    res.json({ ...newMessage, providerMessageId });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to send message' });
@@ -740,16 +827,15 @@ app.get('/test-send', requireAuth, requireRole(['SUPER_ADMIN']), async (req, res
 });
 
 // OUTGOING INSTAGRAM
-const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || process.env.META_ACCESS_TOKEN || '';
-
 app.post('/api/messages/send-instagram', requireAuth, async (req, res) => {
-  const { conversationId, message } = req.body;
-  if (!IG_ACCESS_TOKEN) {
-    return res.status(503).json({
-      error: 'Instagram service unavailable: Meta access token not configured',
-      code: 'PROVIDER_NOT_CONFIGURED'
-    });
+  const { conversationId, message, imageUrl } = req.body;
+  if (!conversationId) {
+    return res.status(400).json({ error: 'conversationId is required' });
   }
+  if (!message && !imageUrl) {
+    return res.status(400).json({ error: 'message or imageUrl is required' });
+  }
+
   try {
     const conversation = await prisma.conversation.findUnique({
       where: { id: conversationId },
@@ -758,46 +844,30 @@ app.post('/api/messages/send-instagram', requireAuth, async (req, res) => {
 
     if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
 
-    const customerIgId = conversation.customer.phone; // We stored the IG senderId in phone
-
-    // 1. Send via Instagram Graph API
-    const igResponse = await fetch('https://graph.instagram.com/v21.0/me/messages', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${IG_ACCESS_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        recipient: { id: customerIgId },
-        message: { text: message }
-      })
-    });
-
-    const igData = await igResponse.json();
-
-    if (!igResponse.ok) {
-      console.error('Instagram API Error:', igData);
-      throw new Error(igData.error?.message || 'Failed to send Instagram message');
+    const customerIgId = conversation.customer.platformUserId || conversation.customer.phone;
+    if (!customerIgId) {
+      return res.status(400).json({ error: 'Customer has no valid Instagram recipient identifier' });
     }
 
-    console.log('✅ Instagram Message Sent:', igData.message_id);
+    // 1. Send via Meta Graph API
+    const igData = await dispatchInstagramMessage(customerIgId, message, imageUrl);
 
     // 2. Save outgoing message to DB
     const savedMessage = await prisma.message.create({
       data: {
         conversationId,
-        content: message,
+        content: message || '[Image Attached]',
         senderType: 'AGENT',
-        status: 'SENT' // Initially SENT upon provider submission; transitions to DELIVERED/READ via webhook
+        status: 'SENT'
       }
     });
 
     // 3. Broadcast
     io.emit('new_message', { conversationId, message: savedMessage });
-    io.emit('messageSent', { conversationId, status: 'Success' });
+    io.emit('messageSent', { conversationId, status: 'Success', providerMessageId: igData.message_id });
     analyzeAndSaveConversation(conversationId, io).catch(console.error);
 
-    // Update unread and timestamp
+    // Update timestamp
     const updatedConv = await prisma.conversation.update({
       where: { id: conversationId },
       data: { updatedAt: new Date() },
@@ -805,10 +875,14 @@ app.post('/api/messages/send-instagram', requireAuth, async (req, res) => {
     });
     io.emit('conversationUpdated', updatedConv);
 
-    res.json({ success: true, message: savedMessage });
+    res.json({ success: true, message: savedMessage, providerMessageId: igData.message_id });
   } catch (err) {
-    console.error('❌ Instagram Send Error:', err);
-    res.status(500).json({ error: 'Failed to send Instagram message', details: err.message });
+    console.error('❌ Instagram Send Error:', err.message);
+    res.status(400).json({
+      error: 'Failed to send Instagram message',
+      details: err.message,
+      code: err.code || 'PROVIDER_ERROR'
+    });
   }
 });
 

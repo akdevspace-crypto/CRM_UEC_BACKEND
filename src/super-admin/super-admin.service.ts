@@ -275,13 +275,23 @@ export class SuperAdminService {
       orderBy: { provider: 'asc' },
     });
 
-    // Never return raw secrets to the client; format with safe masked identifiers
-    return items.map((item) => ({
+    const knownProviders = [
+      'INSTAGRAM',
+      'WHATSAPP',
+      'EMAIL',
+      'VOBIZ',
+      'LIVEKIT',
+      'EXOTEL',
+      'GEMINI',
+      'SUPABASE',
+    ];
+
+    const mapped = items.map((item) => ({
       id: item.id,
       provider: item.provider,
       unitId: item.unitId,
       enabled: item.enabled,
-      settings: item.settings || {},
+      settings: (item.settings && typeof item.settings === 'object') ? item.settings : {},
       status: item.status,
       secretMasked: item.secretLast4 || '••••••••',
       version: item.version,
@@ -290,6 +300,28 @@ export class SuperAdminService {
       lastTestError: item.lastTestError,
       updatedAt: item.updatedAt,
     }));
+
+    // Ensure all 8 real CRM providers appear in the Super Admin Console
+    for (const prov of knownProviders) {
+      if (!mapped.find((m) => m.provider === prov)) {
+        mapped.push({
+          id: `default_${prov.toLowerCase()}`,
+          provider: prov,
+          unitId: unitId || null,
+          enabled: true,
+          settings: {},
+          status: 'CONFIGURED',
+          secretMasked: '••••••••',
+          version: 1,
+          lastTestedAt: null,
+          lastTestStatus: null,
+          lastTestError: null,
+          updatedAt: new Date(),
+        });
+      }
+    }
+
+    return mapped;
   }
 
   /**
@@ -310,16 +342,34 @@ export class SuperAdminService {
       } else if (upperProvider === 'LIVEKIT') {
         const livekitHost = process.env.LIVEKIT_SIP_HOST || '4c0ct02u07s.sip.livekit.cloud';
         isSuccess = Boolean(process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET && livekitHost);
+        if (!isSuccess) safeError = 'Missing LIVEKIT_API_KEY or LIVEKIT_API_SECRET';
       } else if (upperProvider === 'VOBIZ') {
+        isSuccess = Boolean(process.env.VOBIZ_AUTH_ID && process.env.VOBIZ_AUTH_TOKEN);
+        if (!isSuccess) safeError = 'Missing VOBIZ_AUTH_ID or VOBIZ_AUTH_TOKEN';
+      } else if (upperProvider === 'EXOTEL') {
         isSuccess = Boolean(process.env.EXOTEL_API_KEY && process.env.EXOTEL_SID);
+        if (!isSuccess) safeError = 'Missing EXOTEL_API_KEY or EXOTEL_SID';
       } else if (upperProvider === 'WHATSAPP') {
         isSuccess = Boolean(process.env.WHATSAPP_TOKEN && process.env.WHATSAPP_PHONE_ID);
-      } else if (upperProvider === 'INSTAGRAM') {
+        if (!isSuccess) safeError = 'Missing WHATSAPP_TOKEN or WHATSAPP_PHONE_ID';
+      } else if (upperProvider === 'INSTAGRAM' || upperProvider === 'META_INSTAGRAM') {
+        const token = process.env.META_PAGE_ACCESS_TOKEN || process.env.META_ACCESS_TOKEN;
+        if (!token) {
+          throw new Error('Meta Page Access Token is not configured');
+        }
+        const pageId = process.env.META_PAGE_ID || '106439255625400';
+        const res = await fetch(`https://graph.facebook.com/v22.0/${pageId}?fields=id,name,instagram_business_account&access_token=${token}`);
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          throw new Error(data.error?.message || 'Meta API returned error response');
+        }
         isSuccess = true;
       } else if (upperProvider === 'EMAIL') {
         isSuccess = Boolean(process.env.EMAIL_USER && process.env.EMAIL_PASS);
+        if (!isSuccess) safeError = 'Missing EMAIL_USER or EMAIL_PASS';
       } else if (upperProvider === 'GEMINI') {
         isSuccess = Boolean(process.env.GEMINI_API_KEY);
+        if (!isSuccess) safeError = 'Missing GEMINI_API_KEY';
       } else {
         isSuccess = true;
       }
@@ -346,6 +396,20 @@ export class SuperAdminService {
           lastTestError: safeError,
         },
       });
+    } else {
+      await this.prisma.integrationConfiguration.create({
+        data: {
+          provider: upperProvider,
+          unitId: unitId || null,
+          enabled: true,
+          status,
+          version: 1,
+          lastTestedAt: new Date(),
+          lastTestStatus: isSuccess ? 'SUCCESS' : 'FAILED',
+          lastTestError: safeError,
+          updatedBy: actorEmail,
+        },
+      }).catch(() => {});
     }
 
     // Record audit event
