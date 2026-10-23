@@ -4,11 +4,33 @@ import { RoomServiceClient, SipClient } from 'livekit-server-sdk';
 
 @Injectable()
 export class LivekitService implements OnModuleInit {
-  private roomServiceClient: RoomServiceClient;
-  private sipClient: SipClient;
+  public roomServiceClient: RoomServiceClient;
+  public sipClient: SipClient;
   private readonly logger = new Logger(LivekitService.name);
 
   constructor(private configService: ConfigService) {}
+
+  async removeParticipant(roomName: string, identity: string): Promise<boolean> {
+    if (!this.roomServiceClient) return false;
+    try {
+      await this.roomServiceClient.removeParticipant(roomName, identity);
+      this.logger.log(`[LIVEKIT] Successfully removed participant: ${identity} from room: ${roomName}`);
+      return true;
+    } catch (e: any) {
+      this.logger.warn(`[LIVEKIT] Could not remove participant ${identity}: ${e.message}`);
+      return false;
+    }
+  }
+
+  async listParticipants(roomName: string): Promise<any[]> {
+    if (!this.roomServiceClient) return [];
+    try {
+      return await this.roomServiceClient.listParticipants(roomName);
+    } catch (e: any) {
+      this.logger.warn(`[LIVEKIT] Could not list participants for ${roomName}: ${e.message}`);
+      return [];
+    }
+  }
 
   onModuleInit() {
     const livekitApiUrl = this.configService.get<string>('LIVEKIT_API_URL');
