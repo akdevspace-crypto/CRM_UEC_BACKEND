@@ -95,6 +95,21 @@ export class EnquiryController {
     return await this.enquiryService.saveCallIntake(callSidOrId, dto, req.user);
   }
 
+  // 4b. Standalone / Manual Lead Structured Intake Persistence
+  @Post('leads/intake')
+  async saveStructuredEnquiry(@Body() dto: SaveCallIntakeDto, @Req() req: any) {
+    return await this.enquiryService.saveStructuredEnquiryLead(dto, req.user);
+  }
+
+  @Patch('leads/:id/intake')
+  async updateStructuredEnquiry(
+    @Param('id') leadId: string,
+    @Body() dto: SaveCallIntakeDto,
+    @Req() req: any,
+  ) {
+    return await this.enquiryService.saveStructuredEnquiryLead(dto, req.user, leadId);
+  }
+
   // 5. Incremental Live Notes Auto-Save
   @Patch('live-notes/:targetType/:id')
   async saveLiveNotes(

@@ -566,6 +566,22 @@ export class EnquiryService {
   // ==========================================
   // INBOUND & OUTBOUND CALL INTAKE FORM PERSISTENCE
   // ==========================================
+  private normalizePhone(raw?: string | null): string {
+    if (!raw) return '';
+    let clean = String(raw).trim();
+    try { clean = decodeURIComponent(clean); } catch (_) {}
+    const lower = clean.toLowerCase();
+    if (['unknown', 'anonymous', 'withheld', 'internal', 'private', 'none'].includes(lower)) {
+      return '';
+    }
+    let digits = clean.replace(/[^\d+]/g, '');
+    if (digits.startsWith('00')) digits = '+' + digits.substring(2);
+    else if (digits.startsWith('0') && digits.length === 11) digits = '+91' + digits.substring(1);
+    else if (!digits.startsWith('+') && digits.length === 10) digits = '+91' + digits;
+    else if (!digits.startsWith('+') && digits.startsWith('91') && digits.length === 12) digits = '+' + digits;
+    return digits;
+  }
+
   async saveCallIntake(callSidOrId: string, dto: SaveCallIntakeDto, user: any) {
     // Locate call session by ID or reason (Vobiz provider callSid)
     const session = await this.prisma.callSession.findFirst({
@@ -576,7 +592,7 @@ export class EnquiryService {
           { livekitRoom: callSidOrId },
         ],
       },
-      include: { lead: true },
+      include: { lead: true, customer: true },
     });
 
     if (!session) throw new NotFoundException('CallSession not found');
@@ -603,12 +619,67 @@ export class EnquiryService {
       },
     });
 
-    // Update or link lead if leadId present
-    const targetLeadId = dto.leadId || session.leadId;
+    // Update or link lead
+    let targetLeadId = dto.leadId || session.leadId;
+    const cleanPhone = this.normalizePhone(dto.phone || session.customer?.phone);
+
+    if (!targetLeadId && cleanPhone) {
+      // Find existing lead by phone to prevent duplicates
+      const existing = await this.prisma.lead.findFirst({
+        where: { phoneNumber: { contains: cleanPhone.slice(-10) } },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (existing) {
+        targetLeadId = existing.id;
+      } else {
+        // Create brand new Lead
+        const createdLead = await this.prisma.lead.create({
+          data: {
+            customerName: dto.enquirerName || session.customer?.name || 'Inbound Enquirer',
+            phoneNumber: cleanPhone,
+            email: dto.email || session.customer?.email || null,
+            serviceInterest: dto.primaryService || dto.serviceCategory || 'Elder Care',
+            source: (session as any).direction === 'OUTBOUND' || (session.reason && session.reason.includes('outbound')) ? 'Outbound Call' : 'Inbound Call',
+            status: 'NEW',
+            priority: isAmbulance ? LeadPriority.EMERGENCY : LeadPriority.NORMAL,
+            foundation: dto.foundation || 'UEC',
+            enquiryCategory: dto.enquiryCategory as any,
+            primaryService: dto.primaryService || null,
+            subServices: dto.subServices || [],
+            patientName: dto.patientName || null,
+            patientAge: dto.patientAge ?? null,
+            patientConditions: dto.patientConditions || null,
+            patientMobility: dto.patientMobility || null,
+            engagementType: dto.engagementType || null,
+            careDurationCategory: dto.careDurationCategory || null,
+            careDuration: dto.careDuration || null,
+            careSchedule: dto.careSchedule || null,
+            serviceAddress: dto.serviceAddress || null,
+            cityDistrict: dto.cityDistrict || null,
+            postalCode: dto.postalCode || null,
+            pickupLocation: dto.pickupLocation || null,
+            destinationLocation: dto.destinationLocation || null,
+            isAmbulanceEmergency: isAmbulance,
+            notes: dto.liveNotes || null,
+            assignedAgentId: user?.agentId || null,
+          },
+        });
+        targetLeadId = createdLead.id;
+      }
+      // Link session to the lead
+      await this.prisma.callSession.update({
+        where: { id: session.id },
+        data: { leadId: targetLeadId },
+      });
+    }
+
+    let updatedLead: any = null;
     if (targetLeadId) {
-      await this.prisma.lead.update({
+      updatedLead = await this.prisma.lead.update({
         where: { id: targetLeadId },
         data: {
+          ...(dto.enquirerName ? { customerName: dto.enquirerName } : {}),
+          ...(dto.email ? { email: dto.email } : {}),
           ...(dto.foundation ? { foundation: dto.foundation } : {}),
           ...(dto.serviceCategory ? { serviceInterest: dto.serviceCategory } : {}),
           ...(dto.enquiryCategory ? { enquiryCategory: dto.enquiryCategory } : {}),
@@ -629,6 +700,7 @@ export class EnquiryService {
           ...(dto.destinationLocation ? { destinationLocation: dto.destinationLocation } : {}),
           isAmbulanceEmergency: isAmbulance,
           priority: isAmbulance ? LeadPriority.EMERGENCY : undefined,
+          ...(dto.liveNotes ? { notes: dto.liveNotes } : {}),
         },
       });
 
@@ -656,11 +728,144 @@ export class EnquiryService {
             where: { id: targetLeadId },
             data: { status: 'FOLLOWUP_REQUIRED' },
           });
+          updatedLead.status = 'FOLLOWUP_REQUIRED';
         }
       }
     }
 
-    return { success: true, session: updatedSession };
+    return { success: true, session: updatedSession, lead: updatedLead };
+  }
+
+  /**
+   * Save or update structured enquiry directly (manual entry, website, or editing an existing lead)
+   */
+  async saveStructuredEnquiryLead(dto: SaveCallIntakeDto, user: any, leadId?: string) {
+    const isAmbulance =
+      dto.foundation === 'AMBULANCE' ||
+      dto.primaryService?.toLowerCase().includes('ambulance') ||
+      dto.subServices?.some(s => s.toLowerCase().includes('ambulance'));
+
+    const cleanPhone = this.normalizePhone(dto.phone);
+    if (!cleanPhone && !leadId) {
+      throw new BadRequestException('Valid phone number is required for lead enquiry');
+    }
+
+    let targetLead = null;
+    if (leadId) {
+      targetLead = await this.prisma.lead.findUnique({ where: { id: leadId } });
+      if (!targetLead) throw new NotFoundException('Lead not found');
+    } else if (cleanPhone) {
+      targetLead = await this.prisma.lead.findFirst({
+        where: { phoneNumber: { contains: cleanPhone.slice(-10) } },
+        orderBy: { createdAt: 'desc' },
+      });
+    }
+
+    const leadPriority: LeadPriority = isAmbulance
+      ? LeadPriority.EMERGENCY
+      : dto.callbackPriority === 'HIGH'
+      ? LeadPriority.HIGH
+      : LeadPriority.NORMAL;
+
+    let savedLead;
+    if (targetLead) {
+      // Update existing lead transactionally
+      savedLead = await this.prisma.lead.update({
+        where: { id: targetLead.id },
+        data: {
+          customerName: dto.enquirerName || targetLead.customerName,
+          phoneNumber: cleanPhone || targetLead.phoneNumber,
+          email: dto.email !== undefined ? dto.email : targetLead.email,
+          serviceInterest: dto.primaryService || dto.serviceCategory || targetLead.serviceInterest,
+          foundation: dto.foundation || targetLead.foundation || 'UEC',
+          enquiryCategory: (dto.enquiryCategory as any) || targetLead.enquiryCategory,
+          primaryService: dto.primaryService || targetLead.primaryService,
+          subServices: dto.subServices && dto.subServices.length > 0 ? dto.subServices : targetLead.subServices,
+          patientName: dto.patientName !== undefined ? dto.patientName : targetLead.patientName,
+          patientAge: dto.patientAge !== undefined ? dto.patientAge : targetLead.patientAge,
+          patientConditions: dto.patientConditions !== undefined ? dto.patientConditions : targetLead.patientConditions,
+          patientMobility: dto.patientMobility || targetLead.patientMobility,
+          engagementType: dto.engagementType || targetLead.engagementType,
+          careDurationCategory: dto.careDurationCategory || targetLead.careDurationCategory,
+          careDuration: dto.careDuration || targetLead.careDuration,
+          careSchedule: dto.careSchedule || targetLead.careSchedule,
+          serviceAddress: dto.serviceAddress !== undefined ? dto.serviceAddress : targetLead.serviceAddress,
+          cityDistrict: dto.cityDistrict !== undefined ? dto.cityDistrict : targetLead.cityDistrict,
+          postalCode: dto.postalCode !== undefined ? dto.postalCode : targetLead.postalCode,
+          pickupLocation: dto.pickupLocation !== undefined ? dto.pickupLocation : targetLead.pickupLocation,
+          destinationLocation: dto.destinationLocation !== undefined ? dto.destinationLocation : targetLead.destinationLocation,
+          isAmbulanceEmergency: isAmbulance,
+          priority: leadPriority,
+          notes: dto.liveNotes !== undefined ? dto.liveNotes : targetLead.notes,
+          ...(dto.status ? { status: dto.status as any } : {}),
+        },
+      });
+    } else {
+      // Create new lead
+      savedLead = await this.prisma.lead.create({
+        data: {
+          customerName: dto.enquirerName || 'Enquirer',
+          phoneNumber: cleanPhone,
+          email: dto.email || null,
+          serviceInterest: dto.primaryService || dto.serviceCategory || 'Elder Care',
+          source: dto.source || 'Manual Entry',
+          status: (dto.status as any) || 'NEW',
+          priority: leadPriority,
+          foundation: dto.foundation || 'UEC',
+          enquiryCategory: (dto.enquiryCategory as any) || EnquiryCategory.SERVICE_ENQUIRY,
+          primaryService: dto.primaryService || null,
+          subServices: dto.subServices || [],
+          patientName: dto.patientName || null,
+          patientAge: dto.patientAge ?? null,
+          patientConditions: dto.patientConditions || null,
+          patientMobility: dto.patientMobility || null,
+          engagementType: dto.engagementType || null,
+          careDurationCategory: dto.careDurationCategory || null,
+          careDuration: dto.careDuration || null,
+          careSchedule: dto.careSchedule || null,
+          serviceAddress: dto.serviceAddress || null,
+          cityDistrict: dto.cityDistrict || null,
+          postalCode: dto.postalCode || null,
+          pickupLocation: dto.pickupLocation || null,
+          destinationLocation: dto.destinationLocation || null,
+          isAmbulanceEmergency: isAmbulance,
+          notes: dto.liveNotes || null,
+          assignedAgentId: user?.agentId || null,
+        },
+      });
+    }
+
+    // Schedule follow-up if date is specified
+    if (dto.followupDate) {
+      let agentId = user?.agentId;
+      if (!agentId) {
+        const fallbackAgent = await this.prisma.agent.findFirst();
+        agentId = fallbackAgent?.id;
+      }
+      if (agentId) {
+        await this.prisma.leadFollowup.create({
+          data: {
+            leadId: savedLead.id,
+            assignedAgentId: agentId,
+            followupDate: new Date(dto.followupDate),
+            meetingType: 'CALLBACK',
+            notes: dto.liveNotes || `Enquiry intake disposition: ${dto.callOutcome || 'Completed'}`,
+            status: 'PENDING',
+          },
+        });
+        await this.prisma.lead.update({
+          where: { id: savedLead.id },
+          data: { status: 'FOLLOWUP_REQUIRED' },
+        });
+        savedLead.status = 'FOLLOWUP_REQUIRED';
+      }
+    }
+
+    return {
+      success: true,
+      lead: savedLead,
+      message: targetLead ? 'Enquiry updated successfully' : 'Enquiry created successfully',
+    };
   }
 
   // ==========================================

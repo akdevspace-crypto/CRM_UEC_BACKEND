@@ -138,12 +138,29 @@ router.post('/', async (req, res) => {
         customerName: customerName || 'Unknown Lead',
         phoneNumber: trimmedPhone,
         email: email || null,
-        serviceInterest: serviceInterest || null,
+        serviceInterest: req.body.primaryService || serviceInterest || null,
         notes: notes || null,
         source: source || 'Manual Entry',
         city: city || null,
         assignedAgentId: effectiveAgentId,
-        status: status || 'NEW'
+        status: status || 'NEW',
+        primaryService: req.body.primaryService || null,
+        subServices: req.body.subServices || [],
+        patientName: req.body.patientName || null,
+        patientAge: req.body.patientAge !== undefined ? parseInt(req.body.patientAge, 10) : null,
+        patientConditions: req.body.patientConditions || null,
+        patientMobility: req.body.patientMobility || null,
+        engagementType: req.body.engagementType || null,
+        careDurationCategory: req.body.careDurationCategory || null,
+        careDuration: req.body.careDuration || null,
+        careSchedule: req.body.careSchedule || null,
+        serviceAddress: req.body.serviceAddress || null,
+        cityDistrict: req.body.cityDistrict || null,
+        postalCode: req.body.postalCode || null,
+        pickupLocation: req.body.pickupLocation || null,
+        destinationLocation: req.body.destinationLocation || null,
+        foundation: req.body.foundation || null,
+        enquiryCategory: req.body.enquiryCategory || null,
       }
     });
 
@@ -173,6 +190,38 @@ function invalidateLeadsCache() {
   leadsDbCache.clear();
 }
 
+// Helper to generate readable summary for "What Are They Looking For?"
+function generateEnquirySummary(lead) {
+  const parts = [];
+  const service = lead.primaryService || lead.serviceInterest;
+  if (service && service !== 'Unknown') parts.push(`Service: ${service}`);
+
+  const requirements = [];
+  if (lead.subServices && Array.isArray(lead.subServices) && lead.subServices.length > 0) {
+    requirements.push(lead.subServices.join(', '));
+  }
+  if (lead.patientConditions) {
+    requirements.push(lead.patientConditions);
+  }
+  if (requirements.length > 0) {
+    parts.push(`Requirements: ${requirements.join(' • ')}`);
+  }
+
+  if (lead.careDurationCategory || lead.careDuration) {
+    parts.push(`Duration: ${lead.careDurationCategory || lead.careDuration}`);
+  }
+
+  if (lead.careSchedule) {
+    parts.push(`Schedule: ${lead.careSchedule}`);
+  }
+
+  if (parts.length === 0) {
+    return 'Details not recorded';
+  }
+
+  return parts.join(' | ');
+}
+
 // GET /api/v1/leads
 router.get('/', async (req, res) => {
   try {
@@ -188,6 +237,8 @@ router.get('/', async (req, res) => {
         { customerName: { contains: searchTerm, mode: 'insensitive' } },
         { phoneNumber: { contains: searchTerm } },
         { email: { contains: searchTerm, mode: 'insensitive' } },
+        { primaryService: { contains: searchTerm, mode: 'insensitive' } },
+        { patientName: { contains: searchTerm, mode: 'insensitive' } },
       ];
     }
 
@@ -219,6 +270,25 @@ router.get('/', async (req, res) => {
             sentiment: true,
             createdAt: true,
             assignedAgentId: true,
+            foundation: true,
+            enquiryCategory: true,
+            primaryService: true,
+            subServices: true,
+            patientName: true,
+            patientAge: true,
+            patientConditions: true,
+            patientMobility: true,
+            engagementType: true,
+            careDurationCategory: true,
+            careDuration: true,
+            careSchedule: true,
+            serviceAddress: true,
+            cityDistrict: true,
+            postalCode: true,
+            pickupLocation: true,
+            destinationLocation: true,
+            notes: true,
+            isAmbulanceEmergency: true,
             assignedAgent: {
               select: { name: true }
             },
@@ -226,7 +296,19 @@ router.get('/', async (req, res) => {
               select: { followupDate: true },
               orderBy: { followupDate: 'asc' },
               take: 1
-            }
+            },
+            callSessions: {
+              select: {
+                id: true,
+                startedAt: true,
+                endedAt: true,
+                duration: true,
+                status: true,
+                recordingUrl: true,
+              },
+              take: 1,
+              orderBy: { startedAt: 'desc' },
+            },
           },
           orderBy: { createdAt: 'desc' },
           skip: skip,
@@ -251,7 +333,7 @@ router.get('/', async (req, res) => {
     const formatted = leads.map(l => {
       let phone = l.phoneNumber;
       if (!isElevated) {
-        if (l.assignedAgentId !== reqAgentId) {
+        if (l.assignedAgentId && l.assignedAgentId !== reqAgentId) {
           // Mask phone: XXXXXX4521
           phone = phone.length > 4 ? 'X'.repeat(phone.length - 4) + phone.slice(-4) : 'XXXX';
         }
@@ -270,7 +352,26 @@ router.get('/', async (req, res) => {
         createdAt: l.createdAt,
         agentName: l.assignedAgent?.name || 'Unassigned',
         assignedAgentId: l.assignedAgentId,
-        nextFollowup: l.followups[0] ? l.followups[0].followupDate : null
+        nextFollowup: l.followups[0] ? l.followups[0].followupDate : null,
+        foundation: l.foundation,
+        enquiryCategory: l.enquiryCategory,
+        primaryService: l.primaryService,
+        subServices: l.subServices || [],
+        patientName: l.patientName,
+        patientAge: l.patientAge,
+        patientConditions: l.patientConditions,
+        patientMobility: l.patientMobility,
+        engagementType: l.engagementType,
+        careDurationCategory: l.careDurationCategory,
+        careDuration: l.careDuration,
+        careSchedule: l.careSchedule,
+        serviceAddress: l.serviceAddress,
+        cityDistrict: l.cityDistrict,
+        postalCode: l.postalCode,
+        notes: l.notes,
+        isAmbulanceEmergency: l.isAmbulanceEmergency,
+        enquirySummary: generateEnquirySummary(l),
+        lastCall: l.callSessions?.[0] || null,
       };
     });
 
@@ -305,7 +406,8 @@ router.get('/:id', async (req, res) => {
 
     res.json({
       ...lead,
-      phoneNumber: phone
+      phoneNumber: phone,
+      enquirySummary: generateEnquirySummary(lead),
     });
   } catch (err) {
     console.error(err);
@@ -344,6 +446,22 @@ router.put('/:id', async (req, res) => {
     if (notes !== undefined) updateData.notes = notes;
     if (source !== undefined) updateData.source = source;
     if (assignedAgentId !== undefined && isElevated) updateData.assignedAgentId = assignedAgentId;
+    if (req.body.primaryService !== undefined) updateData.primaryService = req.body.primaryService;
+    if (req.body.subServices !== undefined) updateData.subServices = req.body.subServices;
+    if (req.body.patientName !== undefined) updateData.patientName = req.body.patientName;
+    if (req.body.patientAge !== undefined) updateData.patientAge = req.body.patientAge;
+    if (req.body.patientConditions !== undefined) updateData.patientConditions = req.body.patientConditions;
+    if (req.body.patientMobility !== undefined) updateData.patientMobility = req.body.patientMobility;
+    if (req.body.engagementType !== undefined) updateData.engagementType = req.body.engagementType;
+    if (req.body.careDurationCategory !== undefined) updateData.careDurationCategory = req.body.careDurationCategory;
+    if (req.body.careDuration !== undefined) updateData.careDuration = req.body.careDuration;
+    if (req.body.careSchedule !== undefined) updateData.careSchedule = req.body.careSchedule;
+    if (req.body.serviceAddress !== undefined) updateData.serviceAddress = req.body.serviceAddress;
+    if (req.body.cityDistrict !== undefined) updateData.cityDistrict = req.body.cityDistrict;
+    if (req.body.postalCode !== undefined) updateData.postalCode = req.body.postalCode;
+    if (req.body.pickupLocation !== undefined) updateData.pickupLocation = req.body.pickupLocation;
+    if (req.body.destinationLocation !== undefined) updateData.destinationLocation = req.body.destinationLocation;
+    if (req.body.status !== undefined) updateData.status = req.body.status;
 
     const updatedLead = await prisma.lead.update({
       where: { id: leadId },

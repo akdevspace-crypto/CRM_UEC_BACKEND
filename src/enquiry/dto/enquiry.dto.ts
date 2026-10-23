@@ -313,6 +313,14 @@ export class SaveCallIntakeDto {
   @IsOptional()
   @IsString()
   callbackPriority?: string;
+
+  @IsOptional()
+  @IsString()
+  source?: string;
+
+  @IsOptional()
+  @IsString()
+  status?: string;
 }
 
 export class SaveLiveNotesDto {
