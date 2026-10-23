@@ -1,10 +1,29 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { TelephonyProvider, NormalizedCallEvent, OutboundCallRequest } from './telephony-provider.interface';
+import { TelephonyProvider, NormalizedCallEvent, OutboundCallRequest, ProviderCapabilities } from './telephony-provider.interface';
 import fetch from 'node-fetch';
 
 @Injectable()
 export class ExotelProvider implements TelephonyProvider {
   private readonly logger = new Logger(ExotelProvider.name);
+
+  getCapabilities(): ProviderCapabilities {
+    return {
+      provider: 'exotel',
+      supportsInboundBridge: false,
+      supportsOutboundApi: true,
+      supportsRealtimeCapacityQuery: false,
+      supportsCarrierQueue: false,
+      supportsCarrierHold: false,
+      supportsCarrierTransfer: false,
+      defaultChannelCapacity: parseInt(process.env.EXOTEL_CHANNEL_CAPACITY || '5', 10),
+      channelsPerCall: {
+        inboundActive: 1,
+        inboundHeld: 1,
+        outboundActive: 1,
+        warmTransfer: 1,
+      },
+    };
+  }
 
   normalizeWebhookEvent(payload: any, method: string): NormalizedCallEvent {
     // Exotel payloads are similar to TwiML

@@ -1,4 +1,4 @@
-import { Controller, Post, Req, Logger, Header, HttpCode, HttpStatus, UnauthorizedException, ForbiddenException, BadRequestException } from '@nestjs/common';
+import { Controller, Post, Get, Req, Logger, Header, HttpCode, HttpStatus, UnauthorizedException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import type { Request } from 'express';
 import { TelephonyService } from './telephony.service';
 import { VobizProvider } from './providers/vobiz.provider';
@@ -13,6 +13,13 @@ export class VobizController {
     private readonly telephonyService: TelephonyService,
     private readonly vobizProvider: VobizProvider,
   ) {}
+
+  @Public()
+  @Get('incoming')
+  @HttpCode(HttpStatus.OK)
+  async probeIncoming() {
+    return { status: 'ok', endpoint: '/vobiz/incoming', provider: 'vobiz', timestamp: new Date() };
+  }
 
   @Public()
   @Post('incoming')
@@ -31,11 +38,25 @@ export class VobizController {
     // Normalize event using Vobiz Provider
     const event = this.vobizProvider.normalizeWebhookEvent(payload, req.method);
     
-    // Idempotency check handled in service
-    await this.telephonyService.processNormalizedEvent(event, req);
+    // Process event asynchronously/non-blocking
+    const processed = await this.telephonyService.processNormalizedEvent(event, req);
     
-    const roomName = event.roomName || `room_${event.providerCallId || Date.now()}`;
+    // Fix DEF-01: Deterministic room naming aligned with LiveKit SIP
+    const roomName = event.roomName || `call_${event.providerCallId || Date.now()}`;
+
+    // If capacity exhausted or call rejected, return busy/overflow XML
+    if (processed === false && (!event.roomName || payload?.Status === 'busy')) {
+      return this.vobizProvider.generateBusyResponse?.() || this.vobizProvider.generateBridgeResponse(roomName, this.getBaseUrl(req));
+    }
+
     return this.vobizProvider.generateBridgeResponse(roomName, this.getBaseUrl(req));
+  }
+
+  @Public()
+  @Get('status')
+  @HttpCode(HttpStatus.OK)
+  async probeStatus() {
+    return { status: 'ok', endpoint: '/vobiz/status', provider: 'vobiz', timestamp: new Date() };
   }
 
   @Public()

@@ -203,11 +203,8 @@ export class TelephonyGateway
       this.logger.log('SUCCESS: Emit executed for specific socket');
     } else {
       this.logger.warn(
-        `No socketId provided for assigned agent. Fallback to global broadcast.`,
+        `No socketId provided for assigned agent (${payload.assignedAgent?.name || payload.assignedAgent?.id}). Skipping emit to avoid contact center ringing leakage.`,
       );
-      this.server.emit('incoming_call', payload);
-      this.server.emit('proxy_flush', ' '.repeat(131072));
-      this.logger.log('SUCCESS: Emit executed globally');
     }
   }
 

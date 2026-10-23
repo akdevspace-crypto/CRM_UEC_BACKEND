@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { TelephonyProvider, NormalizedCallEvent, OutboundCallRequest } from './telephony-provider.interface';
+import { TelephonyProvider, NormalizedCallEvent, OutboundCallRequest, ProviderCapabilities } from './telephony-provider.interface';
 import { LivekitService } from '../livekit.service';
 
 @Injectable()
@@ -81,13 +81,47 @@ export class VobizProvider implements TelephonyProvider {
     };
   }
 
+  getCapabilities(): ProviderCapabilities {
+    return {
+      provider: 'vobiz',
+      supportsInboundBridge: true,
+      supportsOutboundApi: true,
+      supportsRealtimeCapacityQuery: false,
+      supportsCarrierQueue: false,
+      supportsCarrierHold: true,
+      supportsCarrierTransfer: true,
+      defaultChannelCapacity: parseInt(process.env.VOBIZ_CHANNEL_CAPACITY || '3', 10),
+      channelsPerCall: {
+        inboundActive: 1,
+        inboundHeld: 1,
+        outboundActive: 1,
+        warmTransfer: 2,
+      },
+    };
+  }
+
   generateBridgeResponse(roomName: string, baseUrl: string): string {
-    const livekitSipDomain = process.env.LIVEKIT_SIP_HOST || process.env.LIVEKIT_SIP_URI?.replace(/^sip:/, '') || '23jy3gv6xcs.sip.livekit.cloud';
+    const livekitSipDomain = process.env.LIVEKIT_SIP_HOST || process.env.LIVEKIT_SIP_URI?.replace(/^sip:/, '') || '4c0ct02u07s.sip.livekit.cloud';
     return `
 <Response>
     <Dial action="${baseUrl}/telephony/vobiz/status">
         <Sip>sip:${roomName}@${livekitSipDomain}</Sip>
     </Dial>
+</Response>`.trim();
+  }
+
+  generateBusyResponse(): string {
+    return `
+<Response>
+    <Speak>Thank you for calling ElderCare. All our care coordinators are currently assisting other families. Please hold while we connect you to the next available agent.</Speak>
+</Response>`.trim();
+  }
+
+  generateHoldResponse(holdAudioUrl?: string): string {
+    const audio = holdAudioUrl || `${process.env.BACKEND_URL || 'https://crm-uec-backend.onrender.com'}/audio/hold-music.mp3`;
+    return `
+<Response>
+    <Play loop="0">${audio}</Play>
 </Response>`.trim();
   }
 

@@ -50,14 +50,15 @@ export class QueueService {
     );
 
     try {
-      // 1. Build eligibility query
+      // 1. Build eligibility query - require AVAILABLE, activeCalls: 0, and ACTIVE socket connection!
       const where: any = {
         status: 'AVAILABLE',
         isDeleted: false,
         activeCalls: 0, // Enforce single active voice call capacity
+        socketId: { not: null }, // Critical: prevent assigning to disconnected agents
       };
 
-      if (department) {
+      if (department && department !== 'GENERAL' && !isEmergency) {
         where.department = department;
       }
 
@@ -191,18 +192,114 @@ export class QueueService {
    */
   async enqueueCallItem(callSessionId: string, customerId?: string, department = 'GENERAL', priority = 'NORMAL') {
     try {
+      const isValidUuid = (val?: string) =>
+        typeof val === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
+      const safeCallSessionId = isValidUuid(callSessionId) ? callSessionId : null;
+      const safeCustomerId = isValidUuid(customerId) ? customerId : '00000000-0000-0000-0000-000000000000';
+
       return await (this.prisma as any).queueItem.create({
         data: {
-          callSessionId,
-          customerId: customerId || '00000000-0000-0000-0000-000000000000',
+          callSessionId: safeCallSessionId,
+          customerId: safeCustomerId,
           department,
           priority,
           status: 'WAITING',
+          outcome: callSessionId, // Store original callSid string in outcome during WAITING
           enteredAt: new Date(),
         },
       });
     } catch (e: any) {
       this.logger.warn(`[QUEUE-ITEM] Could not create queue item: ${e.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Dequeues the next waiting call item in priority order (EMERGENCY > HIGH > NORMAL > LOW)
+   * and allocates it to an available agent with active browser WebSocket connectivity.
+   */
+  async dequeueAndAllocateNext(department?: string): Promise<{ assigned: boolean; callSessionId?: string; agentId?: string; agentName?: string } | null> {
+    try {
+      // 1. Fetch pending calls waiting in queue
+      const waitingItems = await (this.prisma as any).queueItem.findMany({
+        where: {
+          status: 'WAITING',
+          ...(department ? { department } : {}),
+        },
+        orderBy: [{ enteredAt: 'asc' }],
+        take: 20,
+      });
+
+      if (!waitingItems || waitingItems.length === 0) {
+        return null;
+      }
+
+      // 2. Sort by priority weight
+      const priorityWeights: Record<string, number> = {
+        EMERGENCY: 4,
+        HIGH: 3,
+        NORMAL: 2,
+        LOW: 1,
+      };
+
+      waitingItems.sort((a: any, b: any) => {
+        const weightA = priorityWeights[a.priority] || 2;
+        const weightB = priorityWeights[b.priority] || 2;
+        if (weightA !== weightB) return weightB - weightA;
+        return new Date(a.enteredAt).getTime() - new Date(b.enteredAt).getTime();
+      });
+
+      const nextItem = waitingItems[0];
+      const now = Date.now();
+      const waitSeconds = Math.floor((now - new Date(nextItem.enteredAt).getTime()) / 1000);
+      const maxWaitSeconds = 300; // 5 minutes max wait before overflow
+
+      // 3. Check for Queue Timeout Overflow
+      if (waitSeconds > maxWaitSeconds) {
+        this.logger.warn(`[QUEUE-TIMEOUT] Call ${nextItem.callSessionId || nextItem.id} timed out after ${waitSeconds}s in queue. Triggering overflow.`);
+        await (this.prisma as any).queueItem.update({
+          where: { id: nextItem.id },
+          data: { status: 'OVERFLOW', outcome: 'OVERFLOW_CALLBACK', waitDuration: waitSeconds },
+        });
+        return null;
+      }
+
+      // 4. Attempt to allocate an available agent
+      const assignedAgent = await this.allocateAgent({
+        department: nextItem.department,
+        callSid: nextItem.callSessionId || nextItem.id,
+        isEmergency: nextItem.priority === 'EMERGENCY',
+      });
+
+      if (!assignedAgent) {
+        // No agent currently free or available
+        return null;
+      }
+
+      // 5. Update QueueItem to ASSIGNED
+      const returnedCallSid = nextItem.callSessionId || nextItem.outcome || nextItem.id;
+
+      await (this.prisma as any).queueItem.update({
+        where: { id: nextItem.id },
+        data: {
+          status: 'ASSIGNED',
+          assignedAgentId: assignedAgent.id,
+          assignedAt: new Date(),
+          waitDuration: waitSeconds,
+          outcome: 'ANSWERED',
+        },
+      });
+
+      this.logger.log(`[QUEUE-DEQUEUED] Dequeued callSessionId=${returnedCallSid} -> assigned to agent=${assignedAgent.name}`);
+
+      return {
+        assigned: true,
+        callSessionId: returnedCallSid,
+        agentId: assignedAgent.id,
+        agentName: assignedAgent.name,
+      };
+    } catch (e: any) {
+      this.logger.error(`[QUEUE-DEQUEUE] Error: ${e.message}`);
       return null;
     }
   }
@@ -277,6 +374,16 @@ export class QueueService {
         abandoned: abandonedToday,
         answerRate,
       },
+      waitingQueueDetails: waitingQueueItems.map((item: any) => ({
+        id: item.id,
+        callSessionId: item.callSessionId,
+        department: item.department || 'GENERAL',
+        priority: item.priority || 'NORMAL',
+        enteredAt: item.enteredAt,
+        waitSeconds: item.enteredAt
+          ? Math.max(Math.floor((now.getTime() - new Date(item.enteredAt).getTime()) / 1000), 0)
+          : 0,
+      })),
       agentRoster: allAgents.map((a) => ({
         id: a.id,
         name: a.name,

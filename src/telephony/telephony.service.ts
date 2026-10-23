@@ -1,4 +1,4 @@
-import { Injectable, Logger, Inject, forwardRef, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, Inject, forwardRef, NotFoundException, ForbiddenException, BadRequestException, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
@@ -7,6 +7,7 @@ import { QueueService } from '../queue-orchestration/queue.service';
 import { TelephonyGateway } from './telephony.gateway';
 import { LivekitService } from './livekit.service';
 import { AnalyticsService } from '../analytics/analytics.service';
+import { CapacityService } from './capacity/capacity.service';
 import { NormalizedCallEvent, OutboundCallRequest } from './providers/telephony-provider.interface';
 import type { FileInfo } from '@livekit/protocol';
 
@@ -21,6 +22,7 @@ export class TelephonyService {
     @Inject(forwardRef(() => TelephonyGateway)) private readonly telephonyGateway: TelephonyGateway,
     @Inject(forwardRef(() => LivekitService)) private readonly livekitService: LivekitService,
     private readonly analyticsService: AnalyticsService,
+    @Optional() private readonly capacityService?: CapacityService,
   ) { }
 
   // ==========================================
@@ -43,6 +45,7 @@ export class TelephonyService {
 
       return {
         customer: customer || lead || null,
+        lead: lead || null,
         priority: customer ? (customer as any).priority || 'Normal' : 'Normal',
         servicePlans: customer?.servicePlans || [],
         tickets: customer?.tickets || [],
@@ -380,15 +383,15 @@ export class TelephonyService {
         terminationResult = await this.livekitService.terminateLiveKitCall(session.livekitRoom, callSid, session.livekitSipParticipantIdentity || undefined);
       }
 
-      // If termination failed and this is an explicit user end, do not blindly end
-      if (terminationResult === 'not_found' && !forceCleanup) {
-        this.logger.log(`[CALL-LIFECYCLE] ` + JSON.stringify({
-          event: 'termination_failed',
-          sessionID: callSid,
-          roomName: session.livekitRoom,
-          reason: 'SIP Participant not found. Waiting for provider webhook to confirm termination.'
-        }));
-        return; // Wait for webhook
+      // If termination returned not_found, the participant/room has already closed.
+      // We must NEVER abort early, as that strands calls in RINGING / IN_PROGRESS (Fix DEF-05).
+      if (terminationResult === 'not_found') {
+        this.logger.log(`[CALL-LIFECYCLE] LiveKit room/participant already closed. Proceeding to finalize DB session ${callSid}`);
+      }
+
+      // Release global capacity channel
+      if (this.capacityService) {
+        await this.capacityService.releaseChannel(callSid, (session.transferHistory as any)?.provider || 'vobiz').catch(() => {});
       }
 
       let finalDuration = duration;
@@ -2024,16 +2027,28 @@ export class TelephonyService {
         });
       }
 
-      if (!assignedAgent) {
-        // Fallback: Check if any agent is marked AVAILABLE
-        const fallbackAgent = await this.prisma.agent.findFirst({
-          where: { status: 'AVAILABLE', isDeleted: false },
-          orderBy: { activeCalls: 'asc' },
-        });
-        if (fallbackAgent) {
-          this.logger.log(`[INBOUND-TRACE] Fallback to available agent: ${fallbackAgent.name} (${fallbackAgent.id})`);
-          assignedAgent = fallbackAgent;
+      // Global Capacity Reservation for Inbound Call
+      if (this.capacityService) {
+        const capRes = await this.capacityService.reserveChannel('INBOUND', event.providerCallId, event.provider || 'vobiz');
+        if (!capRes.success) {
+          this.logger.warn(`[INBOUND-CAPACITY] Carrier capacity limit reached: ${capRes.reason}. Enqueueing to waiting pool.`);
+          await this.queueService.enqueueCallItem(
+            event.providerCallId,
+            customerContext?.customer?.id,
+            isEmergency ? 'EMERGENCY' : 'GENERAL',
+            isEmergency ? 'EMERGENCY' : 'NORMAL'
+          );
+          return false;
         }
+      }
+
+      if (!assignedAgent) {
+        // Fallback: Attempt allocation through QueueService ensuring atomic locks and socket checks are strictly preserved (Fix DEF-03)
+        assignedAgent = await this.queueService.allocateAgent({
+          department: isEmergency ? 'EMERGENCY' : undefined,
+          isEmergency,
+          callSid: event.providerCallId,
+        });
       }
 
       this.logger.log(`[INBOUND-TRACE] AGENT_SELECTION | callId=${event.providerCallId} assignedAgentId=${assignedAgent?.id}`);
@@ -2052,35 +2067,35 @@ export class TelephonyService {
       this.logger.log(`[INBOUND-TRACE] PROVIDER_SELECTION | callId=${event.providerCallId} provider=${event.provider}`);
       this.logger.log(`[INBOUND-TRACE] MEDIA_ROUTING | callId=${event.providerCallId} routing_to=livekit`);
 
-      let roomName = event.roomName || `call_${event.providerCallId}`;
-      let sipParticipantIdentity = null;
-      let sipParticipantRoom = null;
+      // Fix DEF-01: Deterministic room naming aligned with LiveKit and Vobiz bridge XML
+      const roomName = `call_${event.providerCallId}`;
+      event.roomName = roomName;
 
-      this.logger.log(`[INBOUND-LIVEKIT] callId=${event.providerCallId} backendRoom=${roomName}`);
+      this.logger.log(`[INBOUND-LIVEKIT] Established deterministic roomName=${roomName} for callId=${event.providerCallId}`);
 
-      if (event.direction === 'INBOUND' || !event.direction) {
-        this.logger.log(`[INBOUND-LIVEKIT] Polling LiveKit to find actual SIP participant room for ${event.fromNumber}...`);
-        const livekitRoomInfo = await this.livekitService.findInboundSipRoom(event.fromNumber);
-
-        if (livekitRoomInfo) {
-          roomName = livekitRoomInfo.roomName;
-          sipParticipantIdentity = livekitRoomInfo.participantIdentity;
-          sipParticipantRoom = livekitRoomInfo.roomName;
-          this.logger.log(`[INBOUND-LIVEKIT] sipParticipantCreated=true sipParticipantIdentity=${sipParticipantIdentity} sipParticipantRoom=${sipParticipantRoom}`);
-          this.logger.log(`[INBOUND-LIVEKIT] roomMatch=true`);
-        } else {
-          this.logger.log(`[INBOUND-LIVEKIT] sipParticipantCreated=false sipParticipantIdentity=null sipParticipantRoom=null`);
-          this.logger.log(`[INBOUND-LIVEKIT] roomMatch=false`);
+      // Fix DEF-01: Asynchronous non-blocking background discovery of LiveKit SIP participant (reduces webhook delay from 10s to <100ms)
+      setTimeout(async () => {
+        try {
+          const livekitRoomInfo = await this.livekitService.findInboundSipRoom(event.fromNumber, 5, 1000);
+          if (livekitRoomInfo) {
+            this.logger.log(`[INBOUND-LIVEKIT-SYNC] Discovered SIP participant=${livekitRoomInfo.participantIdentity} in room=${livekitRoomInfo.roomName}`);
+            await this.prisma.callSession.updateMany({
+              where: { reason: event.providerCallId },
+              data: {
+                livekitSipParticipantIdentity: livekitRoomInfo.participantIdentity,
+              },
+            });
+          }
+        } catch (syncErr: any) {
+          this.logger.debug(`[INBOUND-LIVEKIT-SYNC] Background check: ${syncErr.message}`);
         }
-      }
-
-      event.roomName = roomName; // Ensure it's populated
+      }, 1500);
 
       if (event.direction === 'INBOUND') {
         this.logger.log(`[INBOUND-CALL] session_create_start | caller=${event.fromNumber} DID=${event.toNumber} providerCallUUID=${event.providerCallId}`);
       }
 
-      // Await session creation to ensure persistence before dispatch
+      // Await session creation to ensure persistence before dispatch (Fix DEF-06: pass customerContext?.lead?.id)
       try {
         const session = await this.createCallSession(
           event.providerCallId,
@@ -2088,15 +2103,11 @@ export class TelephonyService {
           customerContext?.customer?.id,
           assignedAgent.userId,
           event.direction || 'inbound',
-          event.fromNumber
+          event.fromNumber,
+          customerContext?.lead?.id, // Fix DEF-06: Associate Lead!
         );
 
-        if (session && sipParticipantIdentity) {
-          await this.prisma.callSession.updateMany({
-            where: { id: session.id },
-            data: { livekitSipParticipantIdentity: sipParticipantIdentity }
-          });
-        }
+        // LiveKit SIP participant identity is synchronized asynchronously in background task (Fix DEF-01)
 
         this.logger.log(`[INBOUND-TRACE] CALL_SESSION_CREATED | callId=${session?.id} providerCallId=${event.providerCallId} direction=inbound provider=${event.provider} status=${session?.status}`);
         if (event.direction === 'INBOUND') {
@@ -2191,31 +2202,51 @@ export class TelephonyService {
     const roomName = `call_outbound_${Date.now()}`;
     const callSid = roomName; // Using roomName as callSid temporarily for outbound trackability
 
-    // Lookup agent to attach to session
-    let agent = await this.prisma.agent.findFirst({
-      where: { userId: request.agentId },
-    });
-    if (!agent) {
-      agent = await this.prisma.agent.findUnique({ where: { id: request.agentId } });
+    // Global Capacity Orchestration: Check & Reserve Channel before dialing
+    if (this.capacityService) {
+      // Check inbound queue depth to enforce priority policy
+      const queueDashboard = await this.queueService.getQueueOperationsDashboard().catch(() => null);
+      const queueDepth = queueDashboard?.waitingCalls || 0;
+
+      const reservation = await this.capacityService.reserveChannel('OUTBOUND', callSid, providerType, { queueDepth });
+      if (!reservation.success) {
+        this.logger.warn(`[OUTBOUND-CAPACITY] Blocked dial to ${request.to}: reason=${reservation.reason}`);
+        return {
+          success: false,
+          reason: reservation.reason,
+          message: reservation.reason === 'THROTTLED_INBOUND_PRIORITY'
+            ? 'Outbound dialing temporarily paused: Inbound customer calls are waiting in queue.'
+            : 'Telephony channel capacity limit reached. Please wait for an active call to conclude.',
+        };
+      }
     }
 
-    // Create Call Session tracking record in the background
-    await this.createCallSession(
-      callSid,
-      roomName,
-      request.contactId, // Associate customer
-      agent?.userId,
-      'outbound',
-      request.to,
-      request.leadId,
-      request.conversationId,
-    );
+    try {
+      // Lookup agent to attach to session
+      let agent = await this.prisma.agent.findFirst({
+        where: { userId: request.agentId },
+      });
+      if (!agent) {
+        agent = await this.prisma.agent.findUnique({ where: { id: request.agentId } });
+      }
 
-    let providerResponse;
-    if (providerType === 'vobiz') {
-      const { VobizProvider } = require('./providers/vobiz.provider');
-      const vobizProvider = new VobizProvider(this.livekitService);
-      providerResponse = await vobizProvider.initiateOutboundCall(request, roomName);
+      // Create Call Session tracking record in the background
+      await this.createCallSession(
+        callSid,
+        roomName,
+        request.contactId, // Associate customer
+        agent?.userId,
+        'outbound',
+        request.to,
+        request.leadId,
+        request.conversationId,
+      );
+
+      let providerResponse;
+      if (providerType === 'vobiz') {
+        const { VobizProvider } = require('./providers/vobiz.provider');
+        const vobizProvider = new VobizProvider(this.livekitService);
+        providerResponse = await vobizProvider.initiateOutboundCall(request, roomName);
 
       // Persist the SIP participant identity
       if (providerResponse.sipParticipantIdentity) {
@@ -2253,6 +2284,13 @@ export class TelephonyService {
       provider: providerType,
       providerResponse
     };
+    } catch (err: any) {
+      if (this.capacityService) {
+        await this.capacityService.releaseChannel(callSid, providerType).catch(() => {});
+      }
+      this.logger.error(`[OUTBOUND-FAIL] Call initiation failed: ${err.message}`);
+      throw err;
+    }
   }
 
   public async triggerPostCallPipeline(session: any, recordingUrl: string | null = null) {

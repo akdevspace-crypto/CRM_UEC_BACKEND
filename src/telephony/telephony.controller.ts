@@ -9,6 +9,8 @@ import { ExotelProvider } from './providers/exotel.provider';
 import { PrismaService } from '../prisma/prisma.service';
 import { Public } from '../api-gateway/auth.guard';
 
+import { OverflowService } from './overflow/overflow.service';
+
 @Controller('telephony')
 export class TelephonyController {
   private readonly logger = new Logger(TelephonyController.name);
@@ -21,6 +23,7 @@ export class TelephonyController {
     private readonly vobizProvider: VobizProvider,
     private readonly exotelProvider: ExotelProvider,
     private readonly prisma: PrismaService,
+    private readonly overflowService: OverflowService,
   ) {}
 
   @Get('dashboard-calls')
@@ -31,6 +34,16 @@ export class TelephonyController {
   @Get('queue/operations')
   async getQueueOperations() {
     return await this.queueService.getQueueOperationsDashboard();
+  }
+
+  @Get('queue/callbacks')
+  async getQueueCallbacks() {
+    return await this.overflowService.getPendingCallbacks();
+  }
+
+  @Post('queue/callbacks/:id/process')
+  async processQueueCallback(@Param('id') id: string) {
+    return await this.overflowService.markCallbackProcessed(id);
   }
 
   @Get('history')

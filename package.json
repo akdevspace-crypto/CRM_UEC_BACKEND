@@ -5,7 +5,8 @@
   "scripts": {
     "build": "prisma generate && tsc -p tsconfig.build.json",
     "start": "node dist/src/main.js",
-    "dev": "npx @nestjs/cli start --watch"
+    "dev": "npx @nestjs/cli start --watch",
+    "test:telephony": "ts-node -T src/telephony/telephony-queue-orchestration.spec.ts"
   },
   "dependencies": {
     "@google/genai": "^2.27.0",

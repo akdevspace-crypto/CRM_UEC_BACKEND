@@ -24,7 +24,29 @@ export interface OutboundCallRequest {
   agentId: string;
 }
 
+export interface ProviderCapabilities {
+  provider: 'vobiz' | 'exotel' | 'livekit' | 'generic';
+  supportsInboundBridge: boolean;
+  supportsOutboundApi: boolean;
+  supportsRealtimeCapacityQuery: boolean;
+  supportsCarrierQueue: boolean;
+  supportsCarrierHold: boolean;
+  supportsCarrierTransfer: boolean;
+  defaultChannelCapacity: number;
+  channelsPerCall: {
+    inboundActive: number;
+    inboundHeld: number;
+    outboundActive: number;
+    warmTransfer: number;
+  };
+}
+
 export interface TelephonyProvider {
+  /**
+   * Return verified provider capabilities and default capacity characteristics.
+   */
+  getCapabilities(): ProviderCapabilities;
+
   /**
    * Normalizes an incoming webhook payload into a standard CRM call event.
    */
@@ -36,7 +58,22 @@ export interface TelephonyProvider {
   generateBridgeResponse(roomName: string, baseUrl: string): string;
 
   /**
+   * Generates a busy/capacity rejection XML response.
+   */
+  generateBusyResponse?(): string;
+
+  /**
+   * Generates a hold music XML response.
+   */
+  generateHoldResponse?(holdAudioUrl?: string): string;
+
+  /**
    * Initiates an outbound call via this provider.
    */
   initiateOutboundCall(request: OutboundCallRequest, roomName: string): Promise<any>;
+
+  /**
+   * Optional provider-level termination.
+   */
+  terminateCall?(providerCallId: string): Promise<boolean>;
 }
