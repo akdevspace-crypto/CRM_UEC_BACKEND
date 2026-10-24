@@ -193,6 +193,10 @@ export class LivekitService implements OnModuleInit {
       { audioOnly: true }
     );
 
+    if (!info || !info.egressId) {
+      throw new Error(`LiveKit Egress client returned empty egressId for room ${roomName}`);
+    }
+
     return info.egressId;
   }
 

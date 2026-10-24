@@ -15,7 +15,8 @@ import type { FileInfo } from '@livekit/protocol';
 export class TelephonyService {
   private readonly logger = new Logger(TelephonyService.name);
   private readonly terminatingSessions = new Set<string>();
-  private readonly recordingAttemptedRooms = new Set<string>();
+  private readonly recordingStartingInProgress = new Set<string>();
+  private readonly recordingRetryAttempts = new Map<string, number>();
 
   public isSessionTerminatedOrTerminating(sessionIdOrReason: string): boolean {
     return this.terminatingSessions.has(sessionIdOrReason);
@@ -443,16 +444,22 @@ export class TelephonyService {
     if (!roomName && !callSid) return;
     const lookupKey = roomName || callSid;
 
-    if (this.recordingAttemptedRooms.has(lookupKey) || (callSid && this.recordingAttemptedRooms.has(callSid))) {
-      this.logger.log(`[CALL-RECORDING] Recording start already attempted for roomName=${roomName} callSid=${callSid}. Skipping duplicate attempt.`);
+    // Concurrency safety: deduplicate concurrent in-flight start requests
+    if (this.recordingStartingInProgress.has(lookupKey) || (callSid && this.recordingStartingInProgress.has(callSid))) {
+      this.logger.log(`[CALL-RECORDING] Recording start already in-flight for roomName=${roomName} callSid=${callSid}. Skipping duplicate concurrent request.`);
       return;
     }
-    this.recordingAttemptedRooms.add(lookupKey);
-    if (callSid) this.recordingAttemptedRooms.add(callSid);
+
+    const currentAttempts = this.recordingRetryAttempts.get(lookupKey) || (callSid ? this.recordingRetryAttempts.get(callSid) : 0) || 0;
+    const MAX_RECORDING_RETRIES = 3;
+    if (currentAttempts >= MAX_RECORDING_RETRIES) {
+      this.logger.warn(`[CALL-RECORDING] Maximum recording start attempts (${MAX_RECORDING_RETRIES}) reached for roomName=${roomName} callSid=${callSid}. Skipping further retries.`);
+      return;
+    }
 
     let callSession: any = null;
     try {
-      this.logger.log(`[CALL-RECORDING] provider=livekit_egress callId=${callSid} roomName=${roomName}`);
+      this.logger.log(`[CALL-RECORDING] provider=livekit_egress callId=${callSid} roomName=${roomName} attempt=${currentAttempts + 1}`);
       const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(callSid);
       callSession = await this.prisma.callSession.findFirst({
         where: {
@@ -469,22 +476,22 @@ export class TelephonyService {
       }
 
       const isTerminal = ['ENDED', 'MISSED', 'CANCELLED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED'].includes(callSession.status);
-      if (isTerminal ||
-        callSession.recordingStatus === 'RECORDING' ||
-        callSession.recordingStatus === 'PROCESSING' ||
-        callSession.recordingStatus === 'READY' ||
-        callSession.recordingStatus === 'NOT_AVAILABLE' ||
-        callSession.recordingStatus === 'FAILED' ||
-        callSession.livekitEgressId) {
-        this.logger.log(`[CALL-RECORDING] Ignored START: status=${callSession.status} recordingStatus=${callSession.recordingStatus} egressId=${callSession.livekitEgressId} callSid=${callSid}`);
+      if (isTerminal) {
+        this.logger.log(`[CALL-RECORDING] Ignored START: session ${callSession.id} is terminal (status=${callSession.status})`);
+        return;
+      }
+
+      // If already actively recording, processing, or ready with a valid egressId, do not duplicate
+      if (callSession.recordingStatus === 'RECORDING' ||
+          callSession.recordingStatus === 'PROCESSING' ||
+          callSession.recordingStatus === 'READY' ||
+          callSession.livekitEgressId) {
+        this.logger.log(`[CALL-RECORDING] Ignored START: session ${callSession.id} already has active recording (status=${callSession.recordingStatus} egressId=${callSession.livekitEgressId})`);
         return;
       }
 
       if (callSession.status === 'RINGING') {
         this.logger.warn(`[CALL-RECORDING] Refusing recording start: session ${callSession.id} is still RINGING. Recording permitted only after verified answer.`);
-        // Allow a future attempt once the call is verified as answered
-        this.recordingAttemptedRooms.delete(lookupKey);
-        if (callSid) this.recordingAttemptedRooms.delete(callSid);
         return;
       }
 
@@ -507,14 +514,22 @@ export class TelephonyService {
       }
 
       if (participants.length < 2) {
-        this.logger.warn(`[CALL-RECORDING] Timed out waiting for 2nd participant in room ${roomName}. Clearing lock to allow retry when participant connects.`);
-        this.recordingAttemptedRooms.delete(lookupKey);
-        if (callSid) this.recordingAttemptedRooms.delete(callSid);
+        this.logger.warn(`[CALL-RECORDING] Timed out waiting for 2nd participant in room ${roomName}. Allowing retry when participant connects.`);
         return;
       }
 
-      this.logger.log(`[CALL-RECORDING] event=EGRESS_STARTING callId=${callSid} roomName=${roomName}`);
+      // Acquire in-flight lock and track attempt
+      this.recordingStartingInProgress.add(lookupKey);
+      if (callSid) this.recordingStartingInProgress.add(callSid);
+      this.recordingRetryAttempts.set(lookupKey, currentAttempts + 1);
+      if (callSid) this.recordingRetryAttempts.set(callSid, currentAttempts + 1);
+
+      this.logger.log(`[CALL-RECORDING] event=EGRESS_STARTING callId=${callSid} roomName=${roomName} attempt=${currentAttempts + 1}`);
       const egressId = await this.livekitService.startRoomRecording(roomName);
+
+      if (!egressId || typeof egressId !== 'string' || !egressId.trim()) {
+        throw new Error(`LiveKit Egress returned empty egressId for room ${roomName}`);
+      }
 
       await this.prisma.callSession.update({
         where: { id: callSession.id },
@@ -528,31 +543,34 @@ export class TelephonyService {
       this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${callSession?.reason || callSid} stage=RECORDING_STARTED source=startLivekitRecording timestamp=${new Date().toISOString()} egressId=${egressId}`);
     } catch (e: any) {
       const errMsg = e.message || String(e);
-      const isQuotaExceeded = /egress minutes exceeded|quota|limit exceeded/i.test(errMsg);
+      const isQuotaExceeded = /egress minutes exceeded|quota|limit exceeded|resource_exhausted/i.test(errMsg) || e.status === 429;
 
       if (isQuotaExceeded) {
-        this.logger.warn(`[CALL-RECORDING] LiveKit egress recording quota exhausted for room=${roomName} callSid=${callSid}: ${errMsg}. Call preserved with recordingStatus='NOT_AVAILABLE'.`);
+        this.logger.warn(`[CALL-RECORDING] event=EGRESS_QUOTA_EXHAUSTED roomName=${roomName} callSid=${callSid} status=${e.status || 429} code=${e.code || 'resource_exhausted'} message="${errMsg}". Recording unavailable; call preserved.`);
         if (callSession?.id) {
           await this.prisma.callSession.update({
             where: { id: callSession.id },
             data: {
               recordingStatus: 'NOT_AVAILABLE',
+              livekitEgressId: null,
             }
           }).catch(() => {});
         }
       } else {
-        this.logger.error(`[CALL-RECORDING] START failed for room=${roomName} callSid=${callSid}: ${errMsg}`);
-        this.recordingAttemptedRooms.delete(lookupKey);
-        if (callSid) this.recordingAttemptedRooms.delete(callSid);
+        this.logger.error(`[CALL-RECORDING] event=EGRESS_START_FAILED roomName=${roomName} callSid=${callSid} attempt=${currentAttempts + 1}: ${errMsg}`);
         if (callSession?.id) {
           await this.prisma.callSession.update({
             where: { id: callSession.id },
             data: {
               recordingStatus: 'FAILED',
+              livekitEgressId: null,
             }
           }).catch(() => {});
         }
       }
+    } finally {
+      this.recordingStartingInProgress.delete(lookupKey);
+      if (callSid) this.recordingStartingInProgress.delete(callSid);
     }
   }
 
@@ -615,8 +633,18 @@ export class TelephonyService {
       setTimeout(() => {
         this.terminatingSessions.delete(callSid);
         this.terminatingSessions.delete(session.id);
-        if (session.reason) this.terminatingSessions.delete(session.reason);
-        if (session.livekitRoom) this.terminatingSessions.delete(session.livekitRoom);
+        if (session.reason) {
+          this.terminatingSessions.delete(session.reason);
+          this.recordingStartingInProgress.delete(session.reason);
+          this.recordingRetryAttempts.delete(session.reason);
+        }
+        if (session.livekitRoom) {
+          this.terminatingSessions.delete(session.livekitRoom);
+          this.recordingStartingInProgress.delete(session.livekitRoom);
+          this.recordingRetryAttempts.delete(session.livekitRoom);
+        }
+        this.recordingStartingInProgress.delete(callSid);
+        this.recordingRetryAttempts.delete(callSid);
       }, 10000);
 
       // Terminate SIP Participant in LiveKit (Idempotent)
@@ -693,6 +721,10 @@ export class TelephonyService {
           this.processEgress(latestSession.livekitEgressId, latestSession.id, latestSession.livekitRoom || callSid).catch(console.error);
         } catch (e: any) {
           this.logger.error(`[CALL-RECORDING] Failed to stop egress: ${e.message}`);
+          await this.prisma.callSession.update({
+            where: { id: latestSession.id },
+            data: { recordingStatus: 'FAILED' }
+          }).catch(() => {});
           this.triggerPostCallPipeline(latestSession, null).catch(console.error);
         }
       } else if (finalStatus === 'ENDED' && finalDuration > 0) {
