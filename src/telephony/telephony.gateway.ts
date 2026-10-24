@@ -598,26 +598,43 @@ export class TelephonyGateway
     this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${data.callSid} stage=CUSTOMER_ANSWERED source=frontend_sip_active timestamp=${new Date().toISOString()}`);
     if (data.callSid) {
       const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(data.callSid);
-      await this.prisma.callSession.updateMany({
+      const session = await this.prisma.callSession.findFirst({
         where: isUuid
           ? { OR: [{ id: data.callSid }, { reason: data.callSid }, { livekitRoom: data.callSid }] }
           : { OR: [{ reason: data.callSid }, { livekitRoom: data.callSid }] },
+      });
+
+      if (!session) {
+        this.logger.warn(`[CALL-LIFECYCLE] handleCallAnswered: No session found for callSid=${data.callSid}`);
+        return;
+      }
+
+      const isTerminal = ['ENDED', 'MISSED', 'CANCELLED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED'].includes(session.status);
+      if (isTerminal || this.telephonyService.isSessionTerminatedOrTerminating(session.id) || (session.reason && this.telephonyService.isSessionTerminatedOrTerminating(session.reason))) {
+        this.logger.warn(`[CALL-LIFECYCLE] handleCallAnswered: Ignored late answer for already terminated session ${session.id} (status=${session.status})`);
+        return;
+      }
+
+      await this.prisma.callSession.update({
+        where: { id: session.id },
         data: {
           status: 'IN_PROGRESS',
-          startedAt: new Date(),
+          startedAt: session.startedAt || new Date(),
         }
       }).catch(() => {});
 
       // Broadcast callConnected to all sockets for this call with aliases
       this.server.emit('callConnected', {
-        callSid: data.callSid,
-        roomName: data.roomName || data.callSid,
+        callSid: session.reason || data.callSid,
+        roomName: session.livekitRoom || data.roomName || data.callSid,
+        sessionId: session.id,
         answeredAt: new Date().toISOString()
       });
 
-      // Start recording on answer
-      if (data.roomName) {
-        await this.telephonyService.startLivekitRecording(data.callSid, data.roomName).catch((err: any) => {
+      // Start recording on answer if roomName provided (deduplicated in TelephonyService)
+      const roomToRecord = session.livekitRoom || data.roomName;
+      if (roomToRecord) {
+        await this.telephonyService.startLivekitRecording(session.reason || data.callSid, roomToRecord).catch((err: any) => {
           this.logger.warn(`Failed to auto-start recording on answer: ${err.message}`);
         });
       }
@@ -642,10 +659,17 @@ export class TelephonyGateway
       `Call ended by frontend: ${data.callSid}, duration: ${data.duration}, reason: ${data.reason}`,
     );
 
-    // CRITICAL: Do not terminate the PSTN/SIP call solely because the frontend WebRTC connection temporarily disconnects!
-    if (data?.reason === 'webrtc_disconnected') {
+    const nonDestructiveDisconnectReasons = [
+      'webrtc_disconnected',
+      'room_disconnected',
+      'client_disconnected',
+      'network_disconnected'
+    ];
+
+    // CRITICAL: Do not terminate the PSTN/SIP call solely because the frontend WebRTC or room temporarily disconnects!
+    if (data?.reason && nonDestructiveDisconnectReasons.includes(data.reason)) {
       this.logger.warn(
-        `[CALL-LIFECYCLE] Rejecting premature endCall with reason='webrtc_disconnected' for callSid=${data.callSid}. PSTN/SIP call preserved.`,
+        `[CALL-LIFECYCLE] Rejecting premature endCall with reason='${data.reason}' for callSid=${data.callSid}. PSTN/SIP call preserved.`,
       );
       return;
     }

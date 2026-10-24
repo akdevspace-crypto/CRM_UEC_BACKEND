@@ -15,6 +15,11 @@ import type { FileInfo } from '@livekit/protocol';
 export class TelephonyService {
   private readonly logger = new Logger(TelephonyService.name);
   private readonly terminatingSessions = new Set<string>();
+  private readonly recordingAttemptedRooms = new Set<string>();
+
+  public isSessionTerminatedOrTerminating(sessionIdOrReason: string): boolean {
+    return this.terminatingSessions.has(sessionIdOrReason);
+  }
 
   constructor(
     private readonly prisma: PrismaService,
@@ -251,6 +256,12 @@ export class TelephonyService {
     });
 
     if (event.eventType === 'CALL_CONNECTED') {
+      const isTerminal = ['ENDED', 'MISSED', 'CANCELLED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED'].includes(session.status);
+      if (isTerminal || this.isSessionTerminatedOrTerminating(session.id) || (session.reason && this.isSessionTerminatedOrTerminating(session.reason))) {
+        this.logger.warn(`[CALL-LIFECYCLE] processOutboundProviderEvent: Ignored late CALL_CONNECTED for already terminated session ${session.id} (status=${session.status})`);
+        return true;
+      }
+
       this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${session.reason} stage=CUSTOMER_ANSWERED source=vobiz_outbound_webhook timestamp=${new Date().toISOString()}`);
       await this.prisma.callSession.update({
         where: { id: session.id },
@@ -353,6 +364,16 @@ export class TelephonyService {
   }
 
   async startLivekitRecording(callSid: string, roomName: string) {
+    if (!roomName && !callSid) return;
+    const lookupKey = roomName || callSid;
+
+    if (this.recordingAttemptedRooms.has(lookupKey) || (callSid && this.recordingAttemptedRooms.has(callSid))) {
+      this.logger.log(`[CALL-RECORDING] Recording start already attempted for roomName=${roomName} callSid=${callSid}. Skipping duplicate attempt.`);
+      return;
+    }
+    this.recordingAttemptedRooms.add(lookupKey);
+    if (callSid) this.recordingAttemptedRooms.add(callSid);
+
     let callSession: any = null;
     try {
       this.logger.log(`[CALL-RECORDING] provider=livekit_egress callId=${callSid} roomName=${roomName}`);
@@ -366,12 +387,20 @@ export class TelephonyService {
           ]
         }
       });
-      if (!callSession ||
+      if (!callSession) {
+        this.logger.log(`[CALL-RECORDING] Ignored START: session not found callSid=${callSid} roomName=${roomName}`);
+        return;
+      }
+
+      const isTerminal = ['ENDED', 'MISSED', 'CANCELLED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED'].includes(callSession.status);
+      if (isTerminal ||
         callSession.recordingStatus === 'RECORDING' ||
         callSession.recordingStatus === 'PROCESSING' ||
         callSession.recordingStatus === 'READY' ||
+        callSession.recordingStatus === 'NOT_AVAILABLE' ||
+        callSession.recordingStatus === 'FAILED' ||
         callSession.livekitEgressId) {
-        this.logger.log(`[CALL-RECORDING] Ignored START: already in progress or has egressId callSid=${callSid}`);
+        this.logger.log(`[CALL-RECORDING] Ignored START: status=${callSession.status} recordingStatus=${callSession.recordingStatus} egressId=${callSession.livekitEgressId} callSid=${callSid}`);
         return;
       }
 
@@ -384,7 +413,7 @@ export class TelephonyService {
         for (let i = 0; i < 10; i++) {
           await new Promise(r => setTimeout(r, 1500));
           const current = await this.prisma.callSession.findUnique({ where: { id: callSession.id } });
-          if (!current || current.status === 'ENDED' || current.status === 'MISSED') {
+          if (!current || ['ENDED', 'MISSED', 'CANCELLED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED'].includes(current.status)) {
             this.logger.log(`[CALL-RECORDING] Call ended while waiting for participants. Aborting recording start.`);
             return;
           }
@@ -412,11 +441,32 @@ export class TelephonyService {
       this.logger.log(`[CALL-RECORDING] event=EGRESS_STARTED callId=${callSid} roomName=${roomName} egressId=${egressId}`);
       this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${callSession?.reason || callSid} stage=RECORDING_STARTED source=startLivekitRecording timestamp=${new Date().toISOString()} egressId=${egressId}`);
     } catch (e: any) {
-      this.logger.error(`[CALL-RECORDING] START failed: ${e.message}`);
-      await this.prisma.callSession.update({
-        where: { id: callSession.id },
-        data: { recordingStatus: 'FAILED' }
-      }).catch(() => {});
+      const errMsg = e.message || String(e);
+      const isQuotaExceeded = /egress minutes exceeded|quota|limit exceeded/i.test(errMsg);
+
+      if (isQuotaExceeded) {
+        this.logger.warn(`[CALL-RECORDING] LiveKit egress recording quota exhausted for room=${roomName} callSid=${callSid}: ${errMsg}. Call preserved with recordingStatus='NOT_AVAILABLE'.`);
+        if (callSession?.id) {
+          await this.prisma.callSession.update({
+            where: { id: callSession.id },
+            data: {
+              recordingStatus: 'NOT_AVAILABLE',
+              aiProcessingStatus: 'COMPLETED'
+            }
+          }).catch(() => {});
+        }
+      } else {
+        this.logger.error(`[CALL-RECORDING] START failed for room=${roomName} callSid=${callSid}: ${errMsg}`);
+        if (callSession?.id) {
+          await this.prisma.callSession.update({
+            where: { id: callSession.id },
+            data: {
+              recordingStatus: 'FAILED',
+              aiProcessingStatus: 'COMPLETED'
+            }
+          }).catch(() => {});
+        }
+      }
     }
   }
 
@@ -429,9 +479,16 @@ export class TelephonyService {
   ) {
     this.logger.log(`Ending CallSession ${callSid} forceCleanup=${forceCleanup} reason=${reason}`);
 
-    // REQUIREMENT 3: Do not terminate the PSTN/SIP call solely because the frontend WebRTC connection temporarily disconnects!
-    if (reason === 'webrtc_disconnected') {
-      this.logger.warn(`[CALL-LIFECYCLE] Rejecting call termination for callSid=${callSid} with reason='webrtc_disconnected'. PSTN/SIP call preserved.`);
+    const nonDestructiveDisconnectReasons = [
+      'webrtc_disconnected',
+      'room_disconnected',
+      'client_disconnected',
+      'network_disconnected'
+    ];
+
+    // REQUIREMENT 3 & 4: Do not terminate the PSTN/SIP call solely because the frontend WebRTC or LiveKit room temporarily disconnects!
+    if (reason && nonDestructiveDisconnectReasons.includes(reason)) {
+      this.logger.warn(`[CALL-LIFECYCLE] Rejecting call termination for callSid=${callSid} with reason='${reason}'. PSTN/SIP call preserved.`);
       return;
     }
 
