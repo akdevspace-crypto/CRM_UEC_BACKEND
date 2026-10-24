@@ -437,7 +437,9 @@ export class TelephonyService {
       }
 
       if (participants.length < 2) {
-        this.logger.warn(`[CALL-RECORDING] Timed out waiting for 2nd participant in room ${roomName}.`);
+        this.logger.warn(`[CALL-RECORDING] Timed out waiting for 2nd participant in room ${roomName}. Clearing lock to allow retry when participant connects.`);
+        this.recordingAttemptedRooms.delete(lookupKey);
+        if (callSid) this.recordingAttemptedRooms.delete(callSid);
         return;
       }
 
@@ -465,18 +467,18 @@ export class TelephonyService {
             where: { id: callSession.id },
             data: {
               recordingStatus: 'NOT_AVAILABLE',
-              aiProcessingStatus: 'COMPLETED'
             }
           }).catch(() => {});
         }
       } else {
         this.logger.error(`[CALL-RECORDING] START failed for room=${roomName} callSid=${callSid}: ${errMsg}`);
+        this.recordingAttemptedRooms.delete(lookupKey);
+        if (callSid) this.recordingAttemptedRooms.delete(callSid);
         if (callSession?.id) {
           await this.prisma.callSession.update({
             where: { id: callSession.id },
             data: {
               recordingStatus: 'FAILED',
-              aiProcessingStatus: 'COMPLETED'
             }
           }).catch(() => {});
         }

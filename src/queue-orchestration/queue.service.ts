@@ -186,10 +186,19 @@ export class QueueService {
       }
 
       // 3. Count remaining ACTIVE calls for this agent in the database to prevent prematurely setting AVAILABLE or activeCalls: 0
+      const isUuid = Boolean(callSid && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(callSid));
+      const notConditions: any[] = [];
+      if (callSid) {
+        notConditions.push({ reason: callSid }, { livekitRoom: callSid });
+        if (isUuid) {
+          notConditions.push({ id: callSid });
+        }
+      }
+
       const remainingActiveCount = await this.prisma.callSession.count({
         where: {
           status: { in: ['RINGING', 'IN_PROGRESS'] },
-          ...(callSid ? { NOT: { OR: [{ reason: callSid }, { id: callSid }, { livekitRoom: callSid }] } } : {}),
+          ...(notConditions.length > 0 ? { NOT: { OR: notConditions } } : {}),
           OR: [
             { calleeUserId: agent.userId },
             { callerUserId: agent.userId },
@@ -201,7 +210,7 @@ export class QueueService {
       await this.prisma.agent.update({
         where: { id: agent.id },
         data: {
-          activeCalls: remainingActiveCount,
+          activeCalls: Math.max(0, remainingActiveCount),
           status: remainingActiveCount === 0 ? 'AVAILABLE' : 'BUSY',
         },
       });

@@ -11,7 +11,7 @@ import { Public } from '../api-gateway/auth.guard';
 
 import { OverflowService } from './overflow/overflow.service';
 
-@Controller('telephony')
+@Controller(['telephony', 'api/v1/telephony'])
 export class TelephonyController {
   private readonly logger = new Logger(TelephonyController.name);
 

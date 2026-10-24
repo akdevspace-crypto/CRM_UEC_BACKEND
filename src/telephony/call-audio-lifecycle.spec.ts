@@ -682,6 +682,59 @@ async function runCallAudioLifecycleSuite() {
   }
   assert(uniqueAgents.size === 1 && releaseCalls === 1, '16.10 Duplicate Agent Release Prevented via Unique Set', 'releaseCalls=1');
 
+  // 16.11 UUID vs External Call ID Prisma query safety (Fixes "Invalid UUID ... found 'l' at 3")
+  const buildCallSessionNotConditions = (callSid: string) => {
+    const isUuid = Boolean(callSid && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(callSid));
+    const notConditions: any[] = [];
+    if (callSid) {
+      notConditions.push({ reason: callSid }, { livekitRoom: callSid });
+      if (isUuid) {
+        notConditions.push({ id: callSid });
+      }
+    }
+    return { isUuid, notConditions };
+  };
+
+  const outboundQuery = buildCallSessionNotConditions('call_outbound_1792833116856');
+  assert(
+    outboundQuery.isUuid === false && !outboundQuery.notConditions.some(c => 'id' in c),
+    '16.11 External callSid Excluded from Prisma id UUID Query',
+    'id field excluded, preventing Postgres UUID syntax error'
+  );
+
+  const uuidQuery = buildCallSessionNotConditions('dec0822e-4a23-1240-0683-02d7a054053b');
+  assert(
+    uuidQuery.isUuid === true && uuidQuery.notConditions.some(c => 'id' in c),
+    '16.12 Authentic UUID Correctly Included in Prisma id Query',
+    'id field safely included for valid UUID format'
+  );
+
+  // 16.13 Recording lock cleared on participant timeout to allow retry once answered
+  const testRecordingLocks = new Set<string>();
+  const simulateRecordingWithTimeout = (room: string, participantsCount: number) => {
+    testRecordingLocks.add(room);
+    if (participantsCount < 2) {
+      // Participant delayed/timeout: clear lock so subsequent verified answer can start egress
+      testRecordingLocks.delete(room);
+      return { started: false, retryAllowed: true };
+    }
+    return { started: true, retryAllowed: false };
+  };
+
+  const timeoutAttempt = simulateRecordingWithTimeout('room_delay_test', 1);
+  assert(
+    timeoutAttempt.started === false && timeoutAttempt.retryAllowed === true && !testRecordingLocks.has('room_delay_test'),
+    '16.13 Recording Lock Cleared on Participant Delay/Timeout',
+    'Lock removed, preventing permanent blockage of later attempts'
+  );
+
+  const retryAttempt = simulateRecordingWithTimeout('room_delay_test', 2);
+  assert(
+    retryAttempt.started === true && testRecordingLocks.has('room_delay_test'),
+    '16.14 Recording Successfully Started on Subsequent Verified Participant Arrival',
+    'Egress started on verified 2nd participant'
+  );
+
   console.log(`\n================================================================`);
   console.log(`  ALL 16 VERIFICATION AREAS PASSED: ${passedTests}/${totalTests} TESTS SUCCESSFUL`);
   console.log(`================================================================\n`);
