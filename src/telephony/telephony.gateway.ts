@@ -587,7 +587,29 @@ export class TelephonyGateway
       return;
     }
 
-    await this.telephonyService.acceptCallSession(data.callSid, agentId);
+    const session = await this.telephonyService.acceptCallSession(data.callSid, agentId);
+    if (session && session.livekitRoom) {
+      try {
+        const agentRecord = await this.prisma.agent.findFirst({
+          where: { OR: [{ id: agentId }, { userId: agentId }] }
+        });
+        const livekitWsUrl = process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_API_URL;
+        const freshToken = await this.livekitService.generateAgentToken(
+          session.livekitRoom,
+          agentRecord?.name || 'Agent',
+        );
+        client.emit('callAcceptedConfirmed', {
+          callSid: data.callSid,
+          roomName: session.livekitRoom,
+          token: freshToken,
+          serverUrl: livekitWsUrl,
+          wsUrl: livekitWsUrl,
+        });
+        this.logger.log(`[ACCEPT-SYNC] Emitted callAcceptedConfirmed to socket ${client.id} for room ${session.livekitRoom}`);
+      } catch (e: any) {
+        this.logger.warn(`[ACCEPT-SYNC] Failed to emit callAcceptedConfirmed: ${e.message}`);
+      }
+    }
   }
 
   @SubscribeMessage('callAnswered')

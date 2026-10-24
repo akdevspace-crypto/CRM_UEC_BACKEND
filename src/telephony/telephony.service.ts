@@ -110,9 +110,40 @@ export class TelephonyService {
         where: isUuid
           ? { OR: [{ id: callSid }, { reason: callSid }, { livekitRoom: callSid }] }
           : { OR: [{ reason: callSid }, { livekitRoom: callSid }] },
-        include: { transferAudits: { orderBy: { createdAt: 'desc' }, take: 1 } },
+        include: {
+          transferAudits: { orderBy: { createdAt: 'desc' }, take: 1 },
+          customer: true,
+          lead: true,
+        },
       });
-      if (!session) return;
+      if (!session) return null;
+
+      const th = session.transferHistory as any;
+      const callerPhone = session.customer?.phone || session.lead?.phoneNumber || th?.phone;
+      const direction = th?.direction || 'inbound';
+
+      // If inbound call, ensure the actual LiveKit SIP room where the caller joined is synchronized
+      if (direction.toLowerCase() === 'inbound' && callerPhone) {
+        if (!session.livekitSipParticipantIdentity || session.livekitRoom?.startsWith('call_')) {
+          try {
+            const sipInfo = await this.livekitService.findInboundSipRoom(callerPhone, 4, 250);
+            if (sipInfo && sipInfo.roomName) {
+              this.logger.log(`[ACCEPT-SYNC] Discovered real LiveKit SIP room ${sipInfo.roomName} during accept for callSid=${callSid}`);
+              session.livekitRoom = sipInfo.roomName;
+              session.livekitSipParticipantIdentity = sipInfo.participantIdentity;
+              await this.prisma.callSession.update({
+                where: { id: session.id },
+                data: {
+                  livekitRoom: sipInfo.roomName,
+                  livekitSipParticipantIdentity: sipInfo.participantIdentity,
+                },
+              });
+            }
+          } catch (e: any) {
+            this.logger.debug(`[ACCEPT-SYNC] Quick-sync LiveKit SIP room attempt: ${e.message}`);
+          }
+        }
+      }
 
       // Resolve actual Agent ID (since socket passes User ID)
       let agent = await this.prisma.agent.findFirst({
@@ -211,8 +242,11 @@ export class TelephonyService {
           joinedAt: new Date(),
         },
       });
+
+      return session;
     } catch (e) {
       this.logger.error(`Failed to accept CallSession: ${e.message}`);
+      return null;
     }
   }
 
@@ -2365,20 +2399,41 @@ export class TelephonyService {
       // Fix DEF-01: Asynchronous non-blocking background discovery of LiveKit SIP participant (reduces webhook delay from 10s to <100ms)
       setTimeout(async () => {
         try {
-          const livekitRoomInfo = await this.livekitService.findInboundSipRoom(event.fromNumber, 5, 1000);
+          const livekitRoomInfo = await this.livekitService.findInboundSipRoom(event.fromNumber, 10, 350);
           if (livekitRoomInfo) {
             this.logger.log(`[INBOUND-LIVEKIT-SYNC] Discovered SIP participant=${livekitRoomInfo.participantIdentity} in room=${livekitRoomInfo.roomName}`);
             await this.prisma.callSession.updateMany({
               where: { reason: event.providerCallId },
               data: {
+                livekitRoom: livekitRoomInfo.roomName,
                 livekitSipParticipantIdentity: livekitRoomInfo.participantIdentity,
               },
             });
+
+            // Generate fresh token for the agent in the real SIP room
+            const realRoomToken = await this.livekitService.generateAgentToken(
+              livekitRoomInfo.roomName,
+              assignedAgent.name || 'Agent',
+            );
+
+            const livekitWsUrl = process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_API_URL;
+
+            // Emit to agent socket to seamlessly switch to the actual SIP room
+            if (assignedAgent.socketId) {
+              this.logger.log(`[INBOUND-LIVEKIT-SYNC] Emitting callRoomUpdated to agent ${assignedAgent.name} (socket ${assignedAgent.socketId}) for room ${livekitRoomInfo.roomName}`);
+              this.telephonyGateway.server.to(assignedAgent.socketId).emit('callRoomUpdated', {
+                callSid: event.providerCallId,
+                roomName: livekitRoomInfo.roomName,
+                token: realRoomToken,
+                serverUrl: livekitWsUrl,
+                wsUrl: livekitWsUrl,
+              });
+            }
           }
         } catch (syncErr: any) {
           this.logger.debug(`[INBOUND-LIVEKIT-SYNC] Background check: ${syncErr.message}`);
         }
-      }, 1500);
+      }, 200);
 
       if (event.direction === 'INBOUND') {
         this.logger.log(`[INBOUND-CALL] session_create_start | caller=${event.fromNumber} DID=${event.toNumber} providerCallUUID=${event.providerCallId}`);
