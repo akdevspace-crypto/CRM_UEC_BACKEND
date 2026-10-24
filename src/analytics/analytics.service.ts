@@ -56,9 +56,14 @@ export class AnalyticsService {
         where: { callSessionId: sessionId },
       });
 
+      const hasAudioRecording = session.recordingStatus === 'READY' && !!session.recordingStoragePath;
+
       if (existingAnalytics && session.aiProcessingStatus === 'COMPLETED') {
-        this.logger.log(`[AI-AUDIT] event=ALREADY_COMPLETED callId=${sessionId} skipping redundant processing`);
-        return existingAnalytics;
+        if (existingAnalytics.aiHandling || !hasAudioRecording) {
+          this.logger.log(`[AI-AUDIT] event=ALREADY_COMPLETED callId=${sessionId} skipping redundant processing`);
+          return existingAnalytics;
+        }
+        this.logger.log(`[AI-AUDIT] event=UPGRADING_TO_AUDIO_SUMMARY callId=${sessionId} upgrading metadata summary to audio transcription`);
       }
 
       const apiKey = process.env.GEMINI_API_KEY;
@@ -95,7 +100,6 @@ export class AnalyticsService {
         data: { aiProcessingStatus: 'ANALYZING' }
       }).catch(() => {});
 
-      const hasAudioRecording = session.recordingStatus === 'READY' && !!session.recordingStoragePath;
       let base64Audio: string | null = null;
 
       if (hasAudioRecording) {
@@ -170,7 +174,7 @@ export class AnalyticsService {
 
       Please provide a JSON response with the following strictly formatted fields:
       {
-        "summary": "A detailed professional chronological summary of the call based on the interaction details, duration, and agent notes.",
+        "summary": "[Metadata Summary - Audio Not Recorded] A detailed professional chronological summary of the call based on the interaction details, duration, and agent notes.",
         "sentiment": "POSITIVE, NEUTRAL, or NEGATIVE",
         "escalationRisk": "LOW, MEDIUM, or HIGH",
         "customerIntent": "Customer Support, General Inquiry, Follow-up, Escalation, or Feedback",
@@ -256,7 +260,7 @@ export class AnalyticsService {
         );
         const noteSummary = notes && notes !== 'Call concluded normally.' ? notes : 'Call connected and concluded normally.';
         result = {
-          summary: `Call between Agent ${agentName} and Customer ${customerName} (${customerPhone}). Duration: ${durationSeconds}s. Outcome: ${session.status}. Wrap-up details: ${noteSummary}. CSAT rating: ${csatScore ? csatScore + '/5' : 'Standard'}.`,
+          summary: `[Metadata Summary - Audio Not Recorded] Call between Agent ${agentName} and Customer ${customerName} (${customerPhone}). Duration: ${durationSeconds}s. Outcome: ${session.status}. Wrap-up details: ${noteSummary}. CSAT rating: ${csatScore ? csatScore + '/5' : 'Standard'}.`,
           sentiment: csatScore && csatScore >= 4 ? 'POSITIVE' : csatScore && csatScore <= 2 ? 'NEGATIVE' : 'NEUTRAL',
           escalationRisk: 'LOW',
           customerIntent: tags.includes('Billing') ? 'Billing' : tags.includes('Technical') ? 'Technical' : 'General Inquiry',
@@ -284,6 +288,10 @@ export class AnalyticsService {
             customerIntent: 'General Inquiry',
             detectedLanguage: 'English',
           };
+        }
+
+        if (!base64Audio && result.summary && !result.summary.startsWith('[Metadata Summary')) {
+          result.summary = `[Metadata Summary - Audio Not Recorded] ${result.summary}`;
         }
       }
 

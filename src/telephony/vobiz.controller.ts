@@ -55,7 +55,14 @@ export class VobizController {
   @Public()
   @Get('status')
   @HttpCode(HttpStatus.OK)
-  async probeStatus() {
+  async probeStatus(@Req() req: Request) {
+    const query = req.query || {};
+    if (query.CallUUID || query.SIPCallID || query.Status || query.CallStatus) {
+      this.verifySignature(req);
+      const event = this.vobizProvider.normalizeWebhookEvent(query, req.method);
+      await this.telephonyService.processNormalizedEvent(event, req);
+      return 'OK';
+    }
     return { status: 'ok', endpoint: '/vobiz/status', provider: 'vobiz', timestamp: new Date() };
   }
 
@@ -64,7 +71,7 @@ export class VobizController {
   @HttpCode(HttpStatus.OK)
   async handleVobizStatus(@Req() req: Request) {
     this.verifySignature(req);
-    const payload = req.body;
+    const payload = { ...(req.query || {}), ...(req.body || {}) };
     const event = this.vobizProvider.normalizeWebhookEvent(payload, req.method);
     await this.telephonyService.processNormalizedEvent(event, req);
     return 'OK';

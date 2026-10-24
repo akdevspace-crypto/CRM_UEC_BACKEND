@@ -655,7 +655,9 @@ export class TelephonyService {
         const normalizedReason = (reason || session.reason || '').toLowerCase();
         if (normalizedReason.includes('busy') || normalizedReason === 'user_busy') {
           finalStatus = 'BUSY';
-        } else if (normalizedReason.includes('failed') || normalizedReason.includes('rejected')) {
+        } else if (normalizedReason.includes('rejected') || normalizedReason === 'agent_rejected') {
+          finalStatus = 'REJECTED';
+        } else if (normalizedReason.includes('failed')) {
           finalStatus = 'FAILED';
         } else if (normalizedReason === 'explicit_user_end' || normalizedReason === 'agent_cancelled' || normalizedReason === 'cancelled') {
           finalStatus = isOutbound ? 'CANCELLED' : 'MISSED';
@@ -694,15 +696,22 @@ export class TelephonyService {
           this.triggerPostCallPipeline(latestSession, null).catch(console.error);
         }
       } else if (finalStatus === 'ENDED' && finalDuration > 0) {
-        // No egress was started or start failed, but call finished:
-        if (!latestSession.recordingStatus || latestSession.recordingStatus === 'PENDING') {
-          await this.prisma.callSession.update({
-            where: { id: latestSession.id },
-            data: { recordingStatus: 'NOT_AVAILABLE' }
-          }).catch(() => {});
+        if (latestSession.recordingStatus === 'PROCESSING') {
+          this.logger.log(`[CALL-RECORDING] Egress is currently PROCESSING for callId=${latestSession.id}. AI summary pipeline will run when egress completes.`);
+        } else if (latestSession.recordingStatus === 'READY') {
+          this.logger.log(`[CALL-RECORDING] Egress already READY for callId=${latestSession.id}. Triggering AI pipeline with recording.`);
+          this.triggerPostCallPipeline(latestSession, latestSession.recordingStoragePath).catch(console.error);
+        } else {
+          // No egress was started or start failed, but call finished:
+          if (!latestSession.recordingStatus || latestSession.recordingStatus === 'PENDING') {
+            await this.prisma.callSession.update({
+              where: { id: latestSession.id },
+              data: { recordingStatus: 'NOT_AVAILABLE' }
+            }).catch(() => {});
+          }
+          this.logger.log(`[CALL-RECORDING] No active egress for callId=${latestSession.id}. Triggering AI pipeline directly.`);
+          this.triggerPostCallPipeline(latestSession, null).catch(console.error);
         }
-        this.logger.log(`[CALL-RECORDING] No active egress for callId=${latestSession.id}. Triggering AI pipeline directly.`);
-        this.triggerPostCallPipeline(latestSession, null).catch(console.error);
       }
 
       // 1. Mark participants as left in database
@@ -2172,6 +2181,10 @@ export class TelephonyService {
               where: { id: sessionId },
               data: { recordingStatus: 'FAILED' }
             });
+            const session = await this.prisma.callSession.findUnique({ where: { id: sessionId } });
+            if (session) {
+              this.triggerPostCallPipeline(session, null).catch(console.error);
+            }
             break;
           }
         }
@@ -2179,6 +2192,18 @@ export class TelephonyService {
         this.logger.error(`[CALL-RECORDING] processEgress error: ${e.message}`);
       }
       retries++;
+    }
+
+    if (retries >= 20) {
+      this.logger.warn(`[CALL-RECORDING] processEgress timed out waiting for egressId=${egressId} callId=${sessionId}`);
+      await this.prisma.callSession.update({
+        where: { id: sessionId },
+        data: { recordingStatus: 'FAILED' }
+      }).catch(() => {});
+      const session = await this.prisma.callSession.findUnique({ where: { id: sessionId } });
+      if (session) {
+        this.triggerPostCallPipeline(session, null).catch(console.error);
+      }
     }
   }
 
@@ -2525,23 +2550,56 @@ export class TelephonyService {
     }
 
     if (['CALL_ENDED', 'CALL_MISSED', 'CALL_FAILED'].includes(event.eventType)) {
-      let targetCallSid = event.providerCallId;
+      const raw = event.rawPayload || {};
+      const candidateIds = Array.from(new Set([
+        event.providerCallId,
+        raw.CallUUID,
+        raw.DialCallUUID,
+        raw.SIPCallID,
+        raw.RequestID,
+        raw.CallSid,
+        raw.sid,
+        raw.ALegUUID,
+        raw.BLegUUID,
+        event.roomName,
+        raw.roomName,
+      ].filter(Boolean))) as string[];
 
-      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(targetCallSid);
-      const session = await this.prisma.callSession.findFirst({
-        where: isUuid
-          ? { OR: [{ id: targetCallSid }, { reason: targetCallSid }, { livekitRoom: targetCallSid }] }
-          : { OR: [{ reason: targetCallSid }, { livekitRoom: targetCallSid }, { livekitRoom: `call_${targetCallSid}` }] }
-      });
+      let session = null;
+      for (const cand of candidateIds) {
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(cand);
+        session = await this.prisma.callSession.findFirst({
+          where: isUuid
+            ? { OR: [{ id: cand }, { reason: cand }, { livekitRoom: cand }, { livekitRoom: `call_${cand}` }] }
+            : { OR: [{ reason: cand }, { livekitRoom: cand }, { livekitRoom: `call_${cand}` }] }
+        });
+        if (session) break;
+      }
+
+      // If still not found, check active non-terminal sessions matching caller phone
+      if (!session && event.fromNumber && event.fromNumber !== 'Unknown') {
+        const cleanFrom = event.fromNumber.replace(/[^0-9]/g, '');
+        if (cleanFrom.length >= 8) {
+          session = await this.prisma.callSession.findFirst({
+            where: {
+              status: { in: ['RINGING', 'IN_PROGRESS', 'CONNECTED'] },
+              customer: {
+                phone: { contains: cleanFrom.slice(-10) }
+              }
+            },
+            orderBy: { createdAt: 'desc' }
+          });
+        }
+      }
 
       if (!session) {
-        this.logger.warn(`[INBOUND-CORRELATION] No matching inbound CallSession for providerCallId=${targetCallSid}. Safely ignored without guessing.`);
+        this.logger.warn(`[INBOUND-CORRELATION] No matching inbound CallSession for providerCallId=${event.providerCallId} candidates=${candidateIds.join(',')}. Safely ignored without guessing.`);
         return true;
       }
 
-      this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${session.reason || targetCallSid} stage=CALL_TERMINATED source=${event.provider}_carrier_webhook timestamp=${new Date().toISOString()} reason=${event.eventType}`);
+      this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${session.reason || session.id} stage=CALL_TERMINATED source=${event.provider}_carrier_webhook timestamp=${new Date().toISOString()} reason=${event.eventType}`);
 
-      await this.endCallSession(session.reason || targetCallSid, event.duration, event.recordingUrl, true, event.eventType);
+      await this.endCallSession(session.reason || session.id, event.duration, event.recordingUrl, true, event.eventType);
     }
 
     return true; // Processed

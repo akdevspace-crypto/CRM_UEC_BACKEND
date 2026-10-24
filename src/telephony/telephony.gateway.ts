@@ -725,6 +725,38 @@ export class TelephonyGateway
     );
   }
 
+  @SubscribeMessage('rejectCall')
+  async handleRejectCall(
+    @MessageBody() data: any,
+    @ConnectedSocket() client: Socket,
+  ) {
+    if (!data?.callSid) {
+      this.logger.warn('[CALL-TERMINATION] rejectCall received without callSid. Ignored.');
+      return;
+    }
+
+    this.logger.log(`Call rejected by agent socket: callSid=${data.callSid}`);
+
+    if (this.telephonyService.isSessionTerminatedOrTerminating(data.callSid)) {
+      this.logger.log(
+        `[CALL-TERMINATION] Session ${data.callSid} already terminating or ended. Skipping duplicate rejectCall.`,
+      );
+      return;
+    }
+
+    await this.telephonyService.endCallSession(
+      data.callSid,
+      0,
+      null,
+      false,
+      'agent_rejected',
+    );
+
+    this.server.emit('callRejected', {
+      callSid: data.callSid,
+    });
+  }
+
   @SubscribeMessage('initiateTransfer')
   async handleInitiateTransfer(
     @MessageBody() data: any,
