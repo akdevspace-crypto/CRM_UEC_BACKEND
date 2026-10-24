@@ -59,6 +59,37 @@ export class LivekitService implements OnModuleInit {
     );
     this.sipClient = new SipClient(livekitApiUrl, apiKey, apiSecret);
     this.logger.log('LiveKit RoomServiceClient and SipClient initialized.');
+    this.ensureInboundDispatchRule().catch((err) => {
+      this.logger.warn(`Failed to verify inbound SIP dispatch rule: ${err.message}`);
+    });
+  }
+
+  async ensureInboundDispatchRule(): Promise<void> {
+    if (!this.sipClient) return;
+    try {
+      const trunkId = this.configService.get<string>('LIVEKIT_VOBIZ_INBOUND_TRUNK_ID') || 'ST_QnCWUVduoZN5';
+      const rules = await this.sipClient.listSipDispatchRule();
+      const hasCalleeRule = rules.some(r => r.trunkIds?.includes(trunkId) && (r.rule as any)?.dispatchRuleCallee);
+      if (!hasCalleeRule) {
+        this.logger.log(`Configuring callee dispatch rule for inbound trunk ${trunkId}...`);
+        await this.sipClient.createSipDispatchRule(
+          {
+            type: 'callee',
+            roomPrefix: '',
+            pin: '',
+            randomize: false,
+          },
+          {
+            name: 'Vobiz-Inbound',
+            trunkIds: [trunkId],
+            hidePhoneNumber: false,
+          }
+        );
+        this.logger.log(`Successfully verified and applied callee dispatch rule for trunk ${trunkId}`);
+      }
+    } catch (e: any) {
+      this.logger.warn(`Could not ensure inbound SIP dispatch rule: ${e.message}`);
+    }
   }
 
   async createRoom(roomName: string) {
@@ -262,7 +293,7 @@ export class LivekitService implements OnModuleInit {
       try {
         const rooms = await this.roomServiceClient.listRooms();
         for (const room of rooms) {
-          if (!room.name.startsWith('call-')) continue;
+          if (!room.name.startsWith('call-') && !room.name.startsWith('call_')) continue;
           
           try {
             const participants = await this.roomServiceClient.listParticipants(room.name);

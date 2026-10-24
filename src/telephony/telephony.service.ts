@@ -153,6 +153,42 @@ export class TelephonyService {
           },
         });
 
+        // Safe deterministic detachment of initiating agent once destination agent is confirmed ready
+        if (latestAudit.transferMode === 'BLIND' && latestAudit.initiatingAgentId) {
+          await this.prisma.agent.update({
+            where: { id: latestAudit.initiatingAgentId },
+            data: { status: 'AVAILABLE' }
+          }).catch(() => {});
+
+          await this.prisma.callParticipant.updateMany({
+            where: { callSessionId: session.id, agentId: latestAudit.initiatingAgentId, leftAt: null },
+            data: { leftAt: new Date() }
+          }).catch(() => {});
+
+          if (this.livekitService && session.livekitRoom) {
+            try {
+              const initAgentRecord = await this.prisma.agent.findUnique({ where: { id: latestAudit.initiatingAgentId } });
+              if (initAgentRecord) {
+                const sanitizedName = initAgentRecord.name.replace(/\s+/g, '_');
+                const participants = await this.livekitService.listParticipants(session.livekitRoom);
+                const initPart = participants.find(p => p.identity.includes(sanitizedName));
+                if (initPart) {
+                  await this.livekitService.removeParticipant(session.livekitRoom, initPart.identity);
+                }
+                if (initAgentRecord.socketId) {
+                  this.telephonyGateway.server.to(initAgentRecord.socketId).emit('callTransferredOut', {
+                    callSid: session.reason || session.id,
+                    roomName: session.livekitRoom,
+                    transferredTo: agent?.name || 'Care Coordinator',
+                  });
+                }
+              }
+            } catch (e: any) {
+              this.logger.warn(`Could not remove initiating agent from LiveKit after transfer accept: ${e.message}`);
+            }
+          }
+        }
+
         this.telephonyGateway.server.emit('callTransferCompleted', {
           callSessionId: session.id,
           callSid: session.reason || session.id,
@@ -650,6 +686,44 @@ export class TelephonyService {
       if (session.calleeUserId) uniqueAgentKeys.add(session.calleeUserId);
       for (const p of session.participants || []) {
         if (p.agentId) uniqueAgentKeys.add(p.agentId);
+      }
+
+      // 2b. If there are pending transfer audits when call ends, cancel them and release destination agent reservations
+      try {
+        const pendingAudits = await this.prisma.callTransferAudit.findMany({
+          where: {
+            callSessionId: session.id,
+            status: { in: ['INITIATED', 'CONSULTING'] },
+          },
+          include: { destinationAgent: true },
+        });
+
+        for (const audit of pendingAudits) {
+          await this.prisma.callTransferAudit.update({
+            where: { id: audit.id },
+            data: {
+              status: 'CANCELLED',
+              completedAt: new Date(),
+            },
+          }).catch(() => {});
+
+          if (audit.destinationAgentId) {
+            uniqueAgentKeys.add(audit.destinationAgentId);
+          }
+          if (audit.destinationAgent?.userId) {
+            uniqueAgentKeys.add(audit.destinationAgent.userId);
+          }
+        }
+
+        if (pendingAudits.length > 0) {
+          this.telephonyGateway.server.emit('callTransferCancelled', {
+            callSessionId: session.id,
+            callSid: session.reason || callSid,
+            reason: reason || 'customer_hangup_during_transfer',
+          });
+        }
+      } catch (auditErr: any) {
+        this.logger.warn(`Could not cancel pending transfer audits: ${auditErr.message}`);
       }
 
       // 3. Release agent reservations idempotently using queueService (proper activeCalls count & Redis lock match)
@@ -1152,12 +1226,18 @@ export class TelephonyService {
         callSid: r.reason || r.id,
         providerCallId: (r.transferHistory as any)?.providerCallUUID || r.reason || r.id,
         livekitRoom: r.livekitRoom,
+        customerName: r.customer?.name || r.lead?.customerName || (isOutbound ? (phone ? `Customer (${phone})` : 'Customer') : (r.caller?.agentProfile?.name || (phone ? `Customer (${phone})` : 'Customer'))),
+        customerPhone: phone || 'Unknown',
+        agentName: handlingAgentName || r.caller?.agentProfile?.name || 'Agent',
         callerName: r.customer?.name || r.lead?.customerName || (isOutbound ? 'Agent' : 'Unknown Caller'),
         callerPhone: phone || 'Unknown',
         customerEmail: email || null,
         leadId: r.lead?.id || r.leadId || null,
         leadName: r.lead?.customerName || null,
         direction: isOutbound ? 'OUTBOUND' : 'INBOUND',
+        timestamp: r.startedAt ? r.startedAt.toISOString() : r.createdAt.toISOString(),
+        date: r.startedAt ? r.startedAt.toISOString() : r.createdAt.toISOString(),
+        createdAt: r.createdAt.toISOString(),
         startedAt: r.startedAt ? r.startedAt.toISOString() : r.createdAt.toISOString(),
         endedAt: r.endedAt ? r.endedAt.toISOString() : null,
         duration: totalDuration,
@@ -1680,45 +1760,17 @@ export class TelephonyService {
       }
     });
 
-    // 2. If BLIND transfer, detach initiating agent audio and mark available
-    if (transferMode === 'BLIND') {
-      await this.prisma.agent.update({
-        where: { id: initiatingAgent.id },
-        data: { status: 'AVAILABLE' }
-      }).catch(() => {});
-
-      await this.prisma.callParticipant.updateMany({
-        where: { callSessionId: session.id, agentId: initiatingAgent.id, leftAt: null },
-        data: { leftAt: new Date() }
-      }).catch(() => {});
-
-      if (this.livekitService) {
-        try {
-          const participants = await this.livekitService.listParticipants(roomName);
-          const sanitizedName = initiatingAgent.name.replace(/\s+/g, '_');
-          const initPart = participants.find(p => p.identity.includes(sanitizedName));
-          if (initPart) {
-            await this.livekitService.removeParticipant(roomName, initPart.identity);
-          }
-        } catch (e: any) {
-          this.logger.warn(`Could not remove initiating agent from LiveKit: ${e.message}`);
-        }
-      }
-
-      if (initiatingAgent.socketId) {
-        this.telephonyGateway.server.to(initiatingAgent.socketId).emit('callTransferredOut', {
-          callSid: session.reason || session.id,
-          roomName,
-          transferredTo: destinationAgent.name,
-        });
-      }
-      this.telephonyGateway.server.emit('callTransferredOut', {
-        initiatingAgentId: initiatingAgent.id,
+    // 2. Notify initiating agent that transfer has been dispatched (media leg preserved until destination accepts)
+    if (initiatingAgent.socketId) {
+      this.telephonyGateway.server.to(initiatingAgent.socketId).emit('callTransferInitiated', {
         callSid: session.reason || session.id,
         roomName,
         transferredTo: destinationAgent.name,
+        transferMode,
       });
     }
+
+    const isOutboundCall = session.reason?.startsWith('call_outbound_') || (session.transferHistory as any)?.direction === 'outbound';
 
     // 3. Dispatch incoming call event to destination agent with LiveKit credentials
     const incomingCallPayload = {
@@ -1747,8 +1799,8 @@ export class TelephonyService {
       token: destToken,
       serverUrl: livekitWsUrl,
       wsUrl: livekitWsUrl,
-      category: 'Inbound',
-      direction: 'INBOUND',
+      category: isOutboundCall ? 'Outbound' : 'Inbound',
+      direction: isOutboundCall ? 'OUTBOUND' : 'INBOUND',
     };
 
     this.telephonyGateway.dispatchIncomingCallToAgent(destinationAgent.socketId, incomingCallPayload);

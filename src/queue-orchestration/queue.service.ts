@@ -21,6 +21,65 @@ export class QueueService {
     @Optional() @Inject('REDIS_CLIENT') private readonly redis?: Redis,
   ) {}
 
+  async onModuleInit() {
+    await this.reconcileStaleSessionsAndCounters().catch((err) => {
+      this.logger.warn(`[QUEUE-RECONCILE] Initial reconciliation warning: ${err.message}`);
+    });
+  }
+
+  /**
+   * Periodically and safely reconciles orphaned/stale call sessions older than 2 hours.
+   * Ensures agent activeCalls counters and availability reflect true active sessions.
+   */
+  async reconcileStaleSessionsAndCounters(): Promise<void> {
+    try {
+      const cutoff = new Date(Date.now() - 2 * 3600 * 1000); // 2 hours
+      const stale = await this.prisma.callSession.updateMany({
+        where: {
+          status: { in: ['RINGING', 'IN_PROGRESS'] },
+          createdAt: { lt: cutoff },
+        },
+        data: {
+          status: 'ENDED',
+          endedAt: new Date(),
+        },
+      });
+
+      if (stale.count > 0) {
+        this.logger.log(`[QUEUE-RECONCILE] Reconciled ${stale.count} orphaned call sessions to ENDED.`);
+      }
+
+      // Reconcile agent counters
+      const agents = await this.prisma.agent.findMany({ where: { isDeleted: false } });
+      for (const agent of agents) {
+        const count = await this.prisma.callSession.count({
+          where: {
+            status: { in: ['RINGING', 'IN_PROGRESS'] },
+            createdAt: { gte: cutoff },
+            OR: [
+              { calleeUserId: agent.userId },
+              { callerUserId: agent.userId },
+              { participants: { some: { agentId: agent.id, leftAt: null } } }
+            ]
+          }
+        });
+
+        if (agent.activeCalls !== count || (count === 0 && agent.status === 'BUSY')) {
+          await this.prisma.agent.update({
+            where: { id: agent.id },
+            data: {
+              activeCalls: count,
+              status: count === 0 ? 'AVAILABLE' : 'BUSY',
+            }
+          });
+          this.logger.log(`[QUEUE-RECONCILE] Agent ${agent.name} (${agent.id}) reconciled to activeCalls=${count}, status=${count === 0 ? 'AVAILABLE' : 'BUSY'}`);
+        }
+      }
+    } catch (e: any) {
+      this.logger.warn(`[QUEUE-RECONCILE] Reconciliation error: ${e.message}`);
+    }
+  }
+
   /**
    * Allocates an available agent using atomic Redis mutex reservation and PostgreSQL transactional locking.
    * Prevents concurrent calls from reserving the same single-call agent simultaneously.
@@ -195,9 +254,11 @@ export class QueueService {
         }
       }
 
+      const recentCutoff = new Date(Date.now() - 2 * 3600 * 1000); // 2 hours
       const remainingActiveCount = await this.prisma.callSession.count({
         where: {
           status: { in: ['RINGING', 'IN_PROGRESS'] },
+          createdAt: { gte: recentCutoff },
           ...(notConditions.length > 0 ? { NOT: { OR: notConditions } } : {}),
           OR: [
             { calleeUserId: agent.userId },
