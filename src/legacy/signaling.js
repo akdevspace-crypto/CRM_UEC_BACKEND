@@ -14,44 +14,10 @@ function setupSignaling(io) {
   io.on('connection', (socket) => {
     console.log(`Agent connected: ${socket.id}`);
 
-    // Agent authenticates and sets status
-    socket.on('agent_login', async (data) => {
-      const rawToken = data?.token || socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace(/^Bearer\s+/i, '');
-      if (!rawToken) {
-        return; // Handled / rejected by gateway with auth_error
-      }
-      let decoded;
-      try {
-        const secret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
-        decoded = jwt.verify(rawToken, secret);
-      } catch (err) {
-        return;
-      }
+    // Note: Agent authentication, multi-socket presence tracking, and status broadcasts
+    // are authoritatively handled by TelephonyGateway (NestJS). Removing competing duplicate
+    // listeners here prevents duplicate agent_status_change events and competing signaling paths.
 
-      const { agentId, name, skills } = data;
-      const isAdmin = ['ADMIN', 'SUPER_ADMIN'].includes(decoded?.role);
-      const isOwner = decoded?.agentId === agentId || decoded?.userId === agentId || decoded?.id === agentId;
-      if (!isAdmin && !isOwner) {
-        return; // Spoofing attempt blocked
-      }
-      const agentData = { agentId, name, skills, status: 'AVAILABLE', socketId: socket.id };
-      await redis.set(redisKey(socket.id), JSON.stringify(agentData));
-      console.log(`Agent ${name} logged in. Available for calls.`);
-      
-      // Notify supervisor dashboard
-      io.emit('agent_status_change', { agentId, status: 'AVAILABLE', name });
-    });
-
-    socket.on('status_update', async (data) => {
-      const agentStr = await redis.get(redisKey(socket.id));
-      if (agentStr) {
-        const agent = JSON.parse(agentStr);
-        agent.status = data.status;
-        await redis.set(redisKey(socket.id), JSON.stringify(agent));
-        console.log(`Agent ${agent.name} changed status to ${agent.status}`);
-        io.emit('agent_status_change', { agentId: agent.agentId, status: agent.status });
-      }
-    });
 
     // WebRTC Signaling
     socket.on('initiateCall', async (data) => {
@@ -329,15 +295,9 @@ function setupSignaling(io) {
       }
     });
 
-    socket.on('disconnect', async () => {
-      const agentStr = await redis.get(redisKey(socket.id));
-      if (agentStr) {
-        const agent = JSON.parse(agentStr);
-        console.log(`Agent ${agent.name} disconnected.`);
-        io.emit('agent_status_change', { agentId: agent.agentId, status: 'OFFLINE' });
-        await redis.del(redisKey(socket.id));
-      }
-    });
+    // Disconnect cleanup: Managed authoritatively by TelephonyGateway.handleDisconnect
+    // to preserve multi-socket presence and prevent duplicate OFFLINE broadcasts.
+
   });
 }
 
