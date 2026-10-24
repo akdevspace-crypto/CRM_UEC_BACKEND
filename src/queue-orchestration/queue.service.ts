@@ -157,32 +157,59 @@ export class QueueService {
   /**
    * Releases an agent's reservation/call lock, resets activeCalls and marks agent AVAILABLE.
    */
-  async releaseAgentReservation(agentId: string, callSid?: string): Promise<boolean> {
-    this.logger.log(`[QUEUE-RELEASE] Releasing reservation for agent ${agentId} callSid=${callSid}`);
+  async releaseAgentReservation(agentIdOrUserId: string, callSid?: string): Promise<boolean> {
+    this.logger.log(`[QUEUE-RELEASE] Releasing reservation for agent ${agentIdOrUserId} callSid=${callSid}`);
     try {
-      // 1. Clear Redis lock
-      if (this.redis && this.redis.status === 'ready') {
-        const lockKey = `lock:agent:${agentId}:reservation`;
-        await this.redis.del(lockKey).catch(() => {});
+      // 1. Resolve agent by id OR userId
+      const agent = await this.prisma.agent.findFirst({
+        where: { OR: [{ id: agentIdOrUserId }, { userId: agentIdOrUserId }] },
+      });
+      if (!agent) {
+        this.logger.warn(`[QUEUE-RELEASE] No agent found matching ${agentIdOrUserId}`);
+        return false;
       }
 
-      // 2. Update agent in database
-      const agent = await this.prisma.agent.findUnique({ where: { id: agentId } });
-      if (!agent) return false;
+      // 2. Clear Redis lock ONLY if it was locked for THIS callSid (or if no callSid specified)
+      if (this.redis && this.redis.status === 'ready') {
+        const lockKey = `lock:agent:${agent.id}:reservation`;
+        if (callSid) {
+          const currentLock = await this.redis.get(lockKey);
+          if (currentLock === callSid) {
+            await this.redis.del(lockKey);
+            this.logger.log(`[QUEUE-RELEASE] Redis reservation lock cleared for agent ${agent.id} callSid=${callSid}`);
+          } else if (currentLock) {
+            this.logger.warn(`[QUEUE-RELEASE] Redis reservation lock for agent ${agent.id} belongs to different call (${currentLock} vs ${callSid}). Skipping lock deletion.`);
+          }
+        } else {
+          await this.redis.del(lockKey).catch(() => {});
+        }
+      }
 
-      const newActiveCalls = Math.max((agent.activeCalls || 1) - 1, 0);
+      // 3. Count remaining ACTIVE calls for this agent in the database to prevent prematurely setting AVAILABLE or activeCalls: 0
+      const remainingActiveCount = await this.prisma.callSession.count({
+        where: {
+          status: { in: ['RINGING', 'IN_PROGRESS'] },
+          ...(callSid ? { NOT: { OR: [{ reason: callSid }, { id: callSid }, { livekitRoom: callSid }] } } : {}),
+          OR: [
+            { calleeUserId: agent.userId },
+            { callerUserId: agent.userId },
+            { participants: { some: { agentId: agent.id, leftAt: null } } }
+          ]
+        }
+      });
+
       await this.prisma.agent.update({
-        where: { id: agentId },
+        where: { id: agent.id },
         data: {
-          activeCalls: newActiveCalls,
-          status: newActiveCalls === 0 ? 'AVAILABLE' : 'BUSY',
+          activeCalls: remainingActiveCount,
+          status: remainingActiveCount === 0 ? 'AVAILABLE' : 'BUSY',
         },
       });
 
-      this.logger.log(`[QUEUE-RELEASE-SUCCESS] Agent ${agentId} released (activeCalls: ${newActiveCalls})`);
+      this.logger.log(`[QUEUE-RELEASE-SUCCESS] Agent ${agent.id} updated (activeCalls: ${remainingActiveCount}, status: ${remainingActiveCount === 0 ? 'AVAILABLE' : 'BUSY'})`);
       return true;
     } catch (err: any) {
-      this.logger.error(`[QUEUE-RELEASE] Failed to release agent ${agentId}: ${err.message}`);
+      this.logger.error(`[QUEUE-RELEASE] Failed to release agent ${agentIdOrUserId}: ${err.message}`);
       return false;
     }
   }

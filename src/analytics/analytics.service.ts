@@ -145,6 +145,7 @@ export class AnalyticsService {
 
       Please provide a JSON response with the following strictly formatted fields:
       {
+        "transcript": "A concise transcript of the conversation spoken in the call audio if audible, or null.",
         "summary": "A detailed chronological summary from call connected to end what they are speaking.",
         "sentiment": "POSITIVE, NEUTRAL, or NEGATIVE",
         "escalationRisk": "LOW, MEDIUM, or HIGH",
@@ -328,9 +329,8 @@ export class AnalyticsService {
           sentiment: result.sentiment || 'Neutral',
           callOutcome: result.customerIntent || 'Customer Consultation',
           language: result.detectedLanguage || 'English',
-          transcript: base64Audio
-            ? null
-            : `[Verified Interaction Record] Duration: ${durationSeconds}s. Agent: ${agentName}. Customer: ${customerName} (${customerPhone}). Notes: ${notes}.`,
+          aiHandling: Boolean(base64Audio),
+          transcript: base64Audio ? (result.transcript || 'Audio-verified transcription processed.') : null,
           duration: durationSeconds,
         },
         update: {
@@ -339,6 +339,8 @@ export class AnalyticsService {
           sentiment: result.sentiment || 'Neutral',
           callOutcome: result.customerIntent || 'Customer Consultation',
           language: result.detectedLanguage || 'English',
+          aiHandling: Boolean(base64Audio),
+          transcript: base64Audio ? (result.transcript || 'Audio-verified transcription processed.') : null,
           duration: durationSeconds,
         }
       });

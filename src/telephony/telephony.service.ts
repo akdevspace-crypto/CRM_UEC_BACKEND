@@ -309,58 +309,64 @@ export class TelephonyService {
 
     let session = null;
 
-    // 1. Try to find by SIPCallID in transferHistory
-    if (sipCallId) {
-      const sessions = await this.prisma.callSession.findMany({
-        where: { reason: { startsWith: 'call_outbound_' } },
-        orderBy: { startedAt: 'desc' },
-        take: 10
-      });
-      session = sessions.find(s => {
-        const th = s.transferHistory as any;
-        return th && th.providerSIPCallID === sipCallId;
-      });
-      if (session) return session;
-    }
-
-    // 2. Fallback to finding by providerCallId
-    if (callUuid) {
-      const sessions = await this.prisma.callSession.findMany({
-        where: { reason: { startsWith: 'call_outbound_' } },
-        orderBy: { startedAt: 'desc' },
-        take: 10
-      });
-      session = sessions.find(s => {
-        const th = s.transferHistory as any;
-        return th && th.providerCallUUID === callUuid;
-      });
-      if (session) return session;
-    }
-
-    // 3. Fallback: Find the most recent active outbound call to this customer number
-    const toNumber = raw.To || event.toNumber;
-    if (toNumber && toNumber !== 'Unknown') {
+    // 1. Direct match on Session primary key, reason, or livekitRoom
+    if (callUuid || sipCallId) {
       session = await this.prisma.callSession.findFirst({
         where: {
           reason: { startsWith: 'call_outbound_' },
-          status: { in: ['RINGING', 'IN_PROGRESS'] },
-          customer: { phone: { contains: toNumber.slice(-10) } }
-        },
-        orderBy: { startedAt: 'desc' }
+          OR: [
+            ...(callUuid ? [{ reason: callUuid }, { id: callUuid }, { livekitRoom: callUuid }] : []),
+            ...(sipCallId ? [{ reason: sipCallId }, { id: sipCallId }, { livekitRoom: sipCallId }] : []),
+          ]
+        }
       });
       if (session) return session;
     }
 
-    // 4. Absolute fallback: Just get the most recent outbound call that is active
-    session = await this.prisma.callSession.findFirst({
-      where: {
-        reason: { startsWith: 'call_outbound_' },
-        status: { in: ['RINGING', 'IN_PROGRESS'] }
-      },
-      orderBy: { startedAt: 'desc' }
-    });
+    // 2. Authoritative match in transferHistory for persisted provider correlation IDs
+    if (sipCallId || callUuid || requestId || bridgeUuid) {
+      const activeSessions = await this.prisma.callSession.findMany({
+        where: {
+          reason: { startsWith: 'call_outbound_' },
+          status: { in: ['RINGING', 'IN_PROGRESS'] },
+        },
+        orderBy: { startedAt: 'desc' },
+        take: 20
+      });
 
-    return session;
+      session = activeSessions.find(s => {
+        const th = (s.transferHistory as any) || {};
+        return Boolean(
+          (sipCallId && (th.providerSIPCallID === sipCallId || th.sipCallId === sipCallId)) ||
+          (callUuid && (th.providerCallUUID === callUuid || th.callUuid === callUuid)) ||
+          (requestId && th.providerRequestID === requestId) ||
+          (bridgeUuid && th.providerBridgeUUID === bridgeUuid)
+        );
+      });
+      if (session) return session;
+    }
+
+    // 3. Customer Destination Match (only if active within last 2 minutes)
+    const toNumber = raw.To || event.toNumber;
+    if (toNumber && toNumber !== 'Unknown') {
+      const cleanTo = String(toNumber).replace(/[^0-9]/g, '');
+      if (cleanTo.length >= 8) {
+        const twoMinutesAgo = new Date(Date.now() - 120000);
+        session = await this.prisma.callSession.findFirst({
+          where: {
+            reason: { startsWith: 'call_outbound_' },
+            status: { in: ['RINGING', 'IN_PROGRESS'] },
+            startedAt: { gte: twoMinutesAgo },
+            customer: { phone: { contains: cleanTo.slice(-10) } }
+          },
+          orderBy: { startedAt: 'desc' }
+        });
+        if (session) return session;
+      }
+    }
+
+    // CRITICAL: NEVER guess a session match! Do NOT fallback to "most recent outbound call".
+    return null;
   }
 
   async startLivekitRecording(callSid: string, roomName: string) {
@@ -401,6 +407,14 @@ export class TelephonyService {
         callSession.recordingStatus === 'FAILED' ||
         callSession.livekitEgressId) {
         this.logger.log(`[CALL-RECORDING] Ignored START: status=${callSession.status} recordingStatus=${callSession.recordingStatus} egressId=${callSession.livekitEgressId} callSid=${callSid}`);
+        return;
+      }
+
+      if (callSession.status === 'RINGING') {
+        this.logger.warn(`[CALL-RECORDING] Refusing recording start: session ${callSession.id} is still RINGING. Recording permitted only after verified answer.`);
+        // Allow a future attempt once the call is verified as answered
+        this.recordingAttemptedRooms.delete(lookupKey);
+        if (callSid) this.recordingAttemptedRooms.delete(callSid);
         return;
       }
 
@@ -619,14 +633,26 @@ export class TelephonyService {
         this.triggerPostCallPipeline(latestSession, null).catch(console.error);
       }
 
-      // Phase 16: Release agent reservation lock and reset active call capacity
-      if (session.calleeUserId) {
-        await this.queueService.releaseAgentReservation(session.calleeUserId, callSid).catch(() => {});
-      }
+      // 1. Mark participants as left in database
       for (const p of session.participants || []) {
-        if (p.agentId) {
-          await this.queueService.releaseAgentReservation(p.agentId, callSid).catch(() => {});
+        if (!p.leftAt) {
+          await this.prisma.callParticipant.update({
+            where: { id: p.id },
+            data: { leftAt: new Date() },
+          }).catch(() => {});
         }
+      }
+
+      // 2. Collect unique agent identifiers (avoid duplicate releases against multiple keys)
+      const uniqueAgentKeys = new Set<string>();
+      if (session.calleeUserId) uniqueAgentKeys.add(session.calleeUserId);
+      for (const p of session.participants || []) {
+        if (p.agentId) uniqueAgentKeys.add(p.agentId);
+      }
+
+      // 3. Release agent reservations idempotently using queueService (proper activeCalls count & Redis lock match)
+      for (const agentKey of uniqueAgentKeys) {
+        await this.queueService.releaseAgentReservation(agentKey, session.reason || callSid).catch(() => {});
       }
 
       this.logger.log(`[CALL-LIFECYCLE] ` + JSON.stringify({
@@ -636,29 +662,6 @@ export class TelephonyService {
         currentCRMStatus: finalStatus,
         reason: 'endCallSession executed'
       }));
-
-      // Mark agent as AVAILABLE again
-      const agentParticipant = session.participants.find(
-        (p: any) => p.role === 'AGENT' && p.agentId,
-      );
-      if (agentParticipant && agentParticipant.agentId) {
-        await this.prisma.agent.update({
-          where: { id: agentParticipant.agentId },
-          data: { status: 'AVAILABLE', activeCalls: 0 },
-        });
-
-        await this.prisma.callParticipant.update({
-          where: { id: agentParticipant.id },
-          data: { leftAt: new Date() },
-        });
-      } else if (session.calleeUserId) {
-        // If the call was missed/canceled before the agent accepted,
-        // calleeUserId holds the User ID of the assigned agent. Release them!
-        await this.prisma.agent.updateMany({
-          where: { userId: session.calleeUserId },
-          data: { status: 'AVAILABLE', activeCalls: 0 },
-        });
-      }
 
       this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${callSid} stage=CALL_TERMINATED source=endCallSession timestamp=${new Date().toISOString()} finalStatus=${finalStatus} duration=${finalDuration}`);
 
@@ -1486,7 +1489,11 @@ export class TelephonyService {
         sentiment: session.analytics?.sentiment || (session.conversation?.aiSummary as any)?.sentimentScore || 'NEUTRAL',
         riskLevel: (session.conversation?.aiSummary as any)?.riskLevel || 'LOW',
         language: session.analytics?.language || 'en-IN',
-        isTranscriptDerived: Boolean(session.analytics?.transcript || session.analytics?.aiHandling),
+        isTranscriptDerived: Boolean(
+          session.recordingStatus === 'READY' &&
+          session.analytics?.aiHandling === true &&
+          session.analytics?.transcript
+        ),
         transcript: session.analytics?.transcript || null,
       },
       notesAndDisposition: {
@@ -2161,8 +2168,45 @@ export class TelephonyService {
 
     this.logger.log(`Processing Normalized Event [${event.eventType}] for Call ${event.providerCallId}`);
 
-    if (event.direction === 'OUTBOUND') {
-      this.logger.log(`[CALL-DIRECTION] provider=${event.provider} providerCallId=${event.providerCallId} direction=outbound route=OUTBOUND_LIFECYCLE`);
+    const raw = event.rawPayload || {};
+    const sipCallId = raw.SIPCallID;
+    const callUuid = raw.CallUUID || event.providerCallId;
+
+    // Authoritative Correlation: check if this provider CallUUID or SIPCallID matches an existing outbound session
+    let matchedOutboundSession = null;
+    if (callUuid || sipCallId) {
+      matchedOutboundSession = await this.prisma.callSession.findFirst({
+        where: {
+          reason: { startsWith: 'call_outbound_' },
+          OR: [
+            ...(callUuid ? [{ reason: callUuid }, { id: callUuid }, { livekitRoom: callUuid }] : []),
+            ...(sipCallId ? [{ reason: sipCallId }, { id: sipCallId }, { livekitRoom: sipCallId }] : []),
+          ]
+        }
+      });
+
+      if (!matchedOutboundSession) {
+        const activeOutbounds = await this.prisma.callSession.findMany({
+          where: {
+            reason: { startsWith: 'call_outbound_' },
+            status: { in: ['RINGING', 'IN_PROGRESS'] },
+          },
+          orderBy: { startedAt: 'desc' },
+          take: 10
+        });
+
+        matchedOutboundSession = activeOutbounds.find(s => {
+          const th = (s.transferHistory as any) || {};
+          return Boolean(
+            (sipCallId && (th.providerSIPCallID === sipCallId || th.sipCallId === sipCallId)) ||
+            (callUuid && (th.providerCallUUID === callUuid || th.callUuid === callUuid))
+          );
+        }) || null;
+      }
+    }
+
+    if (matchedOutboundSession || event.direction === 'OUTBOUND') {
+      this.logger.log(`[CALL-DIRECTION] provider=${event.provider} providerCallId=${event.providerCallId} direction=outbound route=OUTBOUND_LIFECYCLE matchedOutbound=${matchedOutboundSession?.id || 'none'}`);
       return await this.processOutboundProviderEvent(event, req);
     } else {
       this.logger.log(`[CALL-DIRECTION] provider=${event.provider} providerCallId=${event.providerCallId} direction=inbound route=INBOUND_LIFECYCLE`);
@@ -2374,9 +2418,21 @@ export class TelephonyService {
     if (['CALL_ENDED', 'CALL_MISSED', 'CALL_FAILED'].includes(event.eventType)) {
       let targetCallSid = event.providerCallId;
 
-      this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${targetCallSid} stage=CALL_TERMINATED source=${event.provider}_carrier_webhook timestamp=${new Date().toISOString()} reason=${event.eventType}`);
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(targetCallSid);
+      const session = await this.prisma.callSession.findFirst({
+        where: isUuid
+          ? { OR: [{ id: targetCallSid }, { reason: targetCallSid }, { livekitRoom: targetCallSid }] }
+          : { OR: [{ reason: targetCallSid }, { livekitRoom: targetCallSid }, { livekitRoom: `call_${targetCallSid}` }] }
+      });
 
-      await this.endCallSession(targetCallSid, event.duration, event.recordingUrl, true, event.eventType);
+      if (!session) {
+        this.logger.warn(`[INBOUND-CORRELATION] No matching inbound CallSession for providerCallId=${targetCallSid}. Safely ignored without guessing.`);
+        return true;
+      }
+
+      this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${session.reason || targetCallSid} stage=CALL_TERMINATED source=${event.provider}_carrier_webhook timestamp=${new Date().toISOString()} reason=${event.eventType}`);
+
+      await this.endCallSession(session.reason || targetCallSid, event.duration, event.recordingUrl, true, event.eventType);
     }
 
     return true; // Processed

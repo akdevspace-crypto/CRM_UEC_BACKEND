@@ -655,8 +655,21 @@ export class TelephonyGateway
     @MessageBody() data: any,
     @ConnectedSocket() client: Socket,
   ) {
+    if (!data?.callSid) {
+      this.logger.warn('[CALL-TERMINATION] endCall received without callSid. Ignored.');
+      return;
+    }
+
+    let validatedReason = data.reason;
+    if (!validatedReason) {
+      this.logger.warn(
+        `[CALL-TERMINATION] endCall received with missing or undefined reason for callSid=${data.callSid}. Applying explicit fallback reason 'explicit_user_end'.`,
+      );
+      validatedReason = 'explicit_user_end';
+    }
+
     this.logger.log(
-      `Call ended by frontend: ${data.callSid}, duration: ${data.duration}, reason: ${data.reason}`,
+      `Call ended by frontend: ${data.callSid}, duration: ${data.duration}, reason: ${validatedReason}`,
     );
 
     const nonDestructiveDisconnectReasons = [
@@ -667,9 +680,16 @@ export class TelephonyGateway
     ];
 
     // CRITICAL: Do not terminate the PSTN/SIP call solely because the frontend WebRTC or room temporarily disconnects!
-    if (data?.reason && nonDestructiveDisconnectReasons.includes(data.reason)) {
+    if (nonDestructiveDisconnectReasons.includes(validatedReason)) {
       this.logger.warn(
-        `[CALL-LIFECYCLE] Rejecting premature endCall with reason='${data.reason}' for callSid=${data.callSid}. PSTN/SIP call preserved.`,
+        `[CALL-LIFECYCLE] Rejecting premature endCall with reason='${validatedReason}' for callSid=${data.callSid}. PSTN/SIP call preserved.`,
+      );
+      return;
+    }
+
+    if (this.telephonyService.isSessionTerminatedOrTerminating(data.callSid)) {
+      this.logger.log(
+        `[CALL-TERMINATION] Session ${data.callSid} already terminating or ended. Skipping duplicate endCall from socket.`,
       );
       return;
     }
@@ -679,7 +699,7 @@ export class TelephonyGateway
       data.duration,
       null,
       false,
-      data.reason,
+      validatedReason,
     );
   }
 

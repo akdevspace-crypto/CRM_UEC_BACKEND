@@ -38,7 +38,19 @@ export class VobizProvider implements TelephonyProvider {
       this.logger.log(`[Vobiz Webhook Diagnostic] eventType=${payload?.Status || payload?.DialCallStatus || 'unknown'} candidateCallIds=${candidateCallIds.join(',')} sanitizedPayload=${JSON.stringify(sanitizedPayload)}`);
     }
 
-    const direction = (payload?.Direction === 'outbound-api' || payload?.Direction === 'outbound') ? 'OUTBOUND' : 'INBOUND';
+    const rawDirection = String(payload?.Direction || '').toLowerCase();
+    const vobizTrunkNumber = (process.env.VOBIZ_PHONE_NUMBER || '+918064267760').replace(/[^0-9]/g, '');
+    const fromClean = String(payload?.From || payload?.CallFrom || '').replace(/[^0-9]/g, '');
+    const toClean = String(payload?.To || payload?.CallTo || '').replace(/[^0-9]/g, '');
+
+    let direction: 'OUTBOUND' | 'INBOUND' = 'INBOUND';
+    if (rawDirection.includes('outbound')) {
+      direction = 'OUTBOUND';
+    } else if (fromClean.length >= 8 && vobizTrunkNumber.length >= 8 && fromClean.endsWith(vobizTrunkNumber.slice(-10))) {
+      direction = 'OUTBOUND';
+    } else if (toClean.length >= 8 && vobizTrunkNumber.length >= 8 && toClean.endsWith(vobizTrunkNumber.slice(-10))) {
+      direction = 'INBOUND';
+    }
     
     // Status normalization
     let eventType: NormalizedCallEvent['eventType'] = 'CALL_RINGING'; // default

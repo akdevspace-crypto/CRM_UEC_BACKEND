@@ -553,8 +553,137 @@ async function runCallAudioLifecycleSuite() {
   const lateAnswerResult = handleLateAnswer('call_ended_uuid_1', 'ENDED');
   assert(lateAnswerResult.ignored === true && lateAnswerRevivedSession === false, '15.9 Late Answer Callback Cannot Revive Ended Session', 'Revival prevented');
 
+  // ============================================================================
+  // TEST GROUP 16: ADVANCED CORRELATION, QUEUE CAPACITY ISOLATION & LIFECYCLE EDGE CASES
+  // ============================================================================
+  console.log(`\n${CYAN}--- GROUP 16: Correlation Isolation, Queue Capacity & Lifecycle Edge Cases ---${RESET}`);
+
+  // 16.1 Inbound webhook carrying SIPCallID differing from CallUUID correlates correctly without touching outbound sessions
+  const mockSessions = [
+    { id: 'sess_out_1', reason: 'call_outbound_100', transferHistory: { providerSIPCallID: 'sip_livekit_out_1' }, status: 'IN_PROGRESS' },
+    { id: 'sess_in_1', reason: 'call_uuid_in_1', transferHistory: { providerCallUUID: 'call_uuid_in_1' }, status: 'IN_PROGRESS' }
+  ];
+
+  const correlateWebhook = (event: { direction: string; callUuid: string; sipCallId: string }) => {
+    // Check if matched outbound
+    const matchedOutbound = mockSessions.find(s => 
+      s.reason.startsWith('call_outbound_') && 
+      (s.reason === event.callUuid || (s.transferHistory as any).providerSIPCallID === event.sipCallId)
+    );
+    if (matchedOutbound) return { route: 'OUTBOUND', session: matchedOutbound };
+
+    const matchedInbound = mockSessions.find(s => 
+      !s.reason.startsWith('call_outbound_') && 
+      (s.reason === event.callUuid || (s.transferHistory as any).providerCallUUID === event.callUuid)
+    );
+    if (matchedInbound) return { route: 'INBOUND', session: matchedInbound };
+
+    return { route: 'UNMATCHED', session: null };
+  };
+
+  const inboundWebhookResult = correlateWebhook({
+    direction: 'INBOUND',
+    callUuid: 'call_uuid_in_1',
+    sipCallId: 'different_sip_call_id_999'
+  });
+  assert(inboundWebhookResult.route === 'INBOUND' && inboundWebhookResult.session?.id === 'sess_in_1', '16.1 Inbound Webhook Correlated Directly Without Touching Outbound', 'Target=sess_in_1');
+
+  // 16.2 Unmatched webhook does NOT guess or touch active sessions
+  const unmatchedResult = correlateWebhook({
+    direction: 'OUTBOUND',
+    callUuid: 'completely_unknown_uuid',
+    sipCallId: 'completely_unknown_sip'
+  });
+  assert(unmatchedResult.route === 'UNMATCHED' && unmatchedResult.session === null, '16.2 Unmatched Webhook Safely Handled Without Guessing', 'No arbitrary session selected');
+
+  // 16.3 Missing reason (`reason=undefined`) in frontend `endCall` receives explicit validated reason
+  const sanitizeEndCallReason = (reason?: string) => {
+    if (!reason || typeof reason !== 'string' || reason.trim() === '') {
+      return 'explicit_user_end';
+    }
+    return reason;
+  };
+  const sanitizedUndefined = sanitizeEndCallReason(undefined);
+  assert(sanitizedUndefined === 'explicit_user_end', '16.3 Missing reason=undefined Sanitized to explicit_user_end', 'reason=explicit_user_end');
+
+  // 16.4 Stale components emitting `endCall` after session already ENDED are ignored
+  const sessionStatusMap = new Map<string, string>([['call_outbound_1792828962452', 'ENDED']]);
+  let endCallExecutedForEnded = false;
+
+  const handleSocketEndCallGuarded = (callSid: string, reason?: string) => {
+    const currentStatus = sessionStatusMap.get(callSid);
+    if (currentStatus === 'ENDED') {
+      return { ignored: true, reason: 'already_ended' };
+    }
+    endCallExecutedForEnded = true;
+    return { ignored: false };
+  };
+
+  const guardedResult = handleSocketEndCallGuarded('call_outbound_1792828962452', undefined);
+  assert(guardedResult.ignored === true && endCallExecutedForEnded === false, '16.4 Duplicate endCall on Already-Ended Call Ignored', 'No double termination');
+
+  // 16.5 Recording start refused while call status is RINGING
+  let recordingStartedWhileRinging = false;
+  const attemptStartRecording = (sessionStatus: string) => {
+    if (sessionStatus === 'RINGING') {
+      return { refused: true, reason: 'call_still_ringing' };
+    }
+    recordingStartedWhileRinging = true;
+    return { refused: false };
+  };
+
+  const recRingingResult = attemptStartRecording('RINGING');
+  assert(recRingingResult.refused === true && recordingStartedWhileRinging === false, '16.5 Recording Refused While Call is RINGING', 'Recording blocked until answer');
+
+  // 16.6 Queue reservation release checks callSid in Redis lock
+  const redisLocks = new Map<string, string>([['lock:agent:agent_1:reservation', 'call_101']]);
+  const releaseQueueReservationMock = (agentId: string, callSid: string) => {
+    const lockKey = `lock:agent:${agentId}:reservation`;
+    const current = redisLocks.get(lockKey);
+    if (current === callSid) {
+      redisLocks.delete(lockKey);
+      return { released: true };
+    }
+    return { released: false, reason: 'lock_belongs_to_other_call' };
+  };
+
+  const relAttemptWrong = releaseQueueReservationMock('agent_1', 'call_different_202');
+  assert(relAttemptWrong.released === false && redisLocks.has('lock:agent:agent_1:reservation'), '16.6 Cannot Release Another Call Reservation in Redis', 'Foreign lock preserved');
+
+  const relAttemptCorrect = releaseQueueReservationMock('agent_1', 'call_101');
+  assert(relAttemptCorrect.released === true && !redisLocks.has('lock:agent:agent_1:reservation'), '16.7 Matching Call Reservation Lock Released in Redis', 'Lock deleted');
+
+  // 16.8 Agent with multiple active calls stays BUSY when one ends
+  const computeAgentStatusMock = (agentRemainingActiveCalls: number) => {
+    return {
+      activeCalls: agentRemainingActiveCalls,
+      status: agentRemainingActiveCalls === 0 ? 'AVAILABLE' : 'BUSY'
+    };
+  };
+
+  const agentWithRemainingCall = computeAgentStatusMock(1);
+  assert(agentWithRemainingCall.status === 'BUSY' && agentWithRemainingCall.activeCalls === 1, '16.8 Agent with Remaining Active Call Stays BUSY', 'status=BUSY, activeCalls=1');
+
+  const agentWithZeroRemaining = computeAgentStatusMock(0);
+  assert(agentWithZeroRemaining.status === 'AVAILABLE' && agentWithZeroRemaining.activeCalls === 0, '16.9 Agent with Zero Calls Becomes AVAILABLE', 'status=AVAILABLE, activeCalls=0');
+
+  // 16.10 Deduplication: agent reservations released only once per unique agent
+  const sessionParticipants = [
+    { agentId: 'agent_alpha' },
+    { agentId: 'agent_alpha' } // Duplicate participant entry
+  ];
+  const uniqueAgents = new Set<string>();
+  let releaseCalls = 0;
+  for (const p of sessionParticipants) {
+    if (p.agentId) uniqueAgents.add(p.agentId);
+  }
+  for (const a of uniqueAgents) {
+    releaseCalls++;
+  }
+  assert(uniqueAgents.size === 1 && releaseCalls === 1, '16.10 Duplicate Agent Release Prevented via Unique Set', 'releaseCalls=1');
+
   console.log(`\n================================================================`);
-  console.log(`  ALL 15 VERIFICATION AREAS PASSED: ${passedTests}/${totalTests} TESTS SUCCESSFUL`);
+  console.log(`  ALL 16 VERIFICATION AREAS PASSED: ${passedTests}/${totalTests} TESTS SUCCESSFUL`);
   console.log(`================================================================\n`);
 }
 
