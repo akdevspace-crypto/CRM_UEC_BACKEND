@@ -174,6 +174,54 @@ export class TelephonyService {
     }
   }
 
+  async getMyActiveCall(agentIdOrUserId: string) {
+    try {
+      let agent = await this.prisma.agent.findFirst({
+        where: { OR: [{ id: agentIdOrUserId }, { userId: agentIdOrUserId }] },
+      });
+      const candidateUserIds = [agentIdOrUserId];
+      if (agent?.userId) candidateUserIds.push(agent.userId);
+      const candidateAgentIds = [agentIdOrUserId];
+      if (agent?.id) candidateAgentIds.push(agent.id);
+
+      const activeSession = await this.prisma.callSession.findFirst({
+        where: {
+          status: { in: ['RINGING', 'IN_PROGRESS'] },
+          OR: [
+            { calleeUserId: { in: candidateUserIds } },
+            { callerUserId: { in: candidateUserIds } },
+            { participants: { some: { agentId: { in: candidateAgentIds } } } }
+          ]
+        },
+        include: {
+          customer: true,
+          lead: true,
+        },
+        orderBy: { createdAt: 'desc' }
+      });
+
+      if (!activeSession) {
+        return { activeCall: null };
+      }
+
+      return {
+        activeCall: {
+          callSid: activeSession.reason || activeSession.id,
+          roomName: activeSession.livekitRoom,
+          sessionId: activeSession.id,
+          status: activeSession.status,
+          customerName: activeSession.customer?.name || activeSession.lead?.customerName || 'Customer',
+          phone: activeSession.customer?.phone || activeSession.lead?.phoneNumber || 'Customer Phone',
+          startedAt: activeSession.startedAt?.getTime() || activeSession.createdAt.getTime(),
+          direction: (activeSession.transferHistory as any)?.direction || (activeSession.reason?.startsWith('call_outbound_') ? 'OUTBOUND' : 'INBOUND'),
+        }
+      };
+    } catch (err: any) {
+      this.logger.error(`Error resolving active call for ${agentIdOrUserId}: ${err.message}`);
+      return { activeCall: null };
+    }
+  }
+
   // ==========================================
   // OUTBOUND WEBHOOK PROCESSING (PHASE 2 & 4)
   // ==========================================
@@ -201,6 +249,32 @@ export class TelephonyService {
       data: { transferHistory: th }
     });
 
+    if (event.eventType === 'CALL_CONNECTED') {
+      this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${session.reason} stage=CUSTOMER_ANSWERED source=vobiz_outbound_webhook timestamp=${new Date().toISOString()}`);
+      await this.prisma.callSession.update({
+        where: { id: session.id },
+        data: {
+          status: 'IN_PROGRESS',
+          startedAt: session.startedAt || new Date(),
+        }
+      });
+
+      // Start recording on answer if not already started
+      if (session.livekitRoom && session.recordingStatus !== 'RECORDING') {
+        this.startLivekitRecording(session.reason!, session.livekitRoom).catch(err => {
+          this.logger.warn(`[CALL-RECORDING] Outbound answer recording error: ${err.message}`);
+        });
+      }
+
+      this.telephonyGateway.server.emit('callConnected', {
+        callSid: session.reason,
+        roomName: session.livekitRoom,
+        sessionId: session.id,
+        answeredAt: new Date().toISOString(),
+      });
+      return true;
+    }
+
     if (event.eventType === 'CALL_ENDED' || event.eventType === 'CALL_MISSED' || event.eventType === 'CALL_FAILED') {
       const durationStr = raw.Duration || '0';
       const billsecStr = raw.Billsec || '0';
@@ -216,12 +290,6 @@ export class TelephonyService {
       }
 
       this.logger.log(`[OUTBOUND-LIFECYCLE] Call ended. billsec=${billsec}, finalStatus=${finalStatus}`);
-
-      // DO NOT call endCallSession repeatedly. Update status directly if we are handling the provider webhook.
-      // Wait, endCallSession is idempotent and handles LiveKit termination. We should call it, but pass the correct force flags.
-      // Actually, endCallSession relies on `session.reason`. We can just call it to let it handle AI processing & cleanup.
-
-      // But wait! endCallSession currently uses duration=0 -> MISSED. So we should pass the actual billsec as duration.
       await this.endCallSession(session.reason!, billsec > 0 ? billsec : duration, null, true);
     }
 
@@ -349,6 +417,7 @@ export class TelephonyService {
         }
       });
       this.logger.log(`[CALL-RECORDING] event=EGRESS_STARTED callId=${callSid} roomName=${roomName} egressId=${egressId}`);
+      this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${callSession?.reason || callSid} stage=RECORDING_STARTED source=startLivekitRecording timestamp=${new Date().toISOString()} egressId=${egressId}`);
     } catch (e: any) {
       this.logger.error(`[CALL-RECORDING] START failed: ${e.message}`);
       await this.prisma.callSession.update({
@@ -366,8 +435,11 @@ export class TelephonyService {
   ) {
     this.logger.log(`Ending CallSession ${callSid} forceCleanup=${forceCleanup}`);
     try {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(callSid);
       const session = await this.prisma.callSession.findFirst({
-        where: { reason: callSid },
+        where: isUuid
+          ? { OR: [{ id: callSid }, { reason: callSid }, { livekitRoom: callSid }] }
+          : { OR: [{ reason: callSid }, { livekitRoom: callSid }] },
         include: { participants: true },
       });
       if (!session) return;
@@ -483,6 +555,19 @@ export class TelephonyService {
           data: { status: 'AVAILABLE', activeCalls: 0 },
         });
       }
+
+      this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${callSid} stage=CALL_TERMINATED source=endCallSession timestamp=${new Date().toISOString()} finalStatus=${finalStatus} duration=${finalDuration}`);
+
+      // Emit callEnded with all correlation aliases so frontend clears active call immediately
+      this.telephonyGateway.server.emit('callEnded', {
+        callSid: session.reason || callSid,
+        roomName: session.livekitRoom || callSid,
+        sessionId: session.id,
+        duration: finalDuration,
+        status: finalStatus,
+      });
+
+      this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${callSid} stage=CLEANUP_COMPLETED source=endCallSession timestamp=${new Date().toISOString()}`);
     } catch (e) {
       this.logger.error(`Failed to end CallSession: ${e.message}`);
     }
@@ -2161,32 +2246,33 @@ export class TelephonyService {
     if (event.eventType === 'CALL_CONNECTED') {
       let targetCallSid = event.providerCallId;
 
-      this.logger.log(`[CALL-LIFECYCLE] ` + JSON.stringify({
-        event: 'provider_call_connected',
-        sessionID: targetCallSid,
-        CallUUID: event.providerCallId,
-        source: event.provider
-      }));
-      this.telephonyGateway.server.emit('callConnected', { callSid: targetCallSid });
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(targetCallSid);
+      const session = await this.prisma.callSession.findFirst({
+        where: isUuid
+          ? { OR: [{ id: targetCallSid }, { reason: targetCallSid }, { livekitRoom: targetCallSid }] }
+          : { OR: [{ reason: targetCallSid }, { livekitRoom: targetCallSid }, { livekitRoom: `call_${targetCallSid}` }] }
+      });
+
+      const roomName = session?.livekitRoom || `call_${targetCallSid}`;
+      const reasonSid = session?.reason || targetCallSid;
+
+      this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${reasonSid} stage=CUSTOMER_ANSWERED source=${event.provider}_inbound_connected timestamp=${new Date().toISOString()}`);
+
+      this.telephonyGateway.server.emit('callConnected', {
+        callSid: reasonSid,
+        roomName: roomName,
+        sessionId: session?.id,
+        answeredAt: new Date().toISOString()
+      });
       return true;
     }
 
     if (['CALL_ENDED', 'CALL_MISSED', 'CALL_FAILED'].includes(event.eventType)) {
       let targetCallSid = event.providerCallId;
 
-
-
-      this.logger.log(`[CALL-LIFECYCLE] ` + JSON.stringify({
-        event: 'provider_call_ended',
-        sessionID: targetCallSid,
-        CallUUID: event.providerCallId,
-        source: event.provider,
-        reason: event.eventType
-      }));
+      this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${targetCallSid} stage=CALL_TERMINATED source=${event.provider}_carrier_webhook timestamp=${new Date().toISOString()} reason=${event.eventType}`);
 
       await this.endCallSession(targetCallSid, event.duration, event.recordingUrl, true);
-      this.logger.log(`Emitting callEnded for ${targetCallSid} to frontend.`);
-      this.telephonyGateway.server.emit('callEnded', { callSid: targetCallSid });
     }
 
     return true; // Processed
@@ -2269,12 +2355,10 @@ export class TelephonyService {
       agent?.name || 'Agent',
     );
 
-    // Auto-poll to start recording in background when participants connect
-    setTimeout(() => {
-      this.startLivekitRecording(callSid, roomName).catch(err => {
-        this.logger.warn(`[CALL-RECORDING] Auto-start recording background error: ${err.message}`);
-      });
-    }, 2000);
+    this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${callSid} stage=CALL_INITIATED source=initiateOutboundCall timestamp=${new Date().toISOString()} direction=OUTBOUND to=${request.to} roomName=${roomName}`);
+
+    // NOTE: Removed premature 2-second recording timer.
+    // Recording begins strictly when the customer answers the call (CUSTOMER_ANSWERED stage).
 
     const livekitWsUrl = process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_API_URL;
     return {

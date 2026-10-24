@@ -590,6 +590,40 @@ export class TelephonyGateway
     await this.telephonyService.acceptCallSession(data.callSid, agentId);
   }
 
+  @SubscribeMessage('callAnswered')
+  async handleCallAnswered(
+    @MessageBody() data: any,
+    @ConnectedSocket() client: Socket,
+  ) {
+    this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${data.callSid} stage=CUSTOMER_ANSWERED source=frontend_sip_active timestamp=${new Date().toISOString()}`);
+    if (data.callSid) {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(data.callSid);
+      await this.prisma.callSession.updateMany({
+        where: isUuid
+          ? { OR: [{ id: data.callSid }, { reason: data.callSid }, { livekitRoom: data.callSid }] }
+          : { OR: [{ reason: data.callSid }, { livekitRoom: data.callSid }] },
+        data: {
+          status: 'IN_PROGRESS',
+          startedAt: new Date(),
+        }
+      }).catch(() => {});
+
+      // Broadcast callConnected to all sockets for this call with aliases
+      this.server.emit('callConnected', {
+        callSid: data.callSid,
+        roomName: data.roomName || data.callSid,
+        answeredAt: new Date().toISOString()
+      });
+
+      // Start recording on answer
+      if (data.roomName) {
+        await this.telephonyService.startLivekitRecording(data.callSid, data.roomName).catch((err: any) => {
+          this.logger.warn(`Failed to auto-start recording on answer: ${err.message}`);
+        });
+      }
+    }
+  }
+
   @SubscribeMessage('startRecording')
   async handleStartRecording(
     @MessageBody() data: any,
@@ -605,12 +639,17 @@ export class TelephonyGateway
     @ConnectedSocket() client: Socket,
   ) {
     this.logger.log(
-      `Call ended by frontend: ${data.callSid}, duration: ${data.duration}`,
+      `Call ended by frontend: ${data.callSid}, duration: ${data.duration}, reason: ${data.reason}`,
     );
     await this.telephonyService.endCallSession(data.callSid, data.duration);
 
-    // Emit back so frontend immediately cleans up UI
-    this.server.emit('callEnded', { callSid: data.callSid });
+    // Emit back with aliases so frontend immediately cleans up UI
+    this.server.emit('callEnded', {
+      callSid: data.callSid,
+      roomName: data.roomName || data.callSid,
+      duration: data.duration,
+      status: 'ENDED',
+    });
   }
 
   @SubscribeMessage('initiateTransfer')

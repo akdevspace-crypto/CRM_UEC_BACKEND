@@ -175,7 +175,16 @@ export class TelephonyController {
     };
   }
 
-
+  @Get('my-active-call')
+  async getMyActiveCall(@Req() req: Request) {
+    const user = (req as any).user;
+    const isElevated = user && ['SUPER_ADMIN', 'ADMIN', 'SUPERVISOR'].includes(user.role);
+    const agentId = isElevated
+      ? ((req.query.agentId as string) || user?.agentId || user?.userId)
+      : (user?.agentId || user?.userId || (req.query.agentId as string));
+    if (!agentId) return { activeCall: null };
+    return await this.telephonyService.getMyActiveCall(agentId);
+  }
 
   @Public()
   @All('exotel/incoming')
