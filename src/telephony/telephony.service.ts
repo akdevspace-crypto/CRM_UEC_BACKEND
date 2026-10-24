@@ -14,6 +14,7 @@ import type { FileInfo } from '@livekit/protocol';
 @Injectable()
 export class TelephonyService {
   private readonly logger = new Logger(TelephonyService.name);
+  private readonly terminatingSessions = new Set<string>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -281,16 +282,8 @@ export class TelephonyService {
       const duration = parseInt(durationStr, 10);
       const billsec = parseInt(billsecStr, 10);
 
-      // Determine MISSED vs ENDED based on answered state (billsec > 0 means answered)
-      let finalStatus = session.status;
-      if (billsec > 0 || session.status === 'IN_PROGRESS' || session.status === 'ENDED') {
-        finalStatus = 'ENDED';
-      } else {
-        finalStatus = 'MISSED';
-      }
-
-      this.logger.log(`[OUTBOUND-LIFECYCLE] Call ended. billsec=${billsec}, finalStatus=${finalStatus}`);
-      await this.endCallSession(session.reason!, billsec > 0 ? billsec : duration, null, true);
+      this.logger.log(`[OUTBOUND-LIFECYCLE] Call ended. billsec=${billsec}, duration=${duration}, cause=${raw.HangupCause}`);
+      await this.endCallSession(session.reason!, billsec > 0 ? billsec : duration, null, true, raw.HangupCause || event.eventType);
     }
 
     return true;
@@ -432,8 +425,21 @@ export class TelephonyService {
     duration: number = 0,
     vobizRecordingUrl: string | null = null,
     forceCleanup: boolean = false,
+    reason?: string,
   ) {
-    this.logger.log(`Ending CallSession ${callSid} forceCleanup=${forceCleanup}`);
+    this.logger.log(`Ending CallSession ${callSid} forceCleanup=${forceCleanup} reason=${reason}`);
+
+    // REQUIREMENT 3: Do not terminate the PSTN/SIP call solely because the frontend WebRTC connection temporarily disconnects!
+    if (reason === 'webrtc_disconnected') {
+      this.logger.warn(`[CALL-LIFECYCLE] Rejecting call termination for callSid=${callSid} with reason='webrtc_disconnected'. PSTN/SIP call preserved.`);
+      return;
+    }
+
+    if (this.terminatingSessions.has(callSid)) {
+      this.logger.log(`[CALL-LIFECYCLE] Session ${callSid} termination already in progress. Skipping duplicate.`);
+      return;
+    }
+
     try {
       const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(callSid);
       const session = await this.prisma.callSession.findFirst({
@@ -444,10 +450,31 @@ export class TelephonyService {
       });
       if (!session) return;
 
-      if (session.status === 'ENDED' || session.status === 'MISSED') {
+      const isTerminal = ['ENDED', 'MISSED', 'CANCELLED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED'].includes(session.status);
+      if (isTerminal) {
         this.logger.log(`[CALL-LIFECYCLE] Session ${callSid} is already ${session.status}. Skipping duplicate endCallSession.`);
         return;
       }
+
+      if (this.terminatingSessions.has(session.id) || 
+          (session.reason && this.terminatingSessions.has(session.reason)) || 
+          (session.livekitRoom && this.terminatingSessions.has(session.livekitRoom))) {
+        this.logger.log(`[CALL-LIFECYCLE] Session ${callSid} (id=${session.id}) is already being terminated. Skipping duplicate.`);
+        return;
+      }
+
+      // Add all aliases to in-memory lock
+      this.terminatingSessions.add(callSid);
+      this.terminatingSessions.add(session.id);
+      if (session.reason) this.terminatingSessions.add(session.reason);
+      if (session.livekitRoom) this.terminatingSessions.add(session.livekitRoom);
+
+      setTimeout(() => {
+        this.terminatingSessions.delete(callSid);
+        this.terminatingSessions.delete(session.id);
+        if (session.reason) this.terminatingSessions.delete(session.reason);
+        if (session.livekitRoom) this.terminatingSessions.delete(session.livekitRoom);
+      }, 10000);
 
       // Terminate SIP Participant in LiveKit (Idempotent)
       let terminationResult = 'not_applicable';
@@ -474,14 +501,34 @@ export class TelephonyService {
         }
       }
 
-      const finalStatus = finalDuration === 0 && session.status === 'RINGING' ? 'MISSED' : 'ENDED';
+      const isOutbound = (session.transferHistory as any)?.direction === 'outbound' || 
+                         session.livekitRoom?.startsWith('call_outbound_') || 
+                         session.reason?.startsWith('call_outbound_');
+
+      let finalStatus: string;
+      if (finalDuration > 0 || session.status === 'IN_PROGRESS' || session.status === 'CONNECTED') {
+        finalStatus = 'ENDED';
+      } else {
+        const normalizedReason = (reason || session.reason || '').toLowerCase();
+        if (normalizedReason.includes('busy') || normalizedReason === 'user_busy') {
+          finalStatus = 'BUSY';
+        } else if (normalizedReason.includes('failed') || normalizedReason.includes('rejected')) {
+          finalStatus = 'FAILED';
+        } else if (normalizedReason === 'explicit_user_end' || normalizedReason === 'agent_cancelled' || normalizedReason === 'cancelled') {
+          finalStatus = isOutbound ? 'CANCELLED' : 'MISSED';
+        } else if (normalizedReason === 'timeout' || normalizedReason === 'no-answer' || normalizedReason === 'customer_no_answer') {
+          finalStatus = isOutbound ? 'UNANSWERED' : 'MISSED';
+        } else {
+          finalStatus = isOutbound ? 'UNANSWERED' : 'MISSED';
+        }
+      }
 
       await this.prisma.callSession.update({
         where: { id: session.id },
         data: {
           endedAt: new Date(),
           duration: finalDuration,
-          status: finalStatus,
+          status: finalStatus as any,
           aiProcessingStatus: (finalStatus === 'ENDED' && (finalDuration > 0 || session.recordingStatus === 'RECORDING')) ? 'RECORDING_PENDING' : 'COMPLETED',
         },
       });
@@ -2272,7 +2319,7 @@ export class TelephonyService {
 
       this.logger.log(`[CALL-LIFECYCLE-DIAG] callId=${targetCallSid} stage=CALL_TERMINATED source=${event.provider}_carrier_webhook timestamp=${new Date().toISOString()} reason=${event.eventType}`);
 
-      await this.endCallSession(targetCallSid, event.duration, event.recordingUrl, true);
+      await this.endCallSession(targetCallSid, event.duration, event.recordingUrl, true, event.eventType);
     }
 
     return true; // Processed

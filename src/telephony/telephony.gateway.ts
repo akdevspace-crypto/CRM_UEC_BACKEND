@@ -641,15 +641,22 @@ export class TelephonyGateway
     this.logger.log(
       `Call ended by frontend: ${data.callSid}, duration: ${data.duration}, reason: ${data.reason}`,
     );
-    await this.telephonyService.endCallSession(data.callSid, data.duration);
 
-    // Emit back with aliases so frontend immediately cleans up UI
-    this.server.emit('callEnded', {
-      callSid: data.callSid,
-      roomName: data.roomName || data.callSid,
-      duration: data.duration,
-      status: 'ENDED',
-    });
+    // CRITICAL: Do not terminate the PSTN/SIP call solely because the frontend WebRTC connection temporarily disconnects!
+    if (data?.reason === 'webrtc_disconnected') {
+      this.logger.warn(
+        `[CALL-LIFECYCLE] Rejecting premature endCall with reason='webrtc_disconnected' for callSid=${data.callSid}. PSTN/SIP call preserved.`,
+      );
+      return;
+    }
+
+    await this.telephonyService.endCallSession(
+      data.callSid,
+      data.duration,
+      null,
+      false,
+      data.reason,
+    );
   }
 
   @SubscribeMessage('initiateTransfer')

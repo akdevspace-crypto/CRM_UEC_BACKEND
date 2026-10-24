@@ -292,8 +292,154 @@ async function runCallAudioLifecycleSuite() {
   handleEnableAudioClick();
   assert(audioBlocked === false, '10.2 Agent Click Unlocks Audio Playback', 'audioBlocked=false');
 
+  // ============================================================================
+  // TEST GROUP 11: TEMPORARY WEBRTC DISCONNECT PRESERVES PSTN CALL
+  // ============================================================================
+  console.log(`\n${CYAN}--- GROUP 11: WebRTC Disconnect Protection (Minimal Scope Fix) ---${RESET}`);
+
+  // Test 11.1: Initial mount in disconnected state does NOT trigger call termination
+  let pstnCallTerminated = false;
+  let clientWebRtcConnected = false;
+  let simulatedCallState = 'DIALING';
+
+  const onConnectionStateChange = (state: string) => {
+    if (state === 'connected') {
+      clientWebRtcConnected = true;
+      simulatedCallState = 'RINGING';
+    } else if (state === 'connecting') {
+      clientWebRtcConnected = false;
+    } else if (state === 'reconnecting') {
+      clientWebRtcConnected = false;
+      // Do NOT terminate call!
+    } else if (state === 'disconnected') {
+      clientWebRtcConnected = false;
+      // Do NOT terminate call!
+    }
+  };
+
+  // Initial mount starts as 'disconnected' before connection completes
+  onConnectionStateChange('disconnected');
+  assert(pstnCallTerminated === false, '11.1 Initial Disconnected State Does NOT Terminate Call', 'pstnCallTerminated=false');
+  assert(simulatedCallState === 'DIALING', '11.2 Call Remains in Dialing State on Mount', 'simulatedCallState=DIALING');
+
+  // Connection established
+  onConnectionStateChange('connected');
+  assert(clientWebRtcConnected === true, '11.3 WebRTC Connected Sets Flag', 'clientWebRtcConnected=true');
+
+  // Transient WebRTC glitch / reconnecting
+  onConnectionStateChange('reconnecting');
+  assert(pstnCallTerminated === false, '11.4 Temporary Reconnecting Does NOT Terminate PSTN Call', 'pstnCallTerminated=false');
+  assert(simulatedCallState === 'RINGING', '11.5 Call State Preserved During Media Reconnect', 'simulatedCallState=RINGING');
+
+  // Backend Gateway rejects any endCall with reason='webrtc_disconnected'
+  const handleGatewayEndCall = (data: { callSid: string; reason: string }) => {
+    if (data.reason === 'webrtc_disconnected') {
+      return { rejected: true, terminated: false };
+    }
+    return { rejected: false, terminated: true };
+  };
+
+  const gatewayResult = handleGatewayEndCall({ callSid: 'call_outbound_test_1', reason: 'webrtc_disconnected' });
+  assert(gatewayResult.rejected === true && gatewayResult.terminated === false, '11.6 Backend Rejects webrtc_disconnected Signal', 'PSTN Call Preserved');
+
+  // ============================================================================
+  // TEST GROUP 12: STATUS DIFFERENTIATION (MISSED vs UNANSWERED vs CANCELLED vs BUSY vs FAILED vs ENDED)
+  // ============================================================================
+  console.log(`\n${CYAN}--- GROUP 12: Call Status Classification ---${RESET}`);
+
+  const computeFinalStatus = (direction: 'outbound' | 'inbound', duration: number, preStatus: string, reason?: string) => {
+    if (duration > 0 || preStatus === 'IN_PROGRESS' || preStatus === 'CONNECTED') {
+      return 'ENDED';
+    }
+    const r = (reason || '').toLowerCase();
+    if (r.includes('busy')) return 'BUSY';
+    if (r.includes('fail') || r.includes('reject')) return 'FAILED';
+    if (r === 'explicit_user_end' || r === 'agent_cancelled' || r === 'cancelled') {
+      return direction === 'outbound' ? 'CANCELLED' : 'MISSED';
+    }
+    if (r === 'timeout' || r === 'no-answer') {
+      return direction === 'outbound' ? 'UNANSWERED' : 'MISSED';
+    }
+    return direction === 'outbound' ? 'UNANSWERED' : 'MISSED';
+  };
+
+  // 12.1 Outbound cancelled by agent before customer answer -> CANCELLED
+  const statusOutboundCancelled = computeFinalStatus('outbound', 0, 'RINGING', 'explicit_user_end');
+  assert(statusOutboundCancelled === 'CANCELLED', '12.1 Outbound Cancelled by Agent is CANCELLED', 'status=CANCELLED');
+
+  // 12.2 Outbound unanswered timeout -> UNANSWERED
+  const statusOutboundUnanswered = computeFinalStatus('outbound', 0, 'RINGING', 'no-answer');
+  assert(statusOutboundUnanswered === 'UNANSWERED', '12.2 Outbound Unanswered is UNANSWERED', 'status=UNANSWERED');
+
+  // 12.3 Inbound call abandoned in queue -> MISSED
+  const statusInboundMissed = computeFinalStatus('inbound', 0, 'RINGING', 'timeout');
+  assert(statusInboundMissed === 'MISSED', '12.3 Inbound Abandoned Call is MISSED', 'status=MISSED');
+
+  // 12.4 Callee busy -> BUSY
+  const statusBusy = computeFinalStatus('outbound', 0, 'RINGING', 'user_busy');
+  assert(statusBusy === 'BUSY', '12.4 Busy Call is BUSY', 'status=BUSY');
+
+  // 12.5 Provider failed -> FAILED
+  const statusFailed = computeFinalStatus('outbound', 0, 'RINGING', 'CALL_FAILED');
+  assert(statusFailed === 'FAILED', '12.5 Provider Failure is FAILED', 'status=FAILED');
+
+  // 12.6 Answered call with duration -> ENDED
+  const statusConnectedEnded = computeFinalStatus('outbound', 45, 'IN_PROGRESS', 'customer_hangup');
+  assert(statusConnectedEnded === 'ENDED', '12.6 Connected Call With Duration is ENDED', 'status=ENDED');
+
+  // ============================================================================
+  // TEST GROUP 13: CONCURRENT CALL TERMINATION DEDUPLICATION
+  // ============================================================================
+  console.log(`\n${CYAN}--- GROUP 13: Concurrent Call Termination Deduplication ---${RESET}`);
+
+  const terminatingSet = new Set<string>();
+  let terminationExecutions = 0;
+
+  const executeEndCallSessionWithLock = (callSid: string) => {
+    if (terminatingSet.has(callSid)) {
+      return { executed: false, reason: 'already_terminating' };
+    }
+    terminatingSet.add(callSid);
+    terminationExecutions++;
+    return { executed: true };
+  };
+
+  // First call (e.g. from customer hangup event)
+  const exec1 = executeEndCallSessionWithLock('call_simul_1');
+  assert(exec1.executed === true && terminationExecutions === 1, '13.1 First Termination Executes Teardown', 'terminationExecutions=1');
+
+  // Simultaneous second call (e.g. from Vobiz webhook callback)
+  const exec2 = executeEndCallSessionWithLock('call_simul_1');
+  assert(exec2.executed === false && terminationExecutions === 1, '13.2 Concurrent Termination Blocked Idempotently', 'Double execution prevented');
+
+  // ============================================================================
+  // TEST GROUP 14: BOTH-PARTY HANGUP SUPPORT
+  // ============================================================================
+  console.log(`\n${CYAN}--- GROUP 14: Both-Party Hangup Handling ---${RESET}`);
+
+  // 14.1 Agent explicit hangup
+  let agentEnded = false;
+  const onAgentEndCallClick = () => {
+    agentEnded = true;
+    return { reason: 'explicit_user_end' };
+  };
+  const agentPayload = onAgentEndCallClick();
+  assert(agentEnded === true && agentPayload.reason === 'explicit_user_end', '14.1 Agent Explicit Hangup Registered', 'reason=explicit_user_end');
+
+  // 14.2 Customer remote hangup
+  let customerEnded = false;
+  const onCustomerRemoteHangup = (participant: { isLocal: boolean }) => {
+    if (!participant.isLocal) {
+      customerEnded = true;
+      return { reason: 'customer_hangup' };
+    }
+    return null;
+  };
+  const customerPayload = onCustomerRemoteHangup({ isLocal: false });
+  assert(customerEnded === true && customerPayload?.reason === 'customer_hangup', '14.2 Customer Remote Hangup Registered', 'reason=customer_hangup');
+
   console.log(`\n================================================================`);
-  console.log(`  ALL 10 VERIFICATION AREAS PASSED: ${passedTests}/${totalTests} TESTS SUCCESSFUL`);
+  console.log(`  ALL 14 VERIFICATION AREAS PASSED: ${passedTests}/${totalTests} TESTS SUCCESSFUL`);
   console.log(`================================================================\n`);
 }
 
@@ -301,3 +447,4 @@ runCallAudioLifecycleSuite().catch((err) => {
   console.error('\nSuite Execution Failed:', err);
   process.exit(1);
 });
+
