@@ -364,7 +364,7 @@ export class QueueService {
       // 4. Attempt to allocate an available agent
       const assignedAgent = await this.allocateAgent({
         department: nextItem.department,
-        callSid: nextItem.callSessionId || nextItem.id,
+        callSid: nextItem.callSessionId || nextItem.outcome || nextItem.id,
         isEmergency: nextItem.priority === 'EMERGENCY',
       });
 

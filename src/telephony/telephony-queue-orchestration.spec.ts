@@ -152,6 +152,14 @@ class MockPrismaService {
       const a = MockPrismaService.agents.find((ag) => ag.id === args.where.id);
       return a ? { ...a } : null;
     },
+    findFirst: async (args: any) => {
+      if (args?.where?.OR) {
+        const idMatches = args.where.OR.map((o: any) => o.id || o.userId).filter(Boolean);
+        const a = MockPrismaService.agents.find((ag) => idMatches.includes(ag.id) || idMatches.includes(ag.userId));
+        return a ? { ...a } : null;
+      }
+      return MockPrismaService.agents[0] ? { ...MockPrismaService.agents[0] } : null;
+    },
     findMany: async (args: any) => {
       let res = [...MockPrismaService.agents];
       if (args?.where?.status) res = res.filter((a) => a.status === args.where.status);
@@ -173,6 +181,12 @@ class MockPrismaService {
       }
       return a;
     },
+  };
+
+  public callSession = {
+    count: async () => 0,
+    findMany: async () => [],
+    updateMany: async () => ({ count: 0 }),
   };
 
   public $transaction = async (fn: any) => fn(this);
