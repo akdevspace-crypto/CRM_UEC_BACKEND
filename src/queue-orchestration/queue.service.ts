@@ -49,6 +49,22 @@ export class QueueService {
         this.logger.log(`[QUEUE-RECONCILE] Reconciled ${stale.count} orphaned call sessions to ENDED.`);
       }
 
+      // Reconcile orphaned WAITING QueueItems (older than 10 minutes or belonging to terminal sessions)
+      const queueCutoff = new Date(Date.now() - 10 * 60 * 1000);
+      const staleQueueItems = await (this.prisma as any).queueItem.updateMany({
+        where: {
+          status: 'WAITING',
+          enteredAt: { lt: queueCutoff },
+        },
+        data: {
+          status: 'ABANDONED',
+          outcome: 'WAIT_TIMEOUT',
+        },
+      });
+      if (staleQueueItems.count > 0) {
+        this.logger.log(`[QUEUE-RECONCILE] Cleaned up ${staleQueueItems.count} orphaned WAITING queue items to ABANDONED.`);
+      }
+
       // Reconcile agent counters
       const agents = await this.prisma.agent.findMany({ where: { isDeleted: false } });
       for (const agent of agents) {
@@ -312,6 +328,50 @@ export class QueueService {
   }
 
   /**
+   * Finalizes any pending QueueItem associated with a call when it terminates, fails, or completes.
+   * Ensures waiting queue resources and metrics are immediately released without manual intervention.
+   */
+  async finalizeQueueItem(callSidOrSessionId: string, outcome = 'COMPLETED'): Promise<boolean> {
+    if (!callSidOrSessionId) return false;
+    try {
+      const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(callSidOrSessionId);
+      const items = await (this.prisma as any).queueItem.findMany({
+        where: {
+          status: 'WAITING',
+          OR: [
+            ...(isValidUuid ? [{ callSessionId: callSidOrSessionId }] : []),
+            { outcome: callSidOrSessionId },
+          ],
+        },
+      });
+
+      if (!items || items.length === 0) return false;
+
+      const now = Date.now();
+      for (const item of items) {
+        const waitDuration = item.enteredAt
+          ? Math.max(Math.floor((now - new Date(item.enteredAt).getTime()) / 1000), 0)
+          : 0;
+
+        await (this.prisma as any).queueItem.update({
+          where: { id: item.id },
+          data: {
+            status: outcome === 'ABANDONED' ? 'ABANDONED' : 'COMPLETED',
+            outcome,
+            waitDuration,
+          },
+        });
+      }
+
+      this.logger.log(`[QUEUE-ITEM-FINALIZED] Finalized ${items.length} queue item(s) for ${callSidOrSessionId} -> ${outcome}`);
+      return true;
+    } catch (err: any) {
+      this.logger.warn(`[QUEUE-ITEM-FINALIZE] Failed to finalize queue item for ${callSidOrSessionId}: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
    * Dequeues the next waiting call item in priority order (EMERGENCY > HIGH > NORMAL > LOW)
    * and allocates it to an available agent with active browser WebSocket connectivity.
    */
@@ -346,55 +406,58 @@ export class QueueService {
         return new Date(a.enteredAt).getTime() - new Date(b.enteredAt).getTime();
       });
 
-      const nextItem = waitingItems[0];
-      const now = Date.now();
-      const waitSeconds = Math.floor((now - new Date(nextItem.enteredAt).getTime()) / 1000);
-      const maxWaitSeconds = 300; // 5 minutes max wait before overflow
+      for (const nextItem of waitingItems) {
+        const now = Date.now();
+        const waitSeconds = Math.floor((now - new Date(nextItem.enteredAt).getTime()) / 1000);
+        const maxWaitSeconds = 300; // 5 minutes max wait before overflow
 
-      // 3. Check for Queue Timeout Overflow
-      if (waitSeconds > maxWaitSeconds) {
-        this.logger.warn(`[QUEUE-TIMEOUT] Call ${nextItem.callSessionId || nextItem.id} timed out after ${waitSeconds}s in queue. Triggering overflow.`);
+        // 3. Check for Queue Timeout Overflow
+        if (waitSeconds > maxWaitSeconds) {
+          this.logger.warn(`[QUEUE-TIMEOUT] Call ${nextItem.callSessionId || nextItem.id} timed out after ${waitSeconds}s in queue. Triggering overflow.`);
+          await (this.prisma as any).queueItem.update({
+            where: { id: nextItem.id },
+            data: { status: 'OVERFLOW', outcome: 'OVERFLOW_CALLBACK', waitDuration: waitSeconds },
+          });
+          continue;
+        }
+
+        // 4. Attempt to allocate an available agent
+        const assignedAgent = await this.allocateAgent({
+          department: nextItem.department,
+          callSid: nextItem.callSessionId || nextItem.outcome || nextItem.id,
+          isEmergency: nextItem.priority === 'EMERGENCY',
+        });
+
+        if (!assignedAgent) {
+          // No agent currently free or available
+          return null;
+        }
+
+        // 5. Update QueueItem to ASSIGNED
+        const returnedCallSid = nextItem.callSessionId || nextItem.outcome || nextItem.id;
+
         await (this.prisma as any).queueItem.update({
           where: { id: nextItem.id },
-          data: { status: 'OVERFLOW', outcome: 'OVERFLOW_CALLBACK', waitDuration: waitSeconds },
+          data: {
+            status: 'ASSIGNED',
+            assignedAgentId: assignedAgent.id,
+            assignedAt: new Date(),
+            waitDuration: waitSeconds,
+            outcome: 'ANSWERED',
+          },
         });
-        return null;
+
+        this.logger.log(`[QUEUE-DEQUEUED] Dequeued callSessionId=${returnedCallSid} -> assigned to agent=${assignedAgent.name}`);
+
+        return {
+          assigned: true,
+          callSessionId: returnedCallSid,
+          agentId: assignedAgent.id,
+          agentName: assignedAgent.name,
+        };
       }
 
-      // 4. Attempt to allocate an available agent
-      const assignedAgent = await this.allocateAgent({
-        department: nextItem.department,
-        callSid: nextItem.callSessionId || nextItem.outcome || nextItem.id,
-        isEmergency: nextItem.priority === 'EMERGENCY',
-      });
-
-      if (!assignedAgent) {
-        // No agent currently free or available
-        return null;
-      }
-
-      // 5. Update QueueItem to ASSIGNED
-      const returnedCallSid = nextItem.callSessionId || nextItem.outcome || nextItem.id;
-
-      await (this.prisma as any).queueItem.update({
-        where: { id: nextItem.id },
-        data: {
-          status: 'ASSIGNED',
-          assignedAgentId: assignedAgent.id,
-          assignedAt: new Date(),
-          waitDuration: waitSeconds,
-          outcome: 'ANSWERED',
-        },
-      });
-
-      this.logger.log(`[QUEUE-DEQUEUED] Dequeued callSessionId=${returnedCallSid} -> assigned to agent=${assignedAgent.name}`);
-
-      return {
-        assigned: true,
-        callSessionId: returnedCallSid,
-        agentId: assignedAgent.id,
-        agentName: assignedAgent.name,
-      };
+      return null;
     } catch (e: any) {
       this.logger.error(`[QUEUE-DEQUEUE] Error: ${e.message}`);
       return null;
@@ -408,6 +471,8 @@ export class QueueService {
     const now = new Date();
     const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
+    const validWaitingCutoff = new Date(now.getTime() - 10 * 60 * 1000); // 10 minutes maximum queue validity
+
     const [
       waitingQueueItems,
       allAgents,
@@ -417,7 +482,10 @@ export class QueueService {
       totalQueueDefinitions,
     ] = await Promise.all([
       (this.prisma as any).queueItem.findMany({
-        where: { status: 'WAITING' },
+        where: {
+          status: 'WAITING',
+          enteredAt: { gte: validWaitingCutoff },
+        },
         orderBy: { enteredAt: 'asc' },
       }),
       this.prisma.agent.findMany({
@@ -436,7 +504,7 @@ export class QueueService {
       this.prisma.queue.count({ where: { isActive: true } }),
     ]);
 
-    // Compute oldest wait time
+    // Compute oldest wait time and emergency calls
     let oldestWaitSeconds = 0;
     if (waitingQueueItems.length > 0 && waitingQueueItems[0].enteredAt) {
       oldestWaitSeconds = Math.max(
@@ -444,6 +512,7 @@ export class QueueService {
         0,
       );
     }
+    const emergencyCalls = waitingQueueItems.filter((i: any) => i.priority === 'EMERGENCY').length;
 
     // Agent status breakdown
     const agentBreakdown = {
@@ -461,6 +530,7 @@ export class QueueService {
     return {
       queueDepth: waitingQueueItems.length,
       waitingCalls: waitingQueueItems.length,
+      emergencyCalls,
       oldestWaitSeconds,
       activeQueues: totalQueueDefinitions,
       agents: agentBreakdown,

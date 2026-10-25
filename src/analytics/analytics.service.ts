@@ -56,7 +56,7 @@ export class AnalyticsService {
         where: { callSessionId: sessionId },
       });
 
-      const hasAudioRecording = session.recordingStatus === 'READY' && !!session.recordingStoragePath;
+      const hasAudioRecording = (session.recordingStatus === 'READY' && !!session.recordingStoragePath) || (!!session.recordingUrl && (session.recordingUrl.startsWith('http://') || session.recordingUrl.startsWith('https://')));
 
       if (existingAnalytics && session.aiProcessingStatus === 'COMPLETED') {
         if (existingAnalytics.aiHandling || !hasAudioRecording) {
@@ -103,27 +103,44 @@ export class AnalyticsService {
       let base64Audio: string | null = null;
 
       if (hasAudioRecording) {
-        this.logger.log(`[AI-AUDIT] event=RECORDING_RESOLVED callId=${sessionId} storagePath=${session.recordingStoragePath} recordingStatus=${session.recordingStatus}`);
-        try {
-          const supabaseUrl = process.env.SUPABASE_URL || 'https://aws-1-ap-southeast-1.pooler.supabase.com';
-          const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || 'dummy_key';
-          const supabase = createClient(supabaseUrl, supabaseKey);
+        this.logger.log(`[AI-AUDIT] event=RECORDING_RESOLVED callId=${sessionId} storagePath=${session.recordingStoragePath} recordingStatus=${session.recordingStatus} recordingUrl=${session.recordingUrl}`);
+        if (session.recordingStoragePath) {
+          try {
+            const supabaseUrl = process.env.SUPABASE_URL || 'https://aws-1-ap-southeast-1.pooler.supabase.com';
+            const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || 'dummy_key';
+            const supabase = createClient(supabaseUrl, supabaseKey);
 
-          const { data, error } = await supabase.storage
-            .from('call-recordings')
-            .createSignedUrl(session.recordingStoragePath!, 3600);
+            const { data, error } = await supabase.storage
+              .from('call-recordings')
+              .createSignedUrl(session.recordingStoragePath, 3600);
 
-          if (!error && data?.signedUrl) {
-            this.logger.log(`[AI-AUDIT] event=TRANSCRIPTION_START callId=${sessionId}`);
-            const audioRes = await fetch(data.signedUrl);
-            if (audioRes.ok) {
-              const arrayBuffer = await audioRes.arrayBuffer();
-              base64Audio = Buffer.from(arrayBuffer).toString('base64');
-              this.logger.log(`[AI-AUDIT] event=TRANSCRIPTION_COMPLETE callId=${sessionId}`);
+            if (!error && data?.signedUrl) {
+              this.logger.log(`[AI-AUDIT] event=TRANSCRIPTION_START callId=${sessionId}`);
+              const audioRes = await fetch(data.signedUrl);
+              if (audioRes.ok) {
+                const arrayBuffer = await audioRes.arrayBuffer();
+                base64Audio = Buffer.from(arrayBuffer).toString('base64');
+                this.logger.log(`[AI-AUDIT] event=TRANSCRIPTION_COMPLETE callId=${sessionId}`);
+              }
             }
+          } catch (audioFetchErr: any) {
+            this.logger.warn(`[AI-AUDIT] event=AUDIO_FETCH_FALLBACK callId=${sessionId} error="${audioFetchErr.message}".`);
           }
-        } catch (audioFetchErr: any) {
-          this.logger.warn(`[AI-AUDIT] event=AUDIO_FETCH_FALLBACK callId=${sessionId} error="${audioFetchErr.message}". Proceeding with metadata synthesis.`);
+        }
+
+        // Direct carrier / external recording URL fallback
+        if (!base64Audio && session.recordingUrl && (session.recordingUrl.startsWith('http://') || session.recordingUrl.startsWith('https://'))) {
+          try {
+            this.logger.log(`[AI-AUDIT] event=DIRECT_RECORDING_FETCH callId=${sessionId} url=${session.recordingUrl}`);
+            const directRes = await fetch(session.recordingUrl);
+            if (directRes.ok) {
+              const arrayBuffer = await directRes.arrayBuffer();
+              base64Audio = Buffer.from(arrayBuffer).toString('base64');
+              this.logger.log(`[AI-AUDIT] event=DIRECT_RECORDING_RESOLVED callId=${sessionId} bytes=${arrayBuffer.byteLength}`);
+            }
+          } catch (directErr: any) {
+            this.logger.warn(`[AI-AUDIT] event=DIRECT_RECORDING_FAILED callId=${sessionId} error="${directErr.message}". Proceeding with metadata synthesis.`);
+          }
         }
       } else {
         this.logger.log(`[AI-AUDIT] event=METADATA_FALLBACK callId=${sessionId} reason="Audio recording not available (${session.recordingStatus}). Synthesizing AI summary from verified interaction metadata."`);

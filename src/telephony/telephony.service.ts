@@ -659,9 +659,14 @@ export class TelephonyService {
         this.logger.log(`[CALL-LIFECYCLE] LiveKit room/participant already closed. Proceeding to finalize DB session ${callSid}`);
       }
 
-      // Release global capacity channel
+      // Release global capacity channel with call's specific reservationToken
       if (this.capacityService) {
-        await this.capacityService.releaseChannel(callSid, (session.transferHistory as any)?.provider || 'vobiz').catch(() => {});
+        const token = (session.transferHistory as any)?.reservationToken;
+        const provider = (session.transferHistory as any)?.provider || 'vobiz';
+        await this.capacityService.releaseChannel(session.reason || callSid, provider, token).catch(() => {});
+        if (session.id && session.id !== callSid && session.id !== session.reason) {
+          await this.capacityService.releaseChannel(session.id, provider, token).catch(() => {});
+        }
       }
 
       let finalDuration = duration;
@@ -696,6 +701,19 @@ export class TelephonyService {
         }
       }
 
+      // Automatically finalize any temporary QueueItem resources associated with this call
+      const queueOutcome = ['MISSED', 'CANCELLED', 'REJECTED', 'UNANSWERED', 'FAILED', 'BUSY'].includes(finalStatus) ? 'ABANDONED' : 'COMPLETED';
+      await this.queueService.finalizeQueueItem(session.reason || callSid, queueOutcome).catch(() => {});
+      if (session.id && session.id !== callSid && session.id !== session.reason) {
+        await this.queueService.finalizeQueueItem(session.id, queueOutcome).catch(() => {});
+      }
+
+      const carrierRecordingData: any = {};
+      if (vobizRecordingUrl && typeof vobizRecordingUrl === 'string' && vobizRecordingUrl.trim()) {
+        carrierRecordingData.recordingUrl = vobizRecordingUrl.trim();
+        carrierRecordingData.recordingStatus = 'READY';
+      }
+
       await this.prisma.callSession.update({
         where: { id: session.id },
         data: {
@@ -703,6 +721,7 @@ export class TelephonyService {
           duration: finalDuration,
           status: finalStatus as any,
           aiProcessingStatus: (finalStatus === 'ENDED' && (finalDuration > 0 || session.recordingStatus === 'RECORDING')) ? 'RECORDING_PENDING' : 'COMPLETED',
+          ...carrierRecordingData,
         },
       });
 
@@ -723,16 +742,17 @@ export class TelephonyService {
           this.logger.error(`[CALL-RECORDING] Failed to stop egress: ${e.message}`);
           await this.prisma.callSession.update({
             where: { id: latestSession.id },
-            data: { recordingStatus: 'FAILED' }
+            data: { recordingStatus: carrierRecordingData.recordingStatus || 'FAILED' }
           }).catch(() => {});
-          this.triggerPostCallPipeline(latestSession, null).catch(console.error);
+          this.triggerPostCallPipeline(latestSession, carrierRecordingData.recordingUrl || null).catch(console.error);
         }
       } else if (finalStatus === 'ENDED' && finalDuration > 0) {
         if (latestSession.recordingStatus === 'PROCESSING') {
           this.logger.log(`[CALL-RECORDING] Egress is currently PROCESSING for callId=${latestSession.id}. AI summary pipeline will run when egress completes.`);
-        } else if (latestSession.recordingStatus === 'READY') {
-          this.logger.log(`[CALL-RECORDING] Egress already READY for callId=${latestSession.id}. Triggering AI pipeline with recording.`);
-          this.triggerPostCallPipeline(latestSession, latestSession.recordingStoragePath).catch(console.error);
+        } else if (latestSession.recordingStatus === 'READY' || carrierRecordingData.recordingUrl) {
+          const recUrl = latestSession.recordingStoragePath || carrierRecordingData.recordingUrl || latestSession.recordingUrl;
+          this.logger.log(`[CALL-RECORDING] Egress/Carrier already READY for callId=${latestSession.id}. Triggering AI pipeline with recording: ${recUrl}`);
+          this.triggerPostCallPipeline(latestSession, recUrl).catch(console.error);
         } else {
           // No egress was started or start failed, but call finished:
           if (!latestSession.recordingStatus || latestSession.recordingStatus === 'PENDING') {
@@ -747,7 +767,8 @@ export class TelephonyService {
       }
 
       // 1. Mark participants as left in database
-      for (const p of session.participants || []) {
+      const participantsList = Array.isArray(session.participants) ? session.participants : [];
+      for (const p of participantsList) {
         if (!p.leftAt) {
           await this.prisma.callParticipant.update({
             where: { id: p.id },
@@ -759,7 +780,7 @@ export class TelephonyService {
       // 2. Collect unique agent identifiers (avoid duplicate releases against multiple keys)
       const uniqueAgentKeys = new Set<string>();
       if (session.calleeUserId) uniqueAgentKeys.add(session.calleeUserId);
-      for (const p of session.participants || []) {
+      for (const p of participantsList) {
         if (p.agentId) uniqueAgentKeys.add(p.agentId);
       }
 
@@ -843,7 +864,12 @@ export class TelephonyService {
       return null;
     }
 
-    this.logger.log(`[CALL-RECORDING] event=PLAYBACK_LOOKUP callId=${callId} recordingStatus=${session.recordingStatus} recordingStoragePath=${session.recordingStoragePath}`);
+    this.logger.log(`[CALL-RECORDING] event=PLAYBACK_LOOKUP callId=${callId} recordingStatus=${session.recordingStatus} recordingStoragePath=${session.recordingStoragePath} recordingUrl=${session.recordingUrl}`);
+
+    // Direct carrier / external recording URL support
+    if (session.recordingUrl && (session.recordingUrl.startsWith('http://') || session.recordingUrl.startsWith('https://'))) {
+      return session.recordingUrl;
+    }
 
     if (session.recordingStatus !== 'READY') return null;
 
@@ -1341,8 +1367,10 @@ export class TelephonyService {
         transferredTo: th.lastTransferredTo || latestAudit?.destinationAgent?.name || (latestAudit?.metadata as any)?.transferredTo || null,
         transfers: r.transferAudits,
         transferHistory: th,
-        recordingStatus: r.recordingStatus || 'NOT_AVAILABLE',
-        recordingUrl: r.recordingStatus === 'READY' ? `${baseUrl}/telephony/calls/${r.id}/recording${tokenQuery}` : null,
+        recordingStatus: r.recordingStatus || (r.recordingUrl ? 'READY' : 'NOT_AVAILABLE'),
+        recordingUrl: (r.recordingStatus === 'READY' || r.recordingUrl)
+          ? (r.recordingUrl && (r.recordingUrl.startsWith('http://') || r.recordingUrl.startsWith('https://')) ? r.recordingUrl : `${baseUrl}/telephony/calls/${r.id}/recording${tokenQuery}`)
+          : null,
         recordingDuration: r.recordingDuration || totalDuration,
         disposition: intakeData.callOutcome || analytics?.callOutcome || (r.status === 'MISSED' ? 'Missed Call' : 'Completed'),
         priority: r.lead?.isAmbulanceEmergency ? 'EMERGENCY' : (r.lead?.priority || 'NORMAL'),
@@ -2408,6 +2436,7 @@ export class TelephonyService {
       }
 
       // Global Capacity Reservation for Inbound Call
+      let inboundReservationToken: string | undefined;
       if (this.capacityService) {
         const capRes = await this.capacityService.reserveChannel('INBOUND', event.providerCallId, event.provider || 'vobiz');
         if (!capRes.success) {
@@ -2420,6 +2449,7 @@ export class TelephonyService {
           );
           return false;
         }
+        inboundReservationToken = capRes.reservationToken;
       }
 
       if (!assignedAgent) {
@@ -2441,6 +2471,32 @@ export class TelephonyService {
           isEmergency ? 'EMERGENCY' : 'GENERAL',
           isEmergency ? 'EMERGENCY' : 'NORMAL'
         );
+        // Persist enqueued CallSession so the call lifecycle is durably tracked!
+        try {
+          await this.createCallSession(
+            event.providerCallId,
+            `call_${event.providerCallId}`,
+            customerContext?.customer?.id,
+            undefined,
+            'inbound',
+            event.fromNumber,
+            customerContext?.lead?.id,
+          );
+          await this.prisma.callSession.updateMany({
+            where: { reason: event.providerCallId },
+            data: {
+              status: 'RINGING',
+              transferHistory: {
+                provider: event.provider || 'vobiz',
+                reservationToken: inboundReservationToken,
+                direction: 'inbound',
+                isEnqueued: true,
+              },
+            },
+          });
+        } catch (enqErr: any) {
+          this.logger.warn(`[INBOUND-ENQUEUE] Could not persist enqueued CallSession: ${enqErr.message}`);
+        }
         return false;
       }
 
@@ -2508,7 +2564,18 @@ export class TelephonyService {
           customerContext?.lead?.id, // Fix DEF-06: Associate Lead!
         );
 
-        // LiveKit SIP participant identity is synchronized asynchronously in background task (Fix DEF-01)
+        if (session && inboundReservationToken) {
+          await this.prisma.callSession.update({
+            where: { id: session.id },
+            data: {
+              transferHistory: {
+                provider: event.provider || 'vobiz',
+                reservationToken: inboundReservationToken,
+                direction: 'inbound',
+              },
+            },
+          }).catch(() => {});
+        }
 
         this.logger.log(`[INBOUND-TRACE] CALL_SESSION_CREATED | callId=${session?.id} providerCallId=${event.providerCallId} direction=inbound provider=${event.provider} status=${session?.status}`);
         if (event.direction === 'INBOUND') {
@@ -2625,7 +2692,19 @@ export class TelephonyService {
       }
 
       if (!session) {
-        this.logger.warn(`[INBOUND-CORRELATION] No matching inbound CallSession for providerCallId=${event.providerCallId} candidates=${candidateIds.join(',')}. Safely ignored without guessing.`);
+        this.logger.warn(`[INBOUND-CORRELATION] No matching inbound CallSession for providerCallId=${event.providerCallId} candidates=${candidateIds.join(',')}. Executing automatic reset.`);
+        // Clean up QueueItems for this provider call
+        await this.queueService.finalizeQueueItem(event.providerCallId, 'ABANDONED').catch(() => {});
+        for (const cand of candidateIds) {
+          await this.queueService.finalizeQueueItem(cand, 'ABANDONED').catch(() => {});
+        }
+        // Release channel capacity
+        if (this.capacityService) {
+          await this.capacityService.releaseChannel(event.providerCallId, event.provider || 'vobiz').catch(() => {});
+          for (const cand of candidateIds) {
+            await this.capacityService.releaseChannel(cand, event.provider || 'vobiz').catch(() => {});
+          }
+        }
         return true;
       }
 
@@ -2650,22 +2729,37 @@ export class TelephonyService {
     const callSid = roomName; // Using roomName as callSid temporarily for outbound trackability
 
     // Global Capacity Orchestration: Check & Reserve Channel before dialing
+    let reservationToken: string | undefined;
     if (this.capacityService) {
-      // Check inbound queue depth to enforce priority policy
+      // Check inbound queue depth and emergency priority policy
       const queueDashboard = await this.queueService.getQueueOperationsDashboard().catch(() => null);
       const queueDepth = queueDashboard?.waitingCalls || 0;
+      const emergencyDepth = (queueDashboard as any)?.emergencyCalls || 0;
 
-      const reservation = await this.capacityService.reserveChannel('OUTBOUND', callSid, providerType, { queueDepth });
+      const reservation = await this.capacityService.reserveChannel('OUTBOUND', callSid, providerType, { queueDepth, emergencyDepth });
       if (!reservation.success) {
         this.logger.warn(`[OUTBOUND-CAPACITY] Blocked dial to ${request.to}: reason=${reservation.reason}`);
+        let message = 'Unable to initiate outbound call.';
+        if (reservation.reason === 'THROTTLED_EMERGENCY_PRIORITY') {
+          message = 'Outbound dialing temporarily paused: Emergency customer calls are waiting in queue.';
+        } else if (reservation.reason === 'INSUFFICIENT_INBOUND_RESERVE') {
+          message = 'Outbound dialing paused: The final shared channel is reserved for incoming customer calls under inbound priority policy.';
+        } else if (reservation.reason === 'THROTTLED_INBOUND_PRIORITY') {
+          message = 'Outbound dialing temporarily paused: Inbound customer calls are waiting in queue.';
+        } else if (reservation.reason === 'EXCEEDS_OUTBOUND_LIMIT') {
+          message = 'Outbound call concurrency limit reached under configured capacity policy.';
+        } else if (reservation.reason === 'CAPACITY_EXHAUSTED') {
+          message = 'All 3 shared telephony channels are currently occupied. Please wait for an active call to conclude.';
+        } else if (reservation.reason === 'RATE_LIMIT_CPS_EXCEEDED') {
+          message = 'Call setup rate limit reached. Please wait a moment before dialing again.';
+        }
         return {
           success: false,
           reason: reservation.reason,
-          message: reservation.reason === 'THROTTLED_INBOUND_PRIORITY'
-            ? 'Outbound dialing temporarily paused: Inbound customer calls are waiting in queue.'
-            : 'Telephony channel capacity limit reached. Please wait for an active call to conclude.',
+          message,
         };
       }
+      reservationToken = reservation.reservationToken;
     }
 
     try {
@@ -2688,6 +2782,18 @@ export class TelephonyService {
         request.leadId,
         request.conversationId,
       );
+
+      // Persist provider and reservation token onto session for terminal reconciliation
+      await this.prisma.callSession.updateMany({
+        where: { reason: callSid },
+        data: {
+          transferHistory: {
+            provider: providerType,
+            reservationToken,
+            direction: 'outbound',
+          },
+        },
+      });
 
       let providerResponse;
       if (providerType === 'vobiz') {
@@ -2731,8 +2837,15 @@ export class TelephonyService {
     };
     } catch (err: any) {
       if (this.capacityService) {
-        await this.capacityService.releaseChannel(callSid, providerType).catch(() => {});
+        await this.capacityService.releaseChannel(callSid, providerType, reservationToken).catch(() => {});
       }
+      if (request.agentId) {
+        await this.queueService.releaseAgentReservation(request.agentId, callSid).catch(() => {});
+      }
+      await this.prisma.callSession.updateMany({
+        where: { reason: callSid, status: { in: ['RINGING', 'IN_PROGRESS'] } },
+        data: { status: 'FAILED', endedAt: new Date() },
+      }).catch(() => {});
       this.logger.error(`[OUTBOUND-FAIL] Call initiation failed: ${err.message}`);
       throw err;
     }

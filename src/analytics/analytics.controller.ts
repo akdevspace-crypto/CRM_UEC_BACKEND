@@ -140,6 +140,100 @@ export class AnalyticsController {
     });
   }
 
+  @Get('summaries/:callId')
+  async getAiSummaryForCall(@Param('callId') callId: string, @Req() req: any) {
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const isUuid = UUID_REGEX.test(callId);
+
+    const session = isUuid
+      ? await this.prisma.callSession.findUnique({
+          where: { id: callId },
+          include: {
+            analytics: true,
+            customer: true,
+            participants: { where: { role: 'AGENT' } },
+            caller: { select: { email: true, agentProfile: { select: { name: true } } } },
+            callee: { select: { email: true, agentProfile: { select: { name: true } } } },
+          },
+        })
+      : await this.prisma.callSession.findFirst({
+          where: { OR: [{ reason: callId }, { livekitRoom: callId }] },
+          include: {
+            analytics: true,
+            customer: true,
+            participants: { where: { role: 'AGENT' } },
+            caller: { select: { email: true, agentProfile: { select: { name: true } } } },
+            callee: { select: { email: true, agentProfile: { select: { name: true } } } },
+          },
+        });
+
+    if (!session) {
+      return { success: false, error: 'Call session not found', summary: null };
+    }
+
+    const a = session.analytics;
+    const recordingStatus = session.recordingStatus || (session.recordingUrl ? 'READY' : 'NOT_AVAILABLE');
+    const recordingDuration = session.recordingDuration || session.duration || a?.duration || 0;
+
+    const user = req?.user;
+    const jwt = require('jsonwebtoken');
+    const jwtSecret = process.env.JWT_SECRET || 'crm-secure-jwt-secret-key-2026';
+    const forwardedHost = req?.headers?.['x-forwarded-host'];
+    const host = Array.isArray(forwardedHost) ? forwardedHost[0] : (forwardedHost || (req?.get ? req.get('host') : null) || 'crm-uec-backend.onrender.com');
+    const protocol = req?.headers?.['x-forwarded-proto'] || req?.protocol || 'https';
+    const baseUrl = process.env.BACKEND_PUBLIC_URL || `${protocol}://${host}`;
+
+    let tokenQuery = '';
+    if (session.id && user && (user.userId || user.id || user.sub)) {
+      try {
+        const token = jwt.sign(
+          {
+            sub: user.userId || user.id || user.sub,
+            userId: user.userId || user.id || user.sub,
+            role: user.role,
+            callId: session.id,
+          },
+          jwtSecret,
+          { expiresIn: '2h' }
+        );
+        tokenQuery = `?token=${token}`;
+      } catch (_) {}
+    }
+
+    const recordingUrl = (recordingStatus === 'READY')
+      ? (session.recordingUrl?.startsWith('http') ? session.recordingUrl : `${baseUrl}/telephony/calls/${session.id}/recording${tokenQuery}`)
+      : (session.recordingUrl || null);
+
+    if (!a) {
+      return {
+        success: true,
+        callSessionId: session.id,
+        aiProcessingStatus: session.aiProcessingStatus || 'PENDING',
+        recordingStatus,
+        recordingUrl,
+        recordingDuration,
+        summary: null,
+      };
+    }
+
+    return {
+      success: true,
+      id: a.id,
+      callSessionId: session.id,
+      aiProcessingStatus: session.aiProcessingStatus || 'COMPLETED',
+      recordingStatus,
+      recordingUrl,
+      recordingDuration,
+      summary: a.summary,
+      sentimentScore: a.sentimentScore || 5,
+      sentiment: (a as any).sentiment || (a.sentimentScore ? (a.sentimentScore > 7 ? 'Positive' : a.sentimentScore < 4 ? 'Negative' : 'Neutral') : 'Neutral'),
+      customerIntent: a.callOutcome || 'General Inquiry',
+      detectedLanguage: a.language || 'English',
+      transcript: (a as any).transcript || null,
+      actionItems: ['Review customer notes', 'Follow up if requested'],
+    };
+  }
+
   @Post('calls/:callId/reprocess')
   async reprocessCallSummary(@Param('callId') callId: string, @Req() req: any) {
     const user = req?.user;
