@@ -207,9 +207,13 @@ export class TelephonyController {
   }
 
   @Post('calls/outbound')
-  async initiateOutboundCall(@Body() body: any) {
+  async initiateOutboundCall(@Body() body: any, @Req() req: any) {
     try {
-      return await this.telephonyService.initiateOutboundCall(body);
+      const payload = {
+        ...body,
+        agentId: body?.agentId || req.user?.agentId || req.user?.id || req.user?.sub,
+      };
+      return await this.telephonyService.initiateOutboundCall(payload);
     } catch (error: any) {
       this.logger.error(`Failed to initiate outbound call: ${error.message}`, error.stack);
       
@@ -236,12 +240,27 @@ export class TelephonyController {
   @Public()
   @Get('health')
   async getHealth() {
-    const livekitConfigured = !!(process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET);
+    let livekitStatus = 'missing_credentials';
+    if (process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET) {
+      try {
+        if (this.livekitService?.roomServiceClient) {
+          await Promise.race([
+            this.livekitService.roomServiceClient.listRooms(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000)),
+          ]);
+          livekitStatus = 'connected';
+        } else {
+          livekitStatus = 'uninitialized';
+        }
+      } catch (err: any) {
+        livekitStatus = err.message?.includes('invalid token') ? 'authentication_failed' : 'unreachable';
+      }
+    }
     const vobizConfigured = !!(process.env.VOBIZ_AUTH_TOKEN || process.env.VOBIZ_WEBHOOK_SECRET);
     return {
       status: 'ok',
       provider: process.env.TELEPHONY_PROVIDER || 'vobiz',
-      livekit: livekitConfigured ? 'connected' : 'missing_credentials',
+      livekit: livekitStatus,
       vobiz: vobizConfigured ? 'configured' : 'missing_credentials'
     };
   }

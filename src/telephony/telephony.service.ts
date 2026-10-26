@@ -2133,28 +2133,33 @@ export class TelephonyService {
       return null;
     }
 
+    // Resolve agent record first to get both id and userId
+    let agent = await this.prisma.agent.findFirst({
+      where: { OR: [{ id: agentId }, { userId: agentId }] }
+    });
+    if (!agent) {
+      agent = await this.prisma.agent.findUnique({
+        where: { id: agentId }
+      }).catch(() => null);
+    }
+    if (!agent) return null;
+
+    const targetIds = [agent.id, agent.userId].filter((id): id is string => Boolean(id));
+
     // Find a ringing call session assigned to this agent
     const callSession = await this.prisma.callSession.findFirst({
       where: {
         status: 'RINGING',
-        participants: {
-          some: { agentId: agentId, role: 'AGENT' },
-        },
+        OR: [
+          { calleeUserId: { in: targetIds } },
+          { participants: { some: { agentId: { in: targetIds }, role: 'AGENT' } } },
+        ],
       },
       include: { customer: true, participants: true },
+      orderBy: { createdAt: 'desc' },
     });
 
     if (!callSession) return null;
-
-    // Generate token
-    const agent = await this.prisma.agent.findUnique({
-      where: { userId: agentId },
-    });
-    if (!agent) return null;
-
-    const { LivekitService } = require('./livekit.service');
-    // We cannot easily inject LivekitService here due to circular dependency, so we will generate token manually or pass it in.
-    // Wait, let's just do it in the controller which has access to LivekitService!
 
     return { callSession, agent };
   }
